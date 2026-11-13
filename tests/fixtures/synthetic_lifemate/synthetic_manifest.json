@@ -1,0 +1,46 @@
+{
+  "_synthetic": true,
+  "_warning": "SYNTHETIC TEST DATA / NOT OFFICIAL COMPETITION DATA",
+  "categories": {
+    "train_single_tool": "single_tool",
+    "train_multi_step": "multi_step",
+    "train_read_before_write": "read_before_write",
+    "train_result_dependent_arg": "result_dependent_arg",
+    "train_missing_info": "missing_info",
+    "train_out_of_scope": "out_of_scope",
+    "train_invalid_arguments": "invalid_arguments",
+    "train_failed_tool_result": "failed_tool_result",
+    "train_repeated_failed_calls": "repeated_failed_calls",
+    "train_empty_tool_calls": "empty_tool_calls",
+    "train_multiple_installed_apps": "multiple_installed_apps",
+    "train_long_history": "long_history",
+    "train_missing_optional_fields": "missing_optional_fields",
+    "train_unknown_fields": "unknown_fields",
+    "test_single_tool": "single_tool",
+    "test_missing_info": "missing_info",
+    "test_missing_audio": "missing_audio"
+  },
+  "splits": {
+    "train": [
+      "train_single_tool",
+      "train_multi_step",
+      "train_read_before_write",
+      "train_result_dependent_arg",
+      "train_missing_info",
+      "train_out_of_scope",
+      "train_invalid_arguments",
+      "train_failed_tool_result",
+      "train_repeated_failed_calls",
+      "train_empty_tool_calls",
+      "train_multiple_installed_apps",
+      "train_long_history",
+      "train_missing_optional_fields",
+      "train_unknown_fields"
+    ],
+    "public_test": [
+      "test_single_tool",
+      "test_missing_info",
+      "test_missing_audio"
+    ]
+  }
+}

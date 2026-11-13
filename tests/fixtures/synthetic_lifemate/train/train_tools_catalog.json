@@ -1,0 +1,293 @@
+{
+  "_synthetic": true,
+  "_note": "SYNTHETIC TEST DATA / NOT OFFICIAL COMPETITION DATA",
+  "apps": [
+    {
+      "app_name": "alarm",
+      "description": "Alarms and timers.",
+      "tools": [
+        {
+          "name": "alarm.set",
+          "description": "Create an alarm at a clock time.",
+          "annotations": {
+            "readOnlyHint": false
+          },
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "time": {
+                "type": "string",
+                "description": "HH:MM"
+              },
+              "label": {
+                "type": "string"
+              },
+              "repeat": {
+                "type": "string",
+                "enum": [
+                  "once",
+                  "daily",
+                  "weekdays"
+                ]
+              },
+              "days": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "time"
+            ]
+          }
+        },
+        {
+          "name": "alarm.list",
+          "description": "List existing alarms.",
+          "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        {
+          "name": "alarm.cancel",
+          "description": "Cancel an alarm by id.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "alarm_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "alarm_id"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "app_name": "calendar",
+      "description": "Calendar events.",
+      "tools": [
+        {
+          "name": "calendar.search_events",
+          "description": "Search events by title.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "date": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        },
+        {
+          "name": "calendar.create_event",
+          "description": "Create a calendar event.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "start": {
+                "type": "string"
+              },
+              "end": {
+                "type": "string"
+              },
+              "attendees": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "title",
+              "start"
+            ]
+          }
+        },
+        {
+          "name": "calendar.get_event",
+          "description": "Get one event by id.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "event_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event_id"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "app_name": "smart_home",
+      "description": "Home devices.",
+      "tools": [
+        {
+          "name": "smart_home.list_devices",
+          "description": "List devices in the home.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "room": {
+                "type": "string"
+              }
+            },
+            "required": []
+          }
+        },
+        {
+          "name": "smart_home.device_set",
+          "description": "Set a device state; device_id comes from device_list.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "device_id": {
+                "type": "string",
+                "x-ref": "#/apps/smart_home/tools/0",
+                "x-match": "id"
+              },
+              "on": {
+                "type": "boolean"
+              },
+              "brightness": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "device_id",
+              "on"
+            ]
+          }
+        },
+        {
+          "name": "smart_home.device_status",
+          "description": "Read a device status.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "device_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "device_id"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "app_name": "messaging",
+      "description": "Chat messages.",
+      "tools": [
+        {
+          "name": "messaging.search_contacts",
+          "description": "Search the contact list.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        },
+        {
+          "name": "messaging.send",
+          "description": "Send a message to a contact or a group.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "recipient": {
+                "type": "string",
+                "x-one-of": [
+                  "contact_id",
+                  "group_id"
+                ]
+              },
+              "contact_id": {
+                "type": "string"
+              },
+              "group_id": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              },
+              "urgent": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "body"
+            ],
+            "x-one-of": [
+              "contact_id",
+              "group_id"
+            ]
+          }
+        },
+        {
+          "name": "messaging.read_thread",
+          "description": "Read a message thread.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "thread_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "thread_id"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "app_name": "sys",
+      "description": "Meta tools.",
+      "tools": [
+        {
+          "name": "sys.ask_missing_info",
+          "description": "Ask the user for missing information.",
+          "annotations": {
+            "readOnlyHint": true
+          },
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "missing_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": []
+          }
+        }
+      ]
+    }
+  ]
+}

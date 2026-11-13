@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lifemate"
+version = "0.1.0"
+description = "Zalo AI Challenge 2026 Track 1 (LifeMate): voice-to-tool-calling agent reference implementation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "LifeMate team" }]
+# Stdlib only. Every heavy dependency is an extra and imported lazily.
+dependencies = []
+
+[project.scripts]
+lifemate = "lifemate.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyyaml>=6"]
+train = [
+    "torch>=2.3",
+    "transformers>=4.44",
+    "peft>=0.11",
+    "accelerate>=0.33",
+    "datasets>=2.20",
+    "wandb>=0.17",
+]
+asr = [
+    "numpy>=1.20",
+    "soundfile>=0.12",
+    "sherpa-onnx>=1.10",
+    "sherpa-onnx-core>=1.10",
+    "huggingface-hub>=0.20",
+]
+onnx = [
+    "sherpa-onnx>=1.10",
+    "sherpa-onnx-core>=1.10",
+    "soundfile>=0.12",
+    "numpy>=1.20",
+]
+asr-whisper = [
+    "torch>=2.3",
+    "transformers>=4.44",
+    "soundfile>=0.12",
+]
+cloud = [
+    "wandb>=0.17",
+]
+eda = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+]
+audio = ["soundfile>=0.12"]
+plot = ["matplotlib>=3.8"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

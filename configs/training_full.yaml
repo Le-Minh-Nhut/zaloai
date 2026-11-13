@@ -1,0 +1,50 @@
+# Full-parameter SFT (DEFAULT tuning mode). Qwen3.5-4B, bf16 autocast, fp32 master weights.
+#
+# Memory plan (decimal GB, estimate — see docs/TRAINING_GUIDE.md):
+#   4.2e9 params: weights 16.8 + grads 16.8 + AdamW 33.7 = 67 GB steady state,
+#   + activations (grad ckpt) 1.5 => an 80 GB-class GPU is the practical minimum.
+#   Parameters stay fp32 (AdamW writes its update into the parameter tensor; a bf16
+#   master quantises a 5e-6 step away). bf16 comes from autocast, not from the dtype.
+training:
+  method: sft
+  tuning_mode: full
+  output_dir: outputs/checkpoints
+  precision: bfloat16
+  learning_rate: 5.0e-6       # conservative for full FT of a 4B model
+  weight_decay: 0.01
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8   # effective batch 8 sequences
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  gradient_checkpointing: true     # ~5x smaller activation term, ~20% slower
+  gradient_clip_norm: 1.0
+  logging_steps: 10
+  save_strategy: epoch
+  eval_strategy: epoch
+  seed: 42
+  max_seq_length: 8192             # 4096 truncated 75% of the real SFT records and cut the
+                                   # "# Công cụ khả dụng" section from 176 of them
+  validation_ratio: 0.1
+  optimizer: adamw_torch
+  resume_from_checkpoint: null
+  dataloader_num_workers: 0
+  save_total_limit: 2
+  report_to: []
+
+model:
+  name: Qwen/Qwen3.5-4B
+  torch_dtype: bfloat16
+  device: cuda
+
+# DeepSpeed ZeRO ready (commented: this trainer does not consume it yet).
+# deepspeed:
+#   zero_optimization:
+#     stage: 3
+#     offload_optimizer:
+#       device: cpu
+#     offload_param:
+#       device: none
+#   bf16:
+#     enabled: true
+#   gradient_accumulation_steps: 8

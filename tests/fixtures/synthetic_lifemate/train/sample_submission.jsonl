@@ -1,0 +1,14 @@
+{"_synthetic": true, "id": "train_single_tool", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_multi_step", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_read_before_write", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_result_dependent_arg", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_missing_info", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_out_of_scope", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_invalid_arguments", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_failed_tool_result", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_repeated_failed_calls", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_empty_tool_calls", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_multiple_installed_apps", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_long_history", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_missing_optional_fields", "tool_calls": [], "tool_results": []}
+{"_synthetic": true, "id": "train_unknown_fields", "tool_calls": [], "tool_results": []}

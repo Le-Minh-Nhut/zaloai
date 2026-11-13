@@ -1,0 +1,5 @@
+{"id": "malformed_ok", "audio_text": "fine", "context": {"installed_apps": ["alarm"], "current_time": "2026-11-07T09:30:00+07:00", "timezone": "Asia/Ho_Chi_Minh", "current_location": "Ho Chi Minh City", "user_profile": {"name": "Test User", "phone": "+84900000000"}}, "history": []}
+{"id": "broken_json", "audio_text": "unterminated
+
+[1, 2, 3]
+{"audio_text": "no id here"}

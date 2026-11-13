@@ -1,0 +1,57 @@
+# LoRA SFT (identical to configs/training_lora.yaml) + Weights & Biases logging.
+#
+# COPY, not an include: lifemate.config.load_config() has no include/extends
+# support (src/lifemate/config.py:547 applies one YAML document plus overrides),
+# so this file restates the LoRA settings verbatim. The only intended deltas are
+# at the bottom: `training.report_to: ["wandb"]` and the `wandb:` block.
+# configs/training_lora.yaml stays the shipped no-wandb config.
+#
+# mode: offline by default so a machine without an API key still trains and
+# writes a local run that `wandb sync` can upload later. Override with
+# WANDB_MODE=online (env wins over the config value).
+training:
+  method: sft
+  tuning_mode: lora           # overrides the full default
+  output_dir: outputs/checkpoints
+  precision: bfloat16
+  learning_rate: 2.0e-4       # ~40x the full-FT LR: only adapters train
+  weight_decay: 0.01
+  num_train_epochs: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8  # effective batch stays 8 sequences
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  gradient_checkpointing: true
+  gradient_clip_norm: 1.0
+  logging_steps: 10
+  save_strategy: epoch
+  eval_strategy: epoch
+  seed: 42
+  max_seq_length: 8192
+  validation_ratio: 0.1
+  optimizer: adamw_torch
+  resume_from_checkpoint: null
+  dataloader_num_workers: 0
+  save_total_limit: 2
+  report_to: ["wandb"]        # the only change vs training_lora.yaml
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: null        # null => architecture-aware discovery
+  bias: none
+
+model:
+  name: Qwen/Qwen3.5-4B
+  torch_dtype: bfloat16
+  device: cuda
+
+wandb:
+  enabled: true
+  project: lifemate
+  entity: null
+  run_name: null              # null => the --run-name value
+  mode: offline               # env WANDB_MODE overrides this
+  log_model: false
+  upload_artifacts: false

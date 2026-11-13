@@ -1,0 +1,83 @@
+"""Offline evaluation: metrics, failure analysis, submission validation."""
+
+from __future__ import annotations
+
+from .error_analysis import FAILURE_BUCKETS, analyze, classify_failure, summarize_asr_errors
+from .evaluator import (
+    artifact_paths,
+    config_hash,
+    dataset_manifest_hash,
+    environment_report,
+    evaluate_closed_loop,
+    evaluate_split,
+    evaluate_teacher_forced,
+    git_commit,
+    load_decision_records,
+    render_comparisons_md,
+    render_metrics_md,
+    write_report,
+)
+from .metrics import (
+    METRIC_DEFINITIONS,
+    aggregate_teacher_forced,
+    argument_exact_match,
+    call_count_delta,
+    canonical_json,
+    canonical_signature,
+    lcs_length,
+    missing_info_detection,
+    next_action_accuracy,
+    out_of_scope_accuracy,
+    sequence_precision_recall_f1,
+    stop_accuracy,
+    tool_call_exact_match,
+    tool_selection_accuracy,
+)
+from .submission import (
+    SubmissionError,
+    SubmissionWriter,
+    assert_env_sourced,
+    load_submission,
+    write_submission,
+)
+from .submission_validator import validate_against_sample_submission, validate_submission
+
+__all__ = [
+    "FAILURE_BUCKETS",
+    "METRIC_DEFINITIONS",
+    "SubmissionError",
+    "SubmissionWriter",
+    "aggregate_teacher_forced",
+    "analyze",
+    "argument_exact_match",
+    "artifact_paths",
+    "assert_env_sourced",
+    "call_count_delta",
+    "canonical_json",
+    "canonical_signature",
+    "classify_failure",
+    "config_hash",
+    "dataset_manifest_hash",
+    "environment_report",
+    "evaluate_closed_loop",
+    "evaluate_split",
+    "evaluate_teacher_forced",
+    "git_commit",
+    "lcs_length",
+    "load_decision_records",
+    "load_submission",
+    "missing_info_detection",
+    "next_action_accuracy",
+    "out_of_scope_accuracy",
+    "render_comparisons_md",
+    "render_metrics_md",
+    "sequence_precision_recall_f1",
+    "stop_accuracy",
+    "summarize_asr_errors",
+    "tool_call_exact_match",
+    "tool_selection_accuracy",
+    "validate_against_sample_submission",
+    "validate_submission",
+    "write_report",
+    "write_submission",
+]

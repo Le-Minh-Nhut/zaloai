@@ -1,0 +1,19 @@
+# Offline scoring switches (each metric is independent and can be disabled).
+evaluation:
+  output_dir: outputs/evaluation
+  teacher_forced: true
+  closed_loop: true
+  tool_call_exact_match: true
+  tool_name_accuracy: true
+  argument_accuracy: true
+  final_state_match: true
+  per_category_breakdown: true
+
+inference:
+  model_mode: full
+  checkpoint: null
+  split: public_test
+  output: outputs/submission.jsonl
+  batch_size: 1
+  use_mock_env: false
+  limit: null

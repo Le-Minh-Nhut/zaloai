@@ -153,7 +153,7 @@ activemq-data/
 .env
 .envrc
 .venv
-env/
+/env/
 venv/
 ENV/
 env.bak/
@@ -218,3 +218,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- LifeMate project ----
+# Local dataset (official LifeMate data is never committed).
+/data/
+# Generated reports and checkpoints.
+/outputs/
+wandb/
+*.safetensors
+# Local env / secrets.
+.env
+# Local binaries: dataset archive and model weights (hundreds of MB, never committed).
+train+public_test.zip
+/models/

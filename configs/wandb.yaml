@@ -1,0 +1,13 @@
+# Weights & Biases logging. Disabled by default: an offline machine must never
+# fail a run because a tracker is unreachable.
+wandb:
+  enabled: false
+  project: lifemate
+  entity: null
+  run_name: null              # null => derived from output_dir/run name
+  mode: online                # online | offline | disabled
+  log_model: false
+  upload_artifacts: false
+
+training:
+  report_to: []

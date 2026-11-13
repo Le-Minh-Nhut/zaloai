@@ -1,0 +1,43 @@
+# Build context hygiene.
+# Everything here is excluded from `docker build`; the image needs only the
+# files listed in docker/Dockerfile's COPY lines.
+
+# Version control + editor noise
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Python caches and build artefacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.venv
+venv
+
+# Local data, models, outputs: mounted at run time instead of baked in
+data
+outputs
+checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.wav
+*.mp3
+*.jsonl
+
+# Tests, docs, cloud helpers: not needed to run inference
+tests
+docs
+cloud
+notebooks
+
+# Local secrets / credentials
+.env
+*.pem
+wandb
+.netrc

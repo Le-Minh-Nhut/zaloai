@@ -1,0 +1,13 @@
+{
+  "_synthetic": true,
+  "apps": {
+    "smart_home": {
+      "light_living": {
+        "id": "light_living",
+        "room": "living_room",
+        "on": false,
+        "brightness": 40
+      }
+    }
+  }
+}

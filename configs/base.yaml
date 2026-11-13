@@ -1,0 +1,109 @@
+# Base configuration: mirrors lifemate.config.AppConfig dataclass defaults.
+# Every key here is a real dataclass field; load_config() rejects unknown keys.
+# Values are a STARTING POINT, not a tuned result.
+data:
+  root: ./data
+  train_split: train
+  max_samples: null
+
+model:
+  name: Qwen/Qwen3.5-4B
+  torch_dtype: bfloat16
+  attn_implementation: null
+  trust_remote_code: false
+  device: cuda
+  tokenizer_name: null
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: null
+  bias: none
+
+training:
+  method: sft
+  tuning_mode: full          # DEFAULT: full-parameter fine-tuning
+  output_dir: outputs/checkpoints
+  precision: bfloat16
+  learning_rate: 5.0e-6
+  weight_decay: 0.01
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  gradient_checkpointing: true
+  gradient_clip_norm: 1.0
+  logging_steps: 10
+  save_strategy: epoch
+  eval_strategy: epoch
+  seed: 42
+  max_seq_length: 8192       # 4096 truncated 75% of the real SFT records (see TRAINING_GUIDE §4)
+  validation_ratio: 0.1
+  optimizer: adamw_torch
+  resume_from_checkpoint: null
+  dataloader_num_workers: 0
+  save_total_limit: 2
+  report_to: []
+
+asr:
+  backend: gipformer
+  model_id: g-group-ai-lab/gipformer-68M-rnnt
+  revision: 318322b009200f8e77a3751fa64638e5cc85a7dc
+  model_dir: null
+  runtime: onnx
+  device: cpu
+  quantization: int8
+  offline: true
+  num_threads: 4
+  # greedy_search is the fast/experimental option; modified_beam_search matches the published WER.
+  decoding_method: modified_beam_search
+  model_name: vinai/PhoWhisper-small
+  language: vi
+  sample_rate: 16000
+  max_audio_seconds: 60
+
+agent:
+  max_steps: 8
+  time_budget_seconds: 120.0
+  allow_ask_missing_info: true
+  temperature: 0.0
+  max_new_tokens: 512
+  stop_on_finish: true
+
+inference:
+  model_mode: base
+  checkpoint: null
+  split: public_test
+  output: outputs/submission.jsonl
+  batch_size: 1
+  use_mock_env: false
+  limit: null
+
+evaluation:
+  output_dir: outputs/evaluation
+  teacher_forced: true
+  closed_loop: true
+  tool_call_exact_match: true
+  tool_name_accuracy: true
+  argument_accuracy: true
+  final_state_match: true
+  per_category_breakdown: true
+
+wandb:
+  enabled: false
+  project: lifemate
+  entity: null
+  run_name: null
+  mode: online
+  log_model: false
+  upload_artifacts: false
+
+cloud:
+  provider: wandb_sandbox
+  project: null
+  entity: null
+  gpu_type: null
+  checkpoint_remote: null
+  artifact_name: lifemate-full
