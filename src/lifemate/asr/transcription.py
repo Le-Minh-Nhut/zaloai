@@ -8,7 +8,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping, Sequence
 
 from lifemate.errors import LifeMateError
-from lifemate.evaluation.transcripts import load_cache_entries, save_cache, transcript_cache_key, audio_identities
+from lifemate.evaluation.transcripts import load_cache_entries, save_cache, transcript_cache_key, audio_identities, _artifact_identity
 
 __all__ = [
     "infer_module",
@@ -43,7 +43,19 @@ def transcribe_samples_cached(
     """
     features = features if features is not None else getattr(cfg, "features", None)
     sample_ids = [str(getattr(s, "id", "") or "") for s in samples]
-    key = transcript_cache_key(cfg, features, split=split, sample_ids=sample_ids, audio_identities=audio_identities(samples))
+    def backend_identity(backend: Any) -> dict[str, Any]:
+        if backend is None:
+            return {}
+        paths = getattr(backend, "_resolved_paths", {}) or {}
+        return {"name": getattr(backend, "name", None),
+                "model_id": getattr(backend, "model_id", None),
+                "revision": getattr(backend, "revision", None),
+                "resolved_artifacts": {str(role): _artifact_identity(path) for role, path in sorted(paths.items())}}
+    runtime_identity = {"requested_backend": getattr(args, "asr", None),
+                        "primary": backend_identity(getattr(asr, "primary", asr)),
+                        "secondary": backend_identity(getattr(asr, "secondary", None))}
+    key = transcript_cache_key(cfg, features, split=split, sample_ids=sample_ids,
+                               audio_identities=audio_identities(samples), runtime_identity=runtime_identity)
 
     target_cache_path = Path(cache_path) if cache_path else Path("outputs/cache/transcripts.json")
     loaded = load_cache_entries(target_cache_path).get(key, {})

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from ..compliance import assert_path_allowed
-from ..errors import LifeMateError
+from ..errors import LifeMateError, ProhibitedAccessError
 
 __all__ = [
     "HistoryTranscriptError",
@@ -242,4 +242,8 @@ def transcribe_missing_history(sample: Any, *, split: str, data_root: str | Path
             apply_history_texts([sample], {(split, _sample_id(sample), index): text}, split)
         except HistoryTranscriptError:
             raise
+        except ProhibitedAccessError:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors.append(f"history turn {index}: {type(exc).__name__}: {exc}")
     return errors

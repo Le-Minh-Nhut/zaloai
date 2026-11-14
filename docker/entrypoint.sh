@@ -256,6 +256,10 @@ check_local_weights() {
         echo "       Mount one read-only: -v <ckpt-dir>:/models/ckpt:ro (or set -e CHECKPOINT=/models/<name>)." >&2
         exit 2
     fi
+    if [[ "$MODEL_MODE" == "full" && -f "$ckpt_dir/adapter_config.json" ]] && ! has_weights "$ckpt_dir"; then
+        echo "ERROR: CHECKPOINT is a LoRA adapter; set MODEL_MODE=lora and MODEL_NAME to the base model." >&2
+        exit 1
+    fi
     if ! weights_dir="$(resolve_local_model "$weights_ref")"; then
         echo "ERROR: no local weights for '$weights_ref' (MODEL_MODE=$MODEL_MODE, MODEL_NAME=$MODEL_NAME)." >&2
         echo "       Nothing is downloaded at scoring time. Provide the weights by mounting either:" >&2

@@ -27,9 +27,8 @@ __all__ = [
     "CACHE_VERSION",
 ]
 
-#: Cache schema version. Bumped to 2 when per-sample audio identity and the
-#: full ASR-affecting parameter set joined the key; v1 entries never hit.
-CACHE_VERSION = 2
+#: Version 3 adds local model artifact metadata; older cache entries never hit.
+CACHE_VERSION = 3
 
 #: ASR fields that change the recognised text (everything else is run-local).
 _KEYED_ASR_FIELDS = (
@@ -60,6 +59,24 @@ def _asr_signature(cfg: Any) -> dict[str, Any]:
     return {name: getattr(asr, name, None) for name in _KEYED_ASR_FIELDS}
 
 
+def _artifact_identity(path: Any) -> list[tuple[str, int, int, int]]:
+    """Snapshot file metadata once per cache key, without hashing model weights per sample."""
+    if not path:
+        return []
+    from lifemate.compliance import assert_path_allowed
+    root = assert_path_allowed(Path(str(path)).expanduser())
+    if not root.exists():
+        return []
+    files = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
+    result = []
+    for item in files:
+        assert_path_allowed(item.resolve())
+        stat = item.stat()
+        result.append((str(item.relative_to(root)) if root.is_dir() else item.name,
+                       stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+    return result
+
+
 def asr_cache_identity(cfg: Any, features: Any) -> dict[str, Any]:
     """Every ASR-affecting knob that must invalidate the cache.
 
@@ -69,6 +86,11 @@ def asr_cache_identity(cfg: Any, features: Any) -> dict[str, Any]:
     """
     asr = getattr(cfg, "asr", None)
     identity: dict[str, Any] = {"asr": _asr_signature(cfg)}
+    model_dir = getattr(asr, "model_dir", None)
+    if not model_dir and getattr(asr, "backend", None) == "gipformer":
+        model_dir = "models/gipformer-68M-rnnt"
+    identity["local_artifacts"] = _artifact_identity(model_dir or getattr(asr, "model_name", None))
+    identity["secondary_artifacts"] = _artifact_identity(_param(features, "asr", "secondary_model_id", ""))
     identity["decoding_method"] = getattr(asr, "decoding_method", None)
     identity["nbest_size"] = getattr(asr, "nbest_size", None)
     identity["audio"] = {
@@ -130,13 +152,12 @@ def transcript_cache_key(
     split: str,
     sample_ids: Iterable[str],
     audio_identities: Mapping[str, str] | None = None,
+    runtime_identity: Mapping[str, Any] | None = None,
 ) -> str:
     """Stable key over (ASR config, split, sample ids, feature fingerprint).
 
-    v2 adds the full ASR-affecting identity plus per-sample audio identity,
-    so v1 entries never hit. ``audio_identities`` maps sample id to the cheap
-    content digest from :func:`audio_identities`; ``None`` means audio unknown
-    (still a v2 key, just without per-file tags).
+    Version 3 includes model artifact metadata, ASR-affecting parameters and
+    per-sample audio identity. ``None`` means the audio identity is unknown.
     """
     try:
         from lifemate.features.config import feature_fingerprint  # noqa: PLC0415
@@ -153,6 +174,7 @@ def transcript_cache_key(
         "split": str(split),
         "sample_ids": ids,
         "audio": audio,
+        "runtime_identity": runtime_identity or {},
         "feature_fingerprint": fingerprint,
     }
     text = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)

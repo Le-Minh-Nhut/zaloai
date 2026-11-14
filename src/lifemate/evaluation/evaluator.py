@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from lifemate.agent.protocol import Action, parse_action, render_action
+from lifemate.errors import ProhibitedAccessError
 
 from . import error_analysis, metrics
 
@@ -403,6 +404,7 @@ def evaluate_closed_loop(
     transcripts: Mapping[str, str] | None = None,
     asr_info: Mapping[str, Any] | None = None,
     prepare_history: Any = None,
+    transcribe_sample: Any = None,
 ) -> dict[str, Any]:
     """Run the agent against a REAL environment per sample.
 
@@ -425,24 +427,45 @@ def evaluate_closed_loop(
 
     for sample in chosen:
         sample_id = str(getattr(sample, "id", "") or "")
-        budget_deadline = None if deadline_seconds is None else time.monotonic() + deadline_seconds
+        sample_started = time.monotonic()
+        budget_deadline = None if deadline_seconds is None else sample_started + deadline_seconds
+        history_seconds = 0.0
+        asr_seconds = 0.0
         try:
             if prepare_history is not None:
+                stage_started = time.monotonic()
                 prepare_history(sample, budget_deadline)
+                history_seconds = time.monotonic() - stage_started
+            runtime_transcript = None
+            runtime_info = None
+            if transcribe_sample is not None and (budget_deadline is None or time.monotonic() < budget_deadline):
+                stage_started = time.monotonic()
+                runtime_transcript, runtime_info = transcribe_sample(sample)
+                asr_seconds = time.monotonic() - stage_started
             agent = agent_factory(sample)
+        except ProhibitedAccessError:
+            raise
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "agent_factory", "error": f"{type(exc).__name__}: {exc}"[:300]})
-            rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)]})
+            rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)],
+                         "total_seconds": time.monotonic() - sample_started,
+                         "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline})
             continue
         try:
-            transcript = transcripts.get(sample_id) if transcripts is not None else None
+            transcript = runtime_transcript if transcribe_sample is not None else (transcripts.get(sample_id) if transcripts is not None else None)
             kwargs = {}
-            if asr_info is not None:
+            if runtime_info is not None:
+                kwargs["asr_hypotheses"] = runtime_info.get("hypotheses")
+            elif asr_info is not None:
                 kwargs["asr_hypotheses"] = asr_info.get(sample_id, {}).get("hypotheses")
             result = agent.run(sample, transcript=transcript, deadline=budget_deadline, **kwargs)
+        except ProhibitedAccessError:
+            raise
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "run", "error": f"{type(exc).__name__}: {exc}"[:300]})
-            rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)]})
+            rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)],
+                         "total_seconds": time.monotonic() - sample_started,
+                         "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline})
             continue
 
         env = getattr(agent, "env", None)
@@ -458,6 +481,10 @@ def evaluate_closed_loop(
             "n_llm_calls": int(getattr(result, "n_llm_calls", 0) or 0),
             "elapsed_seconds": round(float(getattr(result, "elapsed_seconds", 0.0) or 0.0), 4),
             "errors": list(getattr(result, "errors", []) or []),
+            "history_seconds": history_seconds,
+            "current_asr_seconds": asr_seconds,
+            "total_seconds": time.monotonic() - sample_started,
+            "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline,
         }
         rows.append(row)
         if status not in {"finished", "ok"}:
@@ -479,6 +506,17 @@ def evaluate_closed_loop(
         counts[row["status"]] = counts.get(row["status"], 0) + 1
 
     total_elapsed = time.monotonic() - started
+    def distribution(key: str) -> dict[str, Any]:
+        values = sorted(float(row[key]) for row in rows if key in row)
+        if not values:
+            return {"available": False}
+        def percentile(q: float) -> float:
+            pos = (len(values) - 1) * q
+            lower = int(pos)
+            upper = min(lower + 1, len(values) - 1)
+            return values[lower] + (values[upper] - values[lower]) * (pos - lower)
+        return {"mean": sum(values) / len(values), "p50": percentile(.5),
+                "p95": percentile(.95), "max": values[-1], "n": len(values)}
     summary: dict[str, Any] = {
         "split": split,
         "data_root": str(data_root),
@@ -486,13 +524,19 @@ def evaluate_closed_loop(
         "n_run": len(rows),
         "status_counts": counts,
         "wall_seconds": round(total_elapsed, 3),
-        "elapsed_seconds_mean": round(
-            sum(row["elapsed_seconds"] for row in rows) / len(rows), 4
-        ) if rows else None,
+        "elapsed_seconds_mean": (sum(row["elapsed_seconds"] for row in rows if "elapsed_seconds" in row) /
+                                 sum("elapsed_seconds" in row for row in rows)) if any("elapsed_seconds" in row for row in rows) else None,
+        "latency": {"history_asr": distribution("history_seconds"),
+                    "current_asr": distribution("current_asr_seconds"),
+                    "total": distribution("total_seconds"),
+                    "llm": {"available": False}, "tool_env": {"available": False},
+                    "prompt": {"available": False},
+                    "timeout_count": sum(bool(row.get("timed_out")) for row in rows)},
         "failures": failures[:50],
         "n_failures": len(failures),
         "rows": rows,
         "evaluation_mode": evaluation_mode,
+        "runtime_protocol": "end_to_end_uncached" if transcribe_sample is not None else "quality_asr_latency_excluded",
         "n_successful": sum(1 for r in rows if r["status"] in {"finished", "ok"}),
         "n_failed": len(failures),
         "final_state_correctness": {

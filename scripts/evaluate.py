@@ -24,7 +24,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
@@ -97,6 +97,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="evaluation mode: text_to_action (gold/fixed transcript) or audio_to_action (full audio->ASR->agent)",
     )
     parser.add_argument("--transcript-cache", default=None, help="transcript cache JSON file")
+    parser.add_argument("--end-to-end-runtime", action="store_true", help="run uncached current-turn ASR within each sample deadline")
     parser.add_argument(
         "--asr",
         choices=("gipformer", "oracle", "whisper", "none"),
@@ -296,6 +297,47 @@ def _teacher_forced(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     return payload
 
 
+def _feature_execution_counts(samples: Any, features: Any, info: Mapping[str, Any]) -> dict[str, Any]:
+    execution = {}
+    enabled_features = (
+        ("asr.nbest", _flag(features, "asr", "nbest_enabled")),
+        ("asr.multi_asr", _flag(features, "asr", "multi_asr_enabled")),
+        ("asr.gipformer_v15", _flag(features, "asr", "gipformer_v15_enabled")),
+        ("audio.vad", _flag(features, "audio", "vad_enabled")),
+        ("audio.rms_normalization", _flag(features, "audio", "rms_normalization_enabled")),
+    )
+    for feature, enabled in enabled_features:
+        if not enabled:
+            continue
+        counts = {"n_requested": len(samples), "n_executed": 0, "n_degraded": 0,
+                  "n_blocked": 0, "n_not_observed": 0}
+        for sample in samples:
+            item = info.get(str(sample.id))
+            if item is None:
+                counts["n_not_observed"] += 1
+                continue
+            if item.get("error"):
+                counts["n_blocked"] += 1
+                continue
+            conditioning = item.get("conditioning") or {}
+            if feature == "asr.nbest":
+                observed = "nbest" in conditioning or bool(item.get("nbest_fallback"))
+                success = not item.get("nbest_fallback") and conditioning.get("nbest", {}).get("returned", 0) > 1
+            elif feature == "asr.multi_asr":
+                observed = "multi_asr" in conditioning
+                success = conditioning.get("multi_asr", {}).get("executed", False) and not conditioning.get("multi_asr", {}).get("degraded", False)
+            elif feature == "asr.gipformer_v15":
+                observed = bool(item.get("model_id"))
+                success = item.get("model_id") == "g-group-ai-lab/gipformer1.5-68M-rnnt"
+            else:
+                key = "vad" if feature == "audio.vad" else "rms"
+                observed = key in conditioning
+                success = observed
+            counts["n_executed" if success else "n_degraded" if observed else "n_not_observed"] += 1
+        execution[feature] = counts
+    return execution
+
+
 def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     """Run full episodes. Fails loudly when the official env cannot be built."""
     features = getattr(cfg, "features", None)
@@ -376,6 +418,7 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     transcripts = None
     cache_stats = {}
     prepare_history = None
+    transcribe_sample = None
     history_path = getattr(cfg.inference, "history_transcripts", None)
     if history_path:
         from lifemate.data.history import apply_history_texts, load_history_texts
@@ -391,21 +434,28 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
                 transcribe=lambda item: infer._transcribe(asr_backend, item, features=features))
             if errors:
                 raise LifeMateError("; ".join(errors))
-        cache_path = getattr(args, "transcript_cache", None) or (Path(cfg.evaluation.output_dir) / "transcripts_cache.json")
-        transcripts, cache_stats = transcribe_samples_cached(
-            samples,
-            cfg,
-            features=features,
-            asr=asr_backend,
-            split=args.split,
-            cache_path=cache_path,
-            args=args,
-        )
-        if not getattr(args, "quiet", False):
-            print(
-                f"audio_to_action: {len(transcripts)} transcripts ready "
-                f"(cache hits={cache_stats.get('cache_hit')}, misses={cache_stats.get('cache_miss')})"
+        if getattr(args, "end_to_end_runtime", False):
+            cache_stats["asr_info"] = {}
+            def transcribe_sample(sample):
+                text, info = infer._transcribe(asr_backend, sample, features=features)
+                cache_stats["asr_info"][str(sample.id)] = info
+                return text, info
+        else:
+            cache_path = getattr(args, "transcript_cache", None) or (Path(cfg.evaluation.output_dir) / "transcripts_cache.json")
+            transcripts, cache_stats = transcribe_samples_cached(
+                samples,
+                cfg,
+                features=features,
+                asr=asr_backend,
+                split=args.split,
+                cache_path=cache_path,
+                args=args,
             )
+            if not getattr(args, "quiet", False):
+                print(
+                    f"audio_to_action: {len(transcripts)} transcripts ready "
+                    f"(cache hits={cache_stats.get('cache_hit')}, misses={cache_stats.get('cache_miss')})"
+                )
 
     summary = evaluate_closed_loop(
         factory,
@@ -419,24 +469,13 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
         transcripts=transcripts,
         asr_info=cache_stats.get("asr_info"),
         prepare_history=prepare_history,
+        transcribe_sample=transcribe_sample,
     )
     if eval_mode == "audio_to_action":
         info = cache_stats.get("asr_info", {})
-        execution = {}
-        for feature, enabled in (("asr.nbest", _flag(features, "asr", "nbest_enabled")), ("asr.multi_asr", _flag(features, "asr", "multi_asr_enabled"))):
-            if not enabled:
-                continue
-            entries = list(info.values())
-            def succeeded(item):
-                if item.get("error"):
-                    return False
-                if feature == "asr.nbest":
-                    return not item.get("nbest_fallback") and bool((item.get("conditioning") or {}).get("nbest", {}).get("returned", 0) > 1)
-                return bool((item.get("conditioning") or {}).get("multi_asr", {}).get("executed"))
-            ok = sum(bool(succeeded(item)) for item in entries)
-            execution[feature] = {"n_requested": len(entries), "n_executed": ok, "n_degraded": len(entries) - ok, "n_blocked": sum(bool(item.get("error")) for item in entries)}
+        execution = _feature_execution_counts(samples, features, info)
         summary["feature_execution"] = execution
-        summary["degraded_features"] = [name for name, counts in execution.items() if counts["n_degraded"]]
+        summary["degraded_features"] = [name for name, counts in execution.items() if counts["n_degraded"] or counts["n_blocked"]]
     if mock:
         summary["mock_env"] = True
         summary["note"] = f"{MOCK_NOTE}: MockToolEnv, not the official simulator"

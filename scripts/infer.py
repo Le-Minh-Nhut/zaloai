@@ -51,6 +51,8 @@ _PII_KEYS = frozenset(
     {
         "user_profile",
         "messages",
+        "message",
+        "text",
         "audio_text",
         "transcript",
         "content",
@@ -642,6 +644,7 @@ def _transcribe(
         "error": getattr(result, "error", None),
         "latency_s": round(float(getattr(result, "latency_s", 0.0) or 0.0), 3),
         "raw_transcript": raw_text,
+        "model_id": getattr(getattr(asr, "primary", asr), "model_id", None),
     }
     if conditioning:
         info["conditioning"] = conditioning
@@ -678,6 +681,16 @@ def _load_generator(cfg: Any, args: argparse.Namespace, current_id: Callable[[],
         raise LifeMateError(
             f"--model-mode {mode} requires --checkpoint (a directory written by scripts/train.py)"
         )
+    if mode in {"full", "lora"}:
+        ckpt = Path(str(checkpoint))
+        if not ckpt.is_dir():
+            raise LifeMateError(f"{mode} checkpoint directory does not exist: {ckpt}")
+        adapter = (ckpt / "adapter_config.json").is_file()
+        if mode == "lora" and not adapter:
+            raise LifeMateError(f"LoRA checkpoint {ckpt} lacks adapter_config.json; select a trained adapter")
+        full_weights = any(ckpt.glob("model*.safetensors")) or any(ckpt.glob("pytorch_model*.bin"))
+        if mode == "full" and adapter and not full_weights:
+            raise LifeMateError(f"{ckpt} is a LoRA adapter, not a full model; use --model-mode lora")
     from lifemate.models.generation import HFGenerator
     from lifemate.models.loader import load_model_and_tokenizer
 
@@ -740,13 +753,20 @@ def _constrained_kwargs(cfg: Any, generator_cls: Any) -> dict[str, Any]:
 _DEBUG_KEEP = frozenset({"transcript", "raw_transcript"})
 
 
-def _sanitize(value: Any) -> Any:
-    """Drop user-content keys from debug dumps (no profile/message bodies)."""
+def _sanitize(value: Any, depth: int = 0) -> Any:
+    """Produce bounded JSON-safe diagnostics while removing user-content keys."""
+    import dataclasses
+    if depth >= 20:
+        return "<depth limit>"
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):
-        return {str(k): _sanitize(v) for k, v in value.items() if str(k) not in _PII_KEYS}
+        return {str(k): _sanitize(v, depth + 1) for k, v in value.items() if str(k) not in _PII_KEYS}
     if isinstance(value, (list, tuple)):
-        return [_sanitize(item) for item in value]
-    return value
+        return [_sanitize(item, depth + 1) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return f"<{type(value).__name__}>"
 
 
 def _dump_debug(directory: str | Path, sample_id: str, payload: Mapping[str, Any]) -> None:
@@ -1004,10 +1024,14 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             sample, split=split, data_root=data_root, deadline=deadline,
             transcribe=lambda item: _transcribe(asr, item, features=features),
         )
-        if history_errors and not getattr(args, "allow_missing_history", False):
-            print(f"ERROR: {sample_id}: {'; '.join(history_errors)}", file=sys.stderr)
-            return EXIT_DATASET
-        transcript, asr_info = _transcribe(asr, sample, features=features)
+        history_incomplete = bool(history_errors) and not getattr(args, "allow_missing_history", False)
+        if history_errors:
+            failures += 1
+            print(f"WARNING: {sample_id}: incomplete history: {'; '.join(history_errors)}", file=sys.stderr)
+        if time.monotonic() >= deadline:
+            transcript, asr_info = "", {"backend": backend_name, "error": "time budget exhausted before current-turn ASR"}
+        else:
+            transcript, asr_info = _transcribe(asr, sample, features=features)
         asr_error = asr_info.get("error")
         if asr_error or (asr_checked and not transcript):
             asr_failures += 1
@@ -1058,7 +1082,9 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         )
         try:
             asr_hyp = asr_info.get("hypotheses")
-            result = agent.run(sample, transcript=transcript, deadline=deadline, asr_hypotheses=asr_hyp)
+            # Do not guess actions when a required history turn is unavailable.
+            result = None if history_incomplete else agent.run(
+                sample, transcript=transcript, deadline=deadline, asr_hypotheses=asr_hyp)
         except ProhibitedAccessError:
             raise  # compliance violation: never downgrade to a warning + empty row
         except Exception as exc:  # keep the run alive; record the failure
@@ -1089,7 +1115,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
                     "asr": asr_info,
                     "transcript": transcript,
                     "raw_transcript": asr_info.get("raw_transcript", ""),
-                    "status": None if result is None else result.status,
+                    "history_errors": history_errors,
+                    "status": "history_incomplete" if history_incomplete else (None if result is None else result.status),
                     "finish_reason": None if result is None else result.finish_reason,
                     "tool_calls": tool_calls,
                     "state_hash": state_hash,

@@ -341,7 +341,12 @@ def build_report(
     _validate_fairness(arms, experimental_variables=experimental_variables)
     arm_features = [set(enabled_features(_arm_config(arm)[1])) for arm in arms]
     changed = set().union(*(item ^ arm_features[0] for item in arm_features))
-    if any(name.startswith(("asr.", "audio.")) for name in changed):
+    # Compare effective ASR/audio values, including parameters excluded from the
+    # high-level technique fingerprint (e.g. RMS target and VAD padding).
+    from lifemate.evaluation.transcripts import asr_cache_identity
+    identities = [asr_cache_identity(app, feat) for app, feat, _, _ in map(_arm_config, arms)]
+    audio_changed = any(identity != identities[0] for identity in identities[1:])
+    if audio_changed or any(name.startswith(("asr.", "audio.")) for name in changed):
         if evaluation_mode is None:
             evaluation_mode = "audio_to_action"
         elif evaluation_mode != "audio_to_action":
@@ -448,8 +453,10 @@ def build_report(
         execution = payload.get("feature_execution") or {}
         observed = {name for name, counts in execution.items() if counts.get("n_requested", 0) and counts.get("n_executed") == counts.get("n_requested")}
         runtime_features = {f for f in entry["enabled_features"] if f.startswith(("asr.", "audio."))}
-        unknown_execution = runtime_features - set(execution)
-        degraded = sorted(set(degraded) | unknown_execution)
+        unknown_execution = (runtime_features - set(execution)) | {
+            name for name in runtime_features if (execution.get(name) or {}).get("n_not_observed", 0)
+        }
+        entry["not_observed_features"] = sorted(unknown_execution)
         effective = [f for f in entry["enabled_features"] if f not in degraded and (f not in runtime_features or f in observed)]
         entry["n_samples"] = n_samples
         entry["n_successful"] = n_successful
@@ -464,9 +471,9 @@ def build_report(
             "model_mode": provenance_block.get("model_mode"),
             "checkpoint": provenance_block.get("checkpoint"),
         }
-        if degraded:
+        if degraded or unknown_execution:
             entry["deltas"] = {key: None for key in COMPARED_METRICS}
-            entry["deltas_note"] = "invalid comparison: a requested feature degraded or was blocked"
+            entry["deltas_note"] = "invalid comparison: a requested feature degraded, was blocked, or was not observed"
             if index == 0:
                 reference_metrics = None
             arm_reports.append(entry)

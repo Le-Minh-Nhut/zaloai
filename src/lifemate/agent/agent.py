@@ -311,6 +311,9 @@ class ToolAgent:
                 kwargs["nbest_limit"] = nbest_limit
             prompt = self.prompt_builder(**kwargs)
             messages = to_messages(prompt)
+            if deadline is not None and self.clock() >= deadline:
+                status, finish_reason = "time_budget", REASON_TIME_BUDGET
+                break
             try:
                 import inspect
                 generate = self.generator.generate
