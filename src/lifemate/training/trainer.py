@@ -472,6 +472,26 @@ def chunked_causal_lm_loss(logits: Any, labels: Any, chunk_tokens: int) -> Any:
     return total / max(supervised, 1)
 
 
+def _target_suffix_inputs(model: Any, inputs: dict[str, Any], labels: Any) -> tuple[dict[str, Any], Any]:
+    """Keep the predecessor of the first target so causal shifting stays exact."""
+    import inspect
+
+    underlying = model.get_base_model() if callable(getattr(model, "get_base_model", None)) else model
+    try:
+        supports_suffix = "logits_to_keep" in inspect.signature(underlying.forward).parameters
+    except (TypeError, ValueError, AttributeError):
+        supports_suffix = False
+    if supports_suffix:
+        positions = (labels != -100).nonzero(as_tuple=False)
+        if positions.numel():
+            first = max(0, int(positions[:, -1].min().item()) - 1)
+            if first:
+                inputs = dict(inputs)
+                inputs["logits_to_keep"] = int(labels.shape[-1]) - first
+                labels = labels[..., first:]
+    return inputs, labels
+
+
 def _forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int = 0) -> Any:
     """Run the model on a tensor batch and return its scalar loss tensor.
 
@@ -483,24 +503,7 @@ def _forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int =
     if loss_chunk_tokens > 0 and "labels" in batch:
         inputs = {key: value for key, value in batch.items() if key != "labels"}
         labels = batch["labels"]
-        # The prompt has no supervised tokens. Architectures exposing
-        # logits_to_keep can skip projecting it through the large vocabulary
-        # head while retaining the token immediately preceding the first target.
-        # This preserves the causal cross-entropy and its gradients exactly.
-        import inspect
-        import torch
-        underlying = model.get_base_model() if callable(getattr(model, "get_base_model", None)) else model
-        try:
-            supports_suffix = "logits_to_keep" in inspect.signature(underlying.forward).parameters
-        except (TypeError, ValueError, AttributeError):
-            supports_suffix = False
-        if supports_suffix:
-            positions = (labels != -100).nonzero(as_tuple=False)
-            if positions.numel():
-                first = max(0, int(positions[:, -1].min().item()) - 1)
-                if first:
-                    inputs["logits_to_keep"] = int(labels.shape[-1]) - first
-                    labels = labels[..., first:]
+        inputs, labels = _target_suffix_inputs(model, inputs, labels)
         try:
             output = model(**inputs)
         except TypeError:  # pragma: no cover - model requires labels
@@ -1130,6 +1133,7 @@ class SFTTrainer:
                 handled = False
                 if self.loss_chunk_tokens > 0 and labels is not None:
                     inputs = {k: v for k, v in tensors.items() if k != "labels"}
+                    inputs, eval_labels = _target_suffix_inputs(self.model, inputs, labels)
                     try:
                         with self._autocast():
                             output = self.model(**inputs)
@@ -1137,7 +1141,7 @@ class SFTTrainer:
                         output = None
                     logits = getattr(output, "logits", None)
                     if logits is not None:
-                        shift_labels = labels[..., 1:]
+                        shift_labels = eval_labels[..., 1:]
                         seq = int(shift_labels.shape[-1])
                         vocab = int(logits.shape[-1])
                         width = max(1, self.loss_chunk_tokens)
