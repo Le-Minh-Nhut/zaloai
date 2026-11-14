@@ -54,14 +54,24 @@ WORKDIR /build
 # Coupling: base image tag nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04 <-> torch cu128 index.
 # For CPU-only image builds, pass: --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cpu
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+# Floors are LOAD-BEARING — do not relax them back to 4.4x/2.4 or the image builds fine and then
+# cannot load either supported model:
+#   * openbmb/MiniCPM5-2B (the default MODEL_NAME) ships `transformers_version: 5.6.2` in its
+#     config.json;
+#   * Qwen/Qwen3.5-4B needs the `qwen3_5` model classes, which simply do not exist at 4.44-4.5x:
+#     `from_pretrained` fails on `model_type qwen3_5` before any weight is read.
+# Verified interpreter of record: torch 2.15.0+cu132 / transformers 5.22.2 / peft 0.21.2.
+# No bitsandbytes here on purpose: this image runs inference, not QLoRA training, and nothing on
+# the inference path requests `quantization` (see scripts/infer.py / docker/entrypoint.sh), so a
+# 4-bit training dependency would only add an unused CUDA extension.
 # Note: sherpa-onnx wheels provide manylinux x86_64 and aarch64 binaries.
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
     && /opt/venv/bin/pip install --index-url "${TORCH_INDEX}" \
-        "torch>=2.4" \
+        "torch>=2.15" \
     && /opt/venv/bin/pip install \
-        "transformers>=4.44" \
-        "peft>=0.11" \
+        "transformers>=5.22" \
+        "peft>=0.21" \
         "accelerate>=0.33" \
         "soundfile>=0.12" \
         "sherpa-onnx>=1.10" \

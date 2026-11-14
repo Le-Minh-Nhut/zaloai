@@ -232,6 +232,13 @@ không phải là đánh giá tool-calling thành công** — đó chỉ là ki�
 * **TESTED ở mức code, không ở mức phần cứng**: `derive_run_config` được gọi thật với
   input tier tổng hợp (T4/L4/A100) trong một script `/tmp` — tách hàm ra bằng `ast`,
   không cần GPU. Đó là kiểm tra logic, không phải kiểm tra VRAM thật.
+* **TESTED ở mức code, không cài gì**: cổng phiên bản ở mục 1c (tách hàm bằng `ast` ra
+  `/tmp`, thay `importlib.metadata.version` + `pip` bằng bản giả) — `transformers` 4.44.2
+  với floor `>=5.22` báo `upgrade`, đúng `5.22` báo `none`, gói vắng báo `install`, và
+  trường hợp vẫn dưới floor sau khi cài thì raise. Mục 1c gate theo **phiên bản** chứ
+  không theo "đã cài hay chưa": floor khớp `pyproject.toml` (`transformers>=5.22`,
+  `peft>=0.21`, `accelerate>=0.33`, `pyyaml>=6`). `torch` chỉ **kiểm tra** (dưới 2.15 thì
+  bảo chọn runtime mới hơn), không pip cài, vì torch của Colab gắn với CUDA của runtime.
 * **ESTIMATE**: mọi con số VRAM, thời gian, Compute Unit, và toàn bộ bảng cấu hình
   khuyến nghị. Chưa có lần chạy Colab nào.
 * **Chưa kiểm chứng được**: load `Qwen/Qwen3.5-4B` trên GPU (không có weights ở máy

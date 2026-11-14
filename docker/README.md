@@ -88,6 +88,14 @@ Base image: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04` (multi-stage — a bu
 stage compiles/installs Python dependencies via `--index-url "${TORCH_INDEX}"`,
 and runtime stage copies the virtualenv).
 
+**The dependency floors are load-bearing, not hygiene.** The image pins the verified
+stack `torch>=2.15` / `transformers>=5.22` / `peft>=0.21` (interpreter of record:
+`torch 2.15.0+cu132`, `transformers 5.22.2`, `peft 0.21.2`); at `transformers` 4.44–4.5x
+`from_pretrained` fails on `model_type qwen3_5` and MiniCPM5-2B's `config.json` declares
+`transformers_version: 5.6.2`, so relaxing them back produces an image that builds and
+then cannot load either supported model. `bitsandbytes` is deliberately absent: this
+image only runs inference and nothing on that path requests 4-bit quantization.
+
 ## Run
 
 GPU run (requires a CUDA-enabled torch build in the image):
