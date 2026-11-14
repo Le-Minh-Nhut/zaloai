@@ -1033,7 +1033,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         else:
             transcript, asr_info = _transcribe(asr, sample, features=features)
         asr_error = asr_info.get("error")
-        if asr_error or (asr_checked and not transcript):
+        current_asr_failed = bool(asr_error or (asr_checked and not transcript))
+        if current_asr_failed:
             asr_failures += 1
             failures += 1
             reason = str(asr_error or "empty transcript")
@@ -1083,7 +1084,7 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         try:
             asr_hyp = asr_info.get("hypotheses")
             # Do not guess actions when a required history turn is unavailable.
-            result = None if history_incomplete else agent.run(
+            result = None if history_incomplete or current_asr_failed else agent.run(
                 sample, transcript=transcript, deadline=deadline, asr_hypotheses=asr_hyp)
         except ProhibitedAccessError:
             raise  # compliance violation: never downgrade to a warning + empty row
@@ -1116,7 +1117,7 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
                     "transcript": transcript,
                     "raw_transcript": asr_info.get("raw_transcript", ""),
                     "history_errors": history_errors,
-                    "status": "history_incomplete" if history_incomplete else (None if result is None else result.status),
+                    "status": "history_incomplete" if history_incomplete else ("asr_failed" if current_asr_failed else (None if result is None else result.status)),
                     "finish_reason": None if result is None else result.finish_reason,
                     "tool_calls": tool_calls,
                     "state_hash": state_hash,

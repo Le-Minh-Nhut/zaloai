@@ -167,3 +167,46 @@ def test_runtime_backend_identity_invalidates_cached_transcript(tmp_path):
     artifact.write_bytes(b'second version')
     transcribe_samples_cached([sample], cfg, asr=backend, cache_path=cache)
     assert backend.calls == 2
+
+
+def test_failed_history_evaluation_preserves_environment_state(tmp_path):
+    class Env:
+        def get_tool_calls(self): return []
+        def get_state_hash(self): return 'official-hash'
+    class Agent:
+        env = Env()
+        def run(self, *args, **kwargs): raise AssertionError('must not act')
+    def history(sample, deadline): raise OSError('bad audio')
+    result = evaluate_closed_loop(lambda _: Agent(), [SimpleNamespace(id='s', label=None)], split='test', data_root=tmp_path, prepare_history=history)
+    assert result['rows'][0]['status'] == 'history_incomplete'
+    assert result['rows'][0]['state_hash'] == 'official-hash'
+    assert result['n_failures'] == 1
+
+
+def test_current_asr_failure_prevents_agent_action(tmp_path, monkeypatch):
+    import copy
+    from pathlib import Path
+    from lifemate.data.loader import load_samples
+    infer = infer_module()
+    root = Path(__file__).resolve().parent / 'fixtures' / 'synthetic_lifemate'
+    original = load_samples(root, 'train', limit=1, with_labels=False)[0]
+    samples = [copy.deepcopy(original), copy.deepcopy(original)]
+    samples[0].id, samples[1].id = 'bad', 'good'
+    monkeypatch.setattr(infer, 'load_samples', lambda *args, **kwargs: samples)
+    monkeypatch.setattr(infer, '_build_asr', lambda *args, **kwargs: object())
+    monkeypatch.setattr(infer, '_transcribe', lambda backend, sample, **kwargs: ('', {'error': 'bad audio'}) if sample.id == 'bad' else ('ok', {'error': None}))
+    from lifemate.agent.agent import ToolAgent
+    called = []
+    original_run = ToolAgent.run
+    def track_run(self, sample, *args, **kwargs):
+        called.append(sample.id)
+        return original_run(self, sample, *args, **kwargs)
+    monkeypatch.setattr(ToolAgent, 'run', track_run)
+    script = tmp_path / 'script.json'
+    script.write_text(json.dumps({'bad': ['<action>{"type":"tool_call","name":"unknown","arguments":{}}</action>'], 'good': ['<action>{"type":"finish"}</action>']}))
+    out = tmp_path / 'out.jsonl'
+    assert infer.run_inference(['--split', 'train', '--data-root', str(root), '--use-mock-env', '--generator', f'dumpscript:{script}', '--asr', 'gipformer', '--output', str(out)]) == 0
+    rows = [json.loads(line) for line in out.read_text().splitlines()]
+    assert rows[0]['tool_calls'] == [] and rows[0]['state_hash']
+    assert called == ['good']
+    assert len(rows) == 2

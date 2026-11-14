@@ -482,13 +482,32 @@ def _forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int =
     """
     if loss_chunk_tokens > 0 and "labels" in batch:
         inputs = {key: value for key, value in batch.items() if key != "labels"}
+        labels = batch["labels"]
+        # The prompt has no supervised tokens. Architectures exposing
+        # logits_to_keep can skip projecting it through the large vocabulary
+        # head while retaining the token immediately preceding the first target.
+        # This preserves the causal cross-entropy and its gradients exactly.
+        import inspect
+        import torch
+        underlying = model.get_base_model() if callable(getattr(model, "get_base_model", None)) else model
+        try:
+            supports_suffix = "logits_to_keep" in inspect.signature(underlying.forward).parameters
+        except (TypeError, ValueError, AttributeError):
+            supports_suffix = False
+        if supports_suffix:
+            positions = (labels != -100).nonzero(as_tuple=False)
+            if positions.numel():
+                first = max(0, int(positions[:, -1].min().item()) - 1)
+                if first:
+                    inputs["logits_to_keep"] = int(labels.shape[-1]) - first
+                    labels = labels[..., first:]
         try:
             output = model(**inputs)
         except TypeError:  # pragma: no cover - model requires labels
             output = None
         logits = getattr(output, "logits", None)
         if logits is not None:
-            return chunked_causal_lm_loss(logits, batch["labels"], loss_chunk_tokens)
+            return chunked_causal_lm_loss(logits, labels, loss_chunk_tokens)
 
     output = model(**batch)
     loss = getattr(output, "loss", None)
@@ -880,6 +899,9 @@ class SFTTrainer:
                     tensors = to_torch_batch(batch, self.device)
                     with self._autocast():
                         loss = _forward_loss(self.model, tensors, self.loss_chunk_tokens)
+                    loss_value = float(loss.detach().item())
+                    if not math.isfinite(loss_value):
+                        raise LifeMateError(f"non-finite training loss at step {step}: {loss_value}")
                     self._pending += 1
                     self._cursor += 1
                     # Scale by the accumulation count; a short trailing group is
@@ -890,7 +912,7 @@ class SFTTrainer:
                         self.scaler.scale(scaled_loss).backward()
                     else:
                         scaled_loss.backward()
-                    last_loss = float(loss.detach().item())
+                    last_loss = loss_value
                     if self._pending >= self.accum:
                         optimizer_step()
                         if self.stop.requested:
@@ -1055,8 +1077,9 @@ class SFTTrainer:
         try:
             import torch  # noqa: PLC0415
 
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-        except Exception:  # pragma: no cover - torch absent
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip,
+                                           error_if_nonfinite=self.scaler is None)
+        except ImportError:  # pragma: no cover - torch absent
             return
 
     def _maybe_log(self, step: int, loss: float | None) -> None:

@@ -28,6 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from lifemate.agent.protocol import Action, parse_action, render_action
 from lifemate.errors import ProhibitedAccessError
+from lifemate.data.history import HistoryTranscriptError
 
 from . import error_analysis, metrics
 
@@ -431,10 +432,16 @@ def evaluate_closed_loop(
         budget_deadline = None if deadline_seconds is None else sample_started + deadline_seconds
         history_seconds = 0.0
         asr_seconds = 0.0
+        history_error = None
         try:
             if prepare_history is not None:
                 stage_started = time.monotonic()
-                prepare_history(sample, budget_deadline)
+                try:
+                    prepare_history(sample, budget_deadline)
+                except (ProhibitedAccessError, HistoryTranscriptError):
+                    raise
+                except Exception as exc:
+                    history_error = f"{type(exc).__name__}: {exc}"[:300]
                 history_seconds = time.monotonic() - stage_started
             runtime_transcript = None
             runtime_info = None
@@ -443,7 +450,18 @@ def evaluate_closed_loop(
                 runtime_transcript, runtime_info = transcribe_sample(sample)
                 asr_seconds = time.monotonic() - stage_started
             agent = agent_factory(sample)
-        except ProhibitedAccessError:
+            if history_error is not None:
+                env = getattr(agent, "env", None)
+                rows.append({"id": sample_id, "status": "history_incomplete",
+                             "tool_calls": _from_env(env, "get_tool_calls", []),
+                             "state_hash": _from_env(env, "get_state_hash", ""),
+                             "errors": [history_error], "history_seconds": history_seconds,
+                             "current_asr_seconds": asr_seconds,
+                             "total_seconds": time.monotonic() - sample_started,
+                             "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline})
+                failures.append({"id": sample_id, "stage": "history", "error": history_error})
+                continue
+        except (ProhibitedAccessError, HistoryTranscriptError):
             raise
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "agent_factory", "error": f"{type(exc).__name__}: {exc}"[:300]})
