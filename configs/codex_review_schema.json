@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "experiment_id", "verdict", "confidence", "evidence", "root_cause", "affected_components", "recommended_action", "decision", "retraining_necessary", "checkpoint_valid"],
+  "properties": {
+    "event_id": {"type": "string"}, "experiment_id": {"type": "string"},
+    "verdict": {"type": "string", "enum": ["PASS", "BUG_CONFIRMED", "MODEL_UNDERPERFORMANCE", "INCONCLUSIVE", "BLOCKED"]},
+    "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]},
+    "evidence": {"type": "array", "items": {"type": "string"}},
+    "root_cause": {"type": ["string", "null"]},
+    "affected_components": {"type": "array", "items": {"type": "string"}},
+    "recommended_action": {"type": "string"},
+    "decision": {"type": "string", "enum": ["CONTINUE", "RUN_EVALUATION", "START_NEXT_EXPERIMENT", "INVESTIGATE", "RETRY_FROM_CHECKPOINT", "SKIP_EXPERIMENT", "STOP"]},
+    "retraining_necessary": {"type": ["boolean", "null"]},
+    "checkpoint_valid": {"type": ["boolean", "null"]}
+  }
+}
