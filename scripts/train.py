@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Train the LifeMate action policy with full-parameter SFT (default) or LoRA.
+"""Train the LifeMate action policy with LoRA (default) or full-parameter SFT.
 
 Usage:
-    # full fine-tuning (DEFAULT)
-    python3 scripts/train.py --config configs/training_full.yaml
-    # LoRA
-    python3 scripts/train.py --config configs/training_lora.yaml --tuning lora
+    # LoRA (DEFAULT: the only mode that fits one consumer GPU)
+    python3 scripts/train.py
+    # full fine-tuning (explicit; needs ~80 GB, see configs/training_full.yaml)
+    python3 scripts/train.py --config configs/training_full.yaml --tuning full
     # planning only: no weight loading
     python3 scripts/train.py --dry-run --param-count 4000000000 --tuning full
     # CPU smoke test: tiny model, 2 steps, synthetic records
@@ -38,22 +38,34 @@ EXIT_NO_DATA = 2
 EXIT_ENV = 3
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Command line interface (no CLI override; the config decides, and the config default is ``full``)."""
+    """Command line interface (no CLI override; the config decides, and the config default is ``lora``)."""
     parser = argparse.ArgumentParser(
         description="Full-parameter (default) or LoRA SFT for the LifeMate action policy.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", default="configs/training_full.yaml", help="YAML config path")
+    parser.add_argument(
+        "--config",
+        default="configs/training_lora.yaml",
+        help="YAML config path (default: the LoRA config, the only mode that fits a "
+        "single consumer GPU; pass configs/training_full.yaml explicitly for full FT)",
+    )
     parser.add_argument(
         "--tuning",
         choices=TUNING_MODES,
         default=None,
-        help="tuning mode; overrides training.tuning_mode from the config (default: from config, or 'full')",
+        help="tuning mode; overrides training.tuning_mode from the config (default: from config, or 'lora'). "
+        "'qlora' = LoRA on a 4-bit nf4 base and also sets training.quantization=nf4",
     )
     parser.add_argument("--dataset-dir", default=None, help="dir holding train.jsonl/val.jsonl")
-    parser.add_argument("--model", default=None, help="override model.name")
+    parser.add_argument("--model", default=None, help="override model.name (wins over YAML)")
     parser.add_argument("--output-dir", default=None, help="override training.output_dir")
-    parser.add_argument("--resume", default=None, help="resume from this step-<n> checkpoint dir")
+    parser.add_argument(
+        "--resume",
+        "--resume-from",
+        dest="resume",
+        default=None,
+        help="resume from this step-<n> checkpoint dir (alias: --resume-from)",
+    )
     parser.add_argument("--max-steps", type=int, default=None, help="stop after N optimizer steps")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and preflight only")
     parser.add_argument(
@@ -69,7 +81,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="checkpoint subdirectory name (default: the tuning mode, e.g. 'full'/'lora')",
     )
-    parser.add_argument("--seq-len", type=int, default=None, help="override training.max_seq_length")
+    parser.add_argument(
+        "--seq-len",
+        "--max-seq-length",
+        dest="seq_len",
+        type=int,
+        default=None,
+        help="override training.max_seq_length (alias: --max-seq-length)",
+    )
     parser.add_argument("--device", default=None, help="override model.device (e.g. 'cpu' or 'cuda')")
     return parser.parse_args(argv)
 
@@ -203,6 +222,72 @@ def _preflight(cfg: Any, args: argparse.Namespace, model: Any = None) -> dict:
     print(format_report(report))
     return report
 
+#: Preflight verdicts that mean "this will not fit".
+_NO_FIT_VERDICTS = frozenset({"does_not_fit"})
+
+
+_FP16_WARNED = False
+
+
+def _warn_fp16(cfg: Any) -> None:
+    """One loud warning for any fp16-on-CUDA run; no sequence threshold guessed.
+
+    The preflight heuristic UNDER-estimates this case (it projects 8.54 GB for
+    LoRA at seq 8192, while the MEASURED float16 step reserved 15.14 GB during an
+    earlier run), so the verdict
+    guard below cannot be the only signal. On a bf16-capable card bf16 is
+    strictly better: MEASURED 14.37 GB allocated on the train-only step (batch
+    padded to exactly 8192) and a completed step, where float16 OOM'd on the
+    first backward.
+    """
+    global _FP16_WARNED
+    if _FP16_WARNED:
+        return
+    precision = str(getattr(cfg.training, "precision", "bfloat16") or "bfloat16").strip().lower()
+    if precision not in {"float16", "fp16", "half"}:
+        return
+    if not str(getattr(getattr(cfg, "model", None), "device", "") or "").startswith("cuda"):
+        return
+    _FP16_WARNED = True
+    print(
+        "warning: precision=float16 uses GradScaler loss scaling. MEASURED on a "
+        "16.57 GB RTX 5070 Ti: LoRA bf16 at seq 8192 (train-only step) completes at "
+        "14.37 GB allocated, "
+        "while the identical float16 run OOMs on the first backward (15.14 GB reserved, "
+        "earlier measurement). "
+        "Prefer precision: bfloat16 on a bf16-capable card."
+    )
+
+
+def _refuse_fp16_overcommit(cfg: Any, report: dict[str, Any]) -> str | None:
+    """Message for an fp16 run whose preflight says it cannot fit, else ``None``.
+
+    MEASURED on an RTX 5070 Ti (16.57 GB): one LoRA bf16 **train-only** step at
+    seq 8192 (batch padded to exactly 8192 tokens) peaks at 14.37 GB allocated
+    and completes; the same run at ``precision: float16``
+    OOMs on the first backward ("Tried to allocate 510.00 MiB … 14.22 GiB in
+    use"). fp16 keeps its own fp32 master/logit copies and gained nothing here,
+    so refusing up front beats a multi-hour run that dies at step 1. The
+    decision is the preflight VERDICT, not a hardcoded sequence limit.
+    """
+    precision = str(getattr(cfg.training, "precision", "bfloat16") or "bfloat16").strip().lower()
+    if precision not in {"float16", "fp16", "half"}:
+        return None
+    if str(report.get("verdict") or "") not in _NO_FIT_VERDICTS:
+        return None
+    return (
+        f"precision=float16 at max_seq_length={report.get('seq_len')} does not fit: the "
+        f"preflight estimates {report.get('total_gb')} GB against "
+        f"{report.get('available_gb')} GB free (verdict {report.get('verdict')}). "
+        "MEASURED on a 16.57 GB RTX 5070 Ti: the identical LoRA run at seq 8192 "
+        "peaks at 14.37 GB allocated in bf16 on the train-only step and SUCCEEDS, "
+        "while float16 OOMs on the "
+        "first backward (earlier measurement: peak 14.53 GB allocated, 15.14 GB reserved). float16 needs "
+        "grad scaling and buys nothing here. Use precision: bfloat16 (or float32) on "
+        "a bf16-capable card, or lower training.max_seq_length / "
+        "per_device_train_batch_size until the preflight verdict is 'fits'."
+    )
+
 def _load_model(cfg: Any, args: argparse.Namespace):
     """Load the real base model + tokenizer for training.
 
@@ -223,7 +308,11 @@ def _load_model(cfg: Any, args: argparse.Namespace):
     # requested here — downcasting later would already have rounded the weights.
     # bf16 speed comes from autocast in the trainer. LoRA keeps the base at
     # ``precision`` because the base is frozen and only adapters train.
-    load_dtype = cfg.training.precision if cfg.training.tuning_mode == "lora" else "float32"
+    # QLoRA stores the base as nf4 and computes in ``precision``; the k-bit
+    # preparation (peft) decides the trainable dtypes, so no fp32 master is
+    # requested here.
+    adapter_mode = cfg.training.tuning_mode in ("lora", "qlora")
+    load_dtype = cfg.training.precision if adapter_mode else "float32"
     try:
         bundle = load_model_and_tokenizer(
             cfg.model.name,
@@ -236,6 +325,7 @@ def _load_model(cfg: Any, args: argparse.Namespace):
             trainable=True,
             for_training=True,
             max_new_tokens=cfg.agent.max_new_tokens,
+            quantization=cfg.training.quantization,
         )
     except Exception as exc:  # heavy ML stack raises a wide variety
         raise LifeMateError(
@@ -278,6 +368,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.tuning is not None and args.tuning != cfg.training.tuning_mode:
         print(f"tuning mode: {cfg.training.tuning_mode} (config) -> {args.tuning} (--tuning)")
         cfg.training.tuning_mode = args.tuning
+    if args.tuning is not None:
+        # Quantization follows the mode explicitly: qlora means a 4-bit base,
+        # every other mode means full-precision weights. Never implied.
+        cfg.training.quantization = "nf4" if args.tuning == "qlora" else "none"
     if args.model:
         cfg.model.name = args.model
     if args.output_dir:
@@ -301,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg.training.max_seq_length = min(int(cfg.training.max_seq_length), 512)
         cfg.training.logging_steps = 1
 
-    print(f"tuning mode : {cfg.training.tuning_mode}  (default: full)")
+    print(f"tuning mode : {cfg.training.tuning_mode}  (default: lora)")
     print(f"model       : {cfg.model.name}  device={cfg.model.device} precision={cfg.training.precision}")
     print(f"output dir  : {cfg.training.output_dir}")
 
@@ -338,12 +432,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # -------------------------------------------------------------- preflight
     if args.dry_run and args.param_count is None and not args.smoke:
-        print("\n(--dry-run without --param-count: using the 4B default for the estimate)")
+        print("\n(--dry-run without --param-count: using the model profile's verified parameter count)")
     try:
-        _preflight(cfg, args)
+        preflight = _preflight(cfg, args)
     except LifeMateError as exc:
         print(f"preflight failed: {exc}")
         return EXIT_FAIL
+    _warn_fp16(cfg)
+    refusal = _refuse_fp16_overcommit(cfg, preflight)
+    if refusal:
+        print(f"environment error: {refusal}")
+        return EXIT_ENV
 
     if args.dry_run:
         plan = {
@@ -393,12 +492,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ENV
 
     # ------------------------------------------------------------- configure
-    is_lora = cfg.training.tuning_mode == "lora"
+    is_lora = cfg.training.tuning_mode in ("lora", "qlora")
     try:
         if is_lora:
-            from lifemate.training.lora_finetuning import configure_lora  # noqa: PLC0415
+            from lifemate.training import lora_finetuning  # noqa: PLC0415
 
-            report = configure_lora(model, cfg)
+            if cfg.training.tuning_mode == "qlora":
+                report = lora_finetuning.configure_qlora(model, tokenizer, cfg)
+            else:
+                report = lora_finetuning.configure_lora(model, cfg)
             model = report.pop("model")
             print(
                 f"LoRA        : r={report['r']} alpha={report['alpha']} "
@@ -427,10 +529,17 @@ def main(argv: list[str] | None = None) -> int:
     # call ran before any weights were loaded, so it could only report the 0.5%
     # placeholder. This one is the number the run actually has to fit.
     try:
-        _preflight(cfg, args, model=model)
+        preflight = _preflight(cfg, args, model=model)
     except LifeMateError as exc:
         print(f"preflight failed: {exc}")
         return EXIT_FAIL
+    _warn_fp16(cfg)
+    # ``report`` below is the adapter/full-FT report and goes into the run summary:
+    # keep the preflight in its own name so it can never clobber it.
+    refusal = _refuse_fp16_overcommit(cfg, preflight)
+    if refusal:
+        print(f"environment error: {refusal}")
+        return EXIT_ENV
 
     # ---------------------------------------------------------------- train
     from lifemate.training.callbacks import StopController  # noqa: PLC0415

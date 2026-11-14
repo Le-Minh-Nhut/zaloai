@@ -272,8 +272,62 @@ def optimizer_steps_per_epoch(n_examples: int, micro_batch: int, accum: int) -> 
     effective = max(1, int(micro_batch)) * max(1, int(accum))
     return max(1, math.ceil(max(0, int(n_examples)) / effective))
 
-def _forward_loss(model: Any, batch: Mapping[str, Any]) -> Any:
-    """Run the model on a tensor batch and return its scalar loss tensor."""
+def chunked_causal_lm_loss(logits: Any, labels: Any, chunk_tokens: int) -> Any:
+    """Causal-LM cross-entropy in sequence chunks, mathematically exact.
+
+    ``transformers``' ``ForCausalLMLoss`` upcasts the WHOLE ``[seq, vocab]``
+    logits tensor to fp32 before the fused ``cross_entropy``. At vocab 130560 and
+    seq 8192 that is one 3.98 GiB allocation (measured OOM on a 16.57 GB card).
+    Chunking over the sequence dimension caps that temporary at
+    ``chunk_tokens * vocab * 4`` bytes.
+
+    Equivalence is preserved by accumulating a **sum** of per-chunk token losses
+    and dividing once by the number of supervised tokens: dividing per chunk and
+    averaging would over-weight a short trailing chunk.
+    """
+    import torch  # noqa: PLC0415 - lazy on purpose
+    import torch.nn.functional as F  # noqa: PLC0415
+
+    shift_labels = labels[..., 1:]
+    seq = int(shift_labels.shape[-1])
+    vocab = int(logits.shape[-1])
+    total = None
+    supervised = 0
+    step = max(1, int(chunk_tokens))
+    for start in range(0, seq, step):
+        stop = min(start + step, seq)
+        target = shift_labels[..., start:stop]
+        piece = logits[..., start:stop, :].float()  # only this slice is upcast
+        piece = piece.reshape(-1, vocab)
+        loss_sum = F.cross_entropy(
+            piece, target.reshape(-1), ignore_index=-100, reduction="sum"
+        )
+        total = loss_sum if total is None else total + loss_sum
+        supervised += int((target != -100).sum())
+    if total is None:  # pragma: no cover - seq == 0 is impossible for a real batch
+        return logits.sum() * 0.0
+    # A zero-grad-linked zero when nothing is supervised, instead of nan.
+    return total / max(supervised, 1)
+
+
+def _forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int = 0) -> Any:
+    """Run the model on a tensor batch and return its scalar loss tensor.
+
+    ``loss_chunk_tokens <= 0`` keeps the original single-shot path (the model
+    computes the loss itself). A positive value asks for logits and computes the
+    chunked loss here; a model that returns no logits falls back to the original
+    path rather than failing.
+    """
+    if loss_chunk_tokens > 0 and "labels" in batch:
+        inputs = {key: value for key, value in batch.items() if key != "labels"}
+        try:
+            output = model(**inputs)
+        except TypeError:  # pragma: no cover - model requires labels
+            output = None
+        logits = getattr(output, "logits", None)
+        if logits is not None:
+            return chunked_causal_lm_loss(logits, batch["labels"], loss_chunk_tokens)
+
     output = model(**batch)
     loss = getattr(output, "loss", None)
     if loss is None and isinstance(output, (tuple, list)) and output:
@@ -283,6 +337,12 @@ def _forward_loss(model: Any, batch: Mapping[str, Any]) -> Any:
             "model returned no loss; pass labels= so the causal-LM head computes cross-entropy"
         )
     return loss
+
+#: Precision spellings that mean fp16 / bf16, lowercased (the loader's
+#: ``DTYPE_MAP`` accepts exactly these). fp16 needs loss scaling; bf16 does not.
+FP16_PRECISIONS = frozenset({"float16", "fp16", "half"})
+BF16_PRECISIONS = frozenset({"bfloat16", "bf16"})
+
 
 class SFTTrainer:
     """Minimal SFT loop: epochs → micro-batches → clip → optimizer/scheduler step.
@@ -345,7 +405,24 @@ class SFTTrainer:
         )
         self.save_strategy = str(getattr(training, "save_strategy", "epoch") or "epoch")
         self.eval_strategy = str(getattr(training, "eval_strategy", "epoch") or "epoch")
-        self.precision = str(getattr(training, "precision", "bfloat16") or "bfloat16")
+        # Normalised the same way the loader's DTYPE_MAP is (strip + lower), so
+        # "FP16"/"Half" reach the same autocast + scaler branches as "float16".
+        self.precision = str(getattr(training, "precision", "bfloat16") or "bfloat16").strip().lower()
+        # fp16 on CUDA needs loss scaling: fp16's exponent range overflows on the
+        # first large grad and the adapter dies silently (fp16 has no bf16's
+        # range). bf16/fp32 and CPU runs get ``None`` and keep the plain
+        # backward -> clip -> step order untouched.
+        self.scaler = self._make_grad_scaler()
+        # 0 => the model's own (whole-vocab, fp32-upcast) loss; >0 => chunked CE.
+        self.loss_chunk_tokens = int(getattr(training, "loss_chunk_tokens", 0) or 0)
+        # Resolved from ``ModelConfig.name`` (the single identity field) and
+        # threaded into every supervised example, so the terminator and template
+        # kwargs do not depend on the tokenizer's (checkpoint-relative) metadata.
+        from lifemate.models.profiles import resolve_profile  # noqa: PLC0415 - lazy
+
+        self.profile = resolve_profile(
+            getattr(getattr(cfg, "model", None), "name", "") if cfg is not None else ""
+        )
         self.start_step = 0
         self._last_saved_step: int | None = None
         self._last_evaluated_step: int | None = None
@@ -361,6 +438,7 @@ class SFTTrainer:
                 list(item.get("messages") or []),
                 str(item.get("target") or ""),
                 self.max_seq_length,
+                profile=self.profile,
             )
             if example.get("kept"):
                 examples.append(example)
@@ -390,15 +468,34 @@ class SFTTrainer:
         self.optimizer = self.optimizer or optimizer
         self.scheduler = self.scheduler or scheduler
 
+    def _make_grad_scaler(self):
+        """A ``torch.amp.GradScaler`` for fp16-on-CUDA runs, else ``None``.
+
+        Only fp16 needs it. The scaler's state (the current scale and its
+        growth/backoff counters) IS persisted next to the optimizer tensors and
+        restored by :meth:`_load_optimizer_state`, so a resumed fp16 run does
+        not restart the scale search from 65536.
+        """
+        if self.precision not in FP16_PRECISIONS:
+            return None
+        if not (isinstance(self.device, str) and self.device.startswith("cuda")):
+            return None
+        try:
+            import torch  # noqa: PLC0415
+
+            return torch.amp.GradScaler("cuda")
+        except Exception:  # pragma: no cover - old torch / no CUDA build
+            return None
+
     def _autocast(self):
         """Autocast context manager (null context on CPU / fp32)."""
         try:
             import torch  # noqa: PLC0415
 
             if isinstance(self.device, str) and self.device.startswith("cuda"):
-                if self.precision in {"bfloat16", "bf16"}:
+                if self.precision in BF16_PRECISIONS:
                     return torch.autocast("cuda", dtype=torch.bfloat16)
-                if self.precision in {"float16", "fp16"}:
+                if self.precision in FP16_PRECISIONS:
                     return torch.autocast("cuda", dtype=torch.float16)
             return _null_context()
         except Exception:  # pragma: no cover - torch absent
@@ -447,6 +544,11 @@ class SFTTrainer:
         def optimizer_step() -> None:
             """One optimizer step; shared by the accumulate path and the flush."""
             nonlocal step, pending, val_loss, checkpoint_dir
+            if self.scaler is not None:
+                # fp16: gradients are still multiplied by the loss scale here, and
+                # both the partial-group rescale and clip_grad_norm_ must see TRUE
+                # magnitudes, so unscale first and never scale twice.
+                self.scaler.unscale_(self.optimizer)
             if 0 < pending < self.accum:
                 # Partial trailing group: gradients were scaled by 1/accum but only
                 # ``pending`` micro-batches contributed, so rescale by accum/pending
@@ -456,7 +558,13 @@ class SFTTrainer:
                     if param.grad is not None:
                         param.grad.mul_(factor)
             self._clip_gradients()
-            self.optimizer.step()
+            if self.scaler is not None:
+                # Inf/NaN guard: ``step`` skips the update when a grad is not
+                # finite; ``update`` then backs the scale off.
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
@@ -486,11 +594,16 @@ class SFTTrainer:
                     batch = self.collator([train_examples[i] for i in chunk])
                     tensors = to_torch_batch(batch, self.device)
                     with self._autocast():
-                        loss = _forward_loss(self.model, tensors)
+                        loss = _forward_loss(self.model, tensors, self.loss_chunk_tokens)
                     pending += 1
                     # Scale by the accumulation count; a short trailing group is
-                    # rescaled by accum/pending before its optimizer step.
-                    (loss / self.accum).backward()
+                    # rescaled by accum/pending before its optimizer step. Under
+                    # fp16 the scaler multiplies that by its dynamic loss scale.
+                    scaled_loss = loss / self.accum
+                    if self.scaler is not None:
+                        self.scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
                     last_loss = float(loss.detach().item())
 
                     if pending >= self.accum:
@@ -583,8 +696,25 @@ class SFTTrainer:
         self.tracker.log(payload)
 
     def evaluate(self, examples: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
-        """Teacher-forced validation loss + per-target-token accuracy."""
+        """Teacher-forced validation loss + per-target-token accuracy.
+
+        Two paths, and the shipped default is the first:
+
+        * ``loss_chunk_tokens > 0`` (default 1024): the forward runs WITHOUT
+          ``labels``, so the model's own ``ForCausalLMLoss`` — which upcasts the
+          whole ``[seq, vocab]`` logits tensor to fp32 — is never invoked, and
+          both the loss sum and the argmax count run on one sequence chunk at a
+          time. At seq 8192 / vocab 130560 that removes a 4.28 GB fp32 upcast
+          plus a 2.14 GB ``.contiguous()`` shift copy from the eval step.
+        * ``loss_chunk_tokens <= 0``: the original single-shot path, kept
+          verbatim so the numbers can be compared against the chunked one.
+
+        Shift semantics are identical in both paths: ``logits[..., :-1, :]``
+        against ``labels[..., 1:]``. A model that returns no logits falls back to
+        its own loss, exactly as before.
+        """
         import torch  # noqa: PLC0415 - lazy
+        import torch.nn.functional as F  # noqa: PLC0415
 
         data = list(examples) if examples is not None else self._prepare_examples(self.val_records, "val")
         self.model.eval()
@@ -595,29 +725,63 @@ class SFTTrainer:
             for start in range(0, len(data), self.micro_batch):
                 batch = self.collator(data[start : start + self.micro_batch])
                 tensors = to_torch_batch(batch, self.device)
-                with self._autocast():
-                    output = self.model(**tensors)
-                loss = getattr(output, "loss", None)
-                if loss is None and isinstance(output, (tuple, list)) and output:
-                    loss = output[0]
-                logits = getattr(output, "logits", None)
                 labels = tensors.get("labels")
-                if logits is not None and labels is not None:
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    mask = shift_labels != -100
-                    supervised = int(mask.sum().item())
-                    if loss is not None and supervised:
-                        total_loss += float(loss.detach().item()) * supervised
-                        total_tokens += supervised
-                    if supervised:
-                        preds = shift_logits.argmax(dim=-1)
-                        correct += int((preds[mask] == shift_labels[mask]).sum().item())
-                elif loss is not None and labels is not None:
-                    supervised = int((labels != -100).sum().item())
-                    if supervised:
-                        total_loss += float(loss.detach().item()) * supervised
-                        total_tokens += supervised
+                handled = False
+                if self.loss_chunk_tokens > 0 and labels is not None:
+                    inputs = {k: v for k, v in tensors.items() if k != "labels"}
+                    try:
+                        with self._autocast():
+                            output = self.model(**inputs)
+                    except TypeError:  # pragma: no cover - model requires labels
+                        output = None
+                    logits = getattr(output, "logits", None)
+                    if logits is not None:
+                        shift_labels = labels[..., 1:]
+                        seq = int(shift_labels.shape[-1])
+                        vocab = int(logits.shape[-1])
+                        width = max(1, self.loss_chunk_tokens)
+                        for lo in range(0, seq, width):
+                            hi = min(lo + width, seq)
+                            target = shift_labels[..., lo:hi]
+                            slice_logits = logits[..., lo:hi, :]
+                            total_loss += float(
+                                F.cross_entropy(
+                                    slice_logits.float().reshape(-1, vocab),
+                                    target.reshape(-1),
+                                    ignore_index=-100,
+                                    reduction="sum",
+                                ).item()
+                            )
+                            # argmax on the slice only, never on [seq, vocab].
+                            preds = slice_logits.argmax(dim=-1)
+                            match = target != -100
+                            correct += int((preds[match] == target[match]).sum().item())
+                            total_tokens += int(match.sum().item())
+                        handled = True
+
+                if not handled:
+                    with self._autocast():
+                        output = self.model(**tensors)
+                    loss = getattr(output, "loss", None)
+                    if loss is None and isinstance(output, (tuple, list)) and output:
+                        loss = output[0]
+                    logits = getattr(output, "logits", None)
+                    if logits is not None and labels is not None:
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        mask = shift_labels != -100
+                        supervised = int(mask.sum().item())
+                        if loss is not None and supervised:
+                            total_loss += float(loss.detach().item()) * supervised
+                            total_tokens += supervised
+                        if supervised:
+                            preds = shift_logits.argmax(dim=-1)
+                            correct += int((preds[mask] == shift_labels[mask]).sum().item())
+                    elif loss is not None and labels is not None:
+                        supervised = int((labels != -100).sum().item())
+                        if supervised:
+                            total_loss += float(loss.detach().item()) * supervised
+                            total_tokens += supervised
         self.model.train()
         return {
             "val_loss": round(total_loss / total_tokens, 6) if total_tokens else None,
@@ -659,10 +823,15 @@ class SFTTrainer:
             "state": self._state(step, epoch),
             "meta": {
                 "model_name": getattr(getattr(self.cfg, "model", None), "name", None),
+                # Profile family makes an adapter/base mismatch detectable before
+                # any weight is merged (see models.checkpoint compat check).
+                "model_profile": self.profile.name if self.profile else None,
                 "seed": self.seed,
                 "config": _cfg_dict(self.cfg),
                 "dataset_manifest_hash": self.dataset_manifest_hash,
-                "tuning_mode": "lora" if self.is_lora else "full",
+                "tuning_mode": str(
+                    getattr(self.training, "tuning_mode", "lora" if self.is_lora else "full")
+                ),
             },
         }
         written = self.checkpoint_manager.save(step, payload, tag=tag)
@@ -682,6 +851,8 @@ class SFTTrainer:
         payload = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
+            # fp16 grad-scaler state (None on bf16/fp32/CPU runs).
+            "grad_scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "step": step,
             "epoch": epoch,
         }
@@ -841,6 +1012,8 @@ class SFTTrainer:
             self.optimizer.load_state_dict(payload["optimizer"])
             if self.scheduler is not None and payload.get("scheduler") is not None:
                 self.scheduler.load_state_dict(payload["scheduler"])
+            if self.scaler is not None and payload.get("grad_scaler"):
+                self.scaler.load_state_dict(payload["grad_scaler"])
         except Exception as exc:
             raise LifeMateError(f"failed to restore optimizer state from {state_file}: {exc}") from exc
 

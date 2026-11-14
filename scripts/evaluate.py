@@ -161,9 +161,13 @@ def _generator(cfg: Any, args: argparse.Namespace | None = None, sample_id: list
         temperature=0.0,
         max_new_tokens=cfg.agent.max_new_tokens,
     )
+    # Base identity comes from the config, not the checkpoint directory: a saved
+    # tokenizer loses the family name, and the profile decides the prompt
+    # template, the terminator and the decode stop ids.
     return HFGenerator(
         bundle.model,
         bundle.tokenizer,
+        model_name=cfg.model.name,
         max_new_tokens=cfg.agent.max_new_tokens,
         temperature=0.0,
         device=getattr(bundle, "device", None),

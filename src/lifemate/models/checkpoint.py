@@ -26,6 +26,7 @@ from lifemate.errors import LifeMateError
 __all__ = [
     "CheckpointInfo",
     "META_FILENAME",
+    "assert_adapter_base_matches",
     "load_checkpoint_meta",
     "merge_lora_adapter",
     "resolve_checkpoint",
@@ -260,6 +261,60 @@ def resolve_checkpoint(path: str | Path) -> CheckpointInfo:
     )
 
 
+def assert_adapter_base_matches(adapter_dir: str | Path, base_model_name: str | None) -> dict[str, Any]:
+    """Refuse an adapter recorded for a different model family.
+
+    Reads, in order of authority:
+
+    1. ``lifemate_meta.json`` (``model_name`` / ``model_profile``) written by
+       :func:`save_checkpoint`;
+    2. ``adapter_config.json``'s ``base_model_name_or_path`` (peft's own record).
+
+    Comparison is by MODEL PROFILE family, so ``openbmb/MiniCPM5-2B`` and a local
+    ``models/MiniCPM5-2B`` directory are the same base, while a MiniCPM adapter
+    on a Qwen base is a hard error. When neither record exists the check is a
+    no-op (``{"recorded": False}``): nothing is known, and refusing would block
+    legacy adapters.
+
+    Raises :class:`LifeMateError` BEFORE any weight is merged or attached.
+    """
+    from lifemate.models.profiles import resolve_profile  # noqa: PLC0415 - lazy
+
+    path = Path(str(adapter_dir))
+    meta = load_checkpoint_meta(path) if path.is_dir() else {}
+    recorded = meta.get("model_name")
+    source = "lifemate_meta.json:model_name"
+    if not recorded and path.is_dir():
+        adapter_config = path / "adapter_config.json"
+        if adapter_config.exists():
+            try:
+                payload = json.loads(adapter_config.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                payload = {}
+            if isinstance(payload, dict):
+                recorded = payload.get("base_model_name_or_path")
+                source = "adapter_config.json:base_model_name_or_path"
+    if not recorded:
+        return {"recorded": False, "recorded_base": None, "requested_base": base_model_name}
+
+    recorded_profile = meta.get("model_profile") or resolve_profile(recorded).name
+    requested_profile = resolve_profile(base_model_name).name if base_model_name else None
+    if requested_profile is not None and recorded_profile != requested_profile:
+        raise LifeMateError(
+            f"checkpoint {path} was trained for model {recorded!r} "
+            f"(profile {recorded_profile!r}) but base {base_model_name!r} "
+            f"(profile {requested_profile!r}) was requested. Refusing to attach/merge an "
+            "adapter onto an incompatible base: the projections would be re-initialised "
+            "and the result would silently generate nonsense. Pass the matching --model."
+        )
+    return {
+        "recorded": True,
+        "recorded_base": recorded,
+        "recorded_profile": recorded_profile,
+        "requested_base": base_model_name,
+        "source": source,
+    }
+
 def merge_lora_adapter(
     base_model_name: str,
     adapter_dir: str | Path,
@@ -276,6 +331,8 @@ def merge_lora_adapter(
     adapter_path = Path(str(adapter_dir))
     if not adapter_path.exists():
         raise LifeMateError(f"LoRA adapter directory not found: {adapter_path}")
+    # Identity check BEFORE any weight is loaded or merged.
+    assert_adapter_base_matches(adapter_path, base_model_name)
     try:
         from peft import PeftModel
         from transformers import AutoModelForCausalLM, AutoTokenizer

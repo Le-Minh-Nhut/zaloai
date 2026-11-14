@@ -19,6 +19,7 @@ __all__ = [
     "ATTENTION_MLP_SUFFIXES",
     "HYBRID_SUFFIXES",
     "configure_lora",
+    "configure_qlora",
     "discover_target_modules",
     "load_adapter",
     "merge_adapter",
@@ -55,6 +56,50 @@ def discover_target_modules(
     """
     present = {_module_suffix(name) for name, _module in getattr(model, "named_modules", lambda: [])()}
     return sorted({suffix for suffix in candidates if suffix in present})
+
+def configure_qlora(
+    model: Any,
+    tokenizer: Any,
+    cfg: Any,
+    target_modules: Sequence[str] | None = None,
+) -> dict:
+    """QLoRA: 4-bit frozen base + LoRA adapters, then the normal LoRA checks.
+
+    The base must ALREADY be loaded with ``quantization='nf4'`` (see
+    ``models.loader.load_model_and_tokenizer``); this function only performs the
+    k-bit preparation peft requires and then delegates, so every invariant
+    (nothing but ``lora_`` parameters trainable, targets resolved from the real
+    module names) is checked in one place.
+
+    ``prepare_model_for_kbit_training`` upcasts LayerNorms/outputs to fp32 and
+    never casts the 4-bit weights, which is exactly why a plain
+    ``model.to(dtype)`` must not be used around it.
+    """
+    try:
+        from peft import prepare_model_for_kbit_training  # noqa: PLC0415 - lazy
+    except Exception as exc:  # pragma: no cover - peft absent
+        raise LifeMateError(f"QLoRA requires the 'peft' package: {exc}") from exc
+    if not bool(getattr(getattr(model, "config", None), "quantization_config", None)):
+        raise LifeMateError(
+            "configure_qlora received an unquantized model; load it with "
+            "quantization='nf4' first (a QLoRA run on 16-bit weights is just LoRA "
+            "with a misleading name)"
+        )
+    training = getattr(cfg, "training", cfg)
+    prepared = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=bool(getattr(training, "gradient_checkpointing", False)),
+    )
+    report = configure_lora(prepared, cfg, target_modules)
+    report["tuning_mode"] = "qlora"
+    report["quantization"] = {
+        "load_in_4bit": True,
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_compute_dtype": str(getattr(training, "precision", "bfloat16")),
+        "bnb_4bit_use_double_quant": True,
+        "source": "active checkpoint config.quantization_config",
+    }
+    return report
 
 def _resolve_targets(model: Any, configured: Iterable[str] | None) -> list[str]:
     if configured:
@@ -123,6 +168,28 @@ def configure_lora(
         raise ConfigError(f"lora.bias must be one of none/all/lora_only, got {bias!r}")
 
     configured = list(target_modules) if target_modules else getattr(lora_cfg, "target_modules", None)
+    if not configured:
+        # Profile default: empty for Qwen (keep hybrid discovery), the 7 verified
+        # Llama projections for MiniCPM. Always intersected with the model's real
+        # module names by ``_resolve_targets``, which raises when none match.
+        from lifemate.models.profiles import resolve_profile  # noqa: PLC0415 - lazy
+
+        model_cfg = getattr(cfg, "model", None)
+        profile = resolve_profile(getattr(model_cfg, "name", "") or "")
+        configured = profile.lora_targets() or None
+        if configured:
+            # A profile's list is authoritative: if the model exposes projections
+            # the profile does not name (a Qwen hybrid block behind a MiniCPM
+            # profile), adapting only the listed subset would be a silent
+            # downgrade. Fail and say which knob to turn.
+            extra = sorted(set(discover_target_modules(model)) - set(configured))
+            if extra:
+                raise LifeMateError(
+                    f"model exposes LoRA-able projections the {profile.name!r} profile does "
+                    f"not list (e.g. {', '.join(extra)}); the configured model "
+                    f"({getattr(model_cfg, 'name', None)!r}) does not match its profile. "
+                    "Pass --model with the matching base, or set lora.target_modules explicitly."
+                )
     resolved = _resolve_targets(model, configured)
 
     for param in model.parameters():

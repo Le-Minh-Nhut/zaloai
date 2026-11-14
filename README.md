@@ -4,27 +4,61 @@ Voice → action agentic benchmark: a spoken Vietnamese request plus a world
 context (time, location, installed apps, conversation history) must be turned
 into the right sequence of tool calls.
 
-**Status: verified on the real data, no model trained yet.** The official
-LifeMate dataset **is** present under `./data` (1545 train / 634 public_test
-samples) and drove the EDA, the SFT build (4368 train + 482 val decision
-points), ToolEnv replay and the ASR measurement. The organizers' `zaic_tools`
-SDK ships with each split and is used through `lifemate.env.official`. Still
-absent: the **Qwen3.5-4B weights** — and therefore any training run or score.
+**Status: the default model is `openbmb/MiniCPM5-2B` and its weights are present
+locally; no full training run has happened yet.** The official LifeMate dataset
+**is** present under `./data` (1545 train / 634 public_test samples) and drove the
+EDA, the SFT build (4368 train + 482 val decision points), ToolEnv replay and the
+ASR measurement. The organizers' `zaic_tools` SDK ships with each split and is
+used through `lifemate.env.official`. A LoRA forward/backward step on the real
+MiniCPM5-2B weights was measured on this machine's GPU (see the status table
+below); a full epoch, a full fine-tune and a leaderboard score are still absent.
 Every number, file and record in `tests/fixtures/` is synthetic and labelled as
 such.
+
+## Default model
+
+`openbmb/MiniCPM5-2B` is the default: `model.name` in
+`src/lifemate/config.py`, `configs/base.yaml`, `configs/training_lora.yaml` and
+`configs/inference.yaml`. `Qwen/Qwen3.5-4B` stays supported and is one flag or
+one config away:
+
+```bash
+python3 scripts/train.py --model Qwen/Qwen3.5-4B   # override model.name
+python3 scripts/train.py --config configs/training_lora_qwen.yaml
+```
+
+Nothing else changes per family: `lifemate.models.profiles` holds the prompt
+template kwargs, the supervised terminator, the LoRA projections, the decode stop
+ids and the `max_new_tokens` fallback (used only when a caller supplies none; the
+shipped scripts pass `agent.max_new_tokens`, 512 for both models). See
+`docs/ARCHITECTURE.md`.
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Le-Minh-Nhut/zaloai/blob/main/notebooks/finetune_qwen35_colab.ipynb)
+
+Fine-tune Qwen3.5-4B (LoRA/QLoRA) on a free Colab GPU — setup, dataset, training, resume, export; see [`notebooks/README_colab.md`](notebooks/README_colab.md) (tiếng Việt).
+
+That notebook is the **Qwen3.5-4B** walkthrough and has **never been executed on
+Colab**; its VRAM/time figures are labelled ESTIMATE there. No Colab notebook
+exists for the MiniCPM default.
+
 ## Current status vs. verified
 
 | Status item | Verified? | Reason |
 | --- | --- | --- |
-| CODE COMPLETE | YES | All modules, CLI entrypoints, scripts, and verification gates implemented; gates **17/17 PASS** on the current tree (`scripts/verify_all.py --no-write`, gates A–O, R, P). Gate Q is unmeasured — GPU work is paused by the operator |
-| SYNTHETIC TESTED | YES | `.venv/bin/python -m pytest -q` → `485 passed, 7 skipped` (6 torch-gated tiny tests + `test_wandb_tracking.py`, `wandb` absent from `.venv`); stdlib runner `passed=479 failed=0 skipped(needs fixtures)=13` (6 torch-gated tiny tests + 7 tests in `test_sandbox_credentials.py` that take pytest fixtures, which the stdlib runner cannot bind); torch interpreter `/tmp/cudaenv/bin/python -m pytest -q` → `491 passed, 1 skipped` (`tests/test_asr.py:376`). `/tmp/torchenv` was deleted during the 2026-11-13 session, so `/tmp/cudaenv` is the torch interpreter of record and the old `468 / 468 / 473` triple is historical |
-| REAL DATASET TESTED | PARTIAL | Real splits present under `./data` (`train` 1545 samples, `public_test` 634) and exercised: `inspect_data.py` / `run_eda.py` / `prepare_dataset.py` (**4850** decision points = 4368 train + 482 val, 0 sample drops, 19 `unobservable_ref_target` point drops) / collator truncation measurement (47 at `max_seq_length` 8192). Model weights and GPU are still absent, so no training or scoring has run on it. |
-| REAL MODEL TESTED | NO | Official Qwen3.5-4B weights not downloaded locally |
-| GPU TRAINING TESTED | NO | GPU present (RTX 5070 Ti, 16303 MiB = 17.09 GB decimal / 15.92 GiB) and a CUDA-capable build exists locally at `/tmp/cudaenv` (`torch 2.15.0+cu132`, `sm_120` verified) — the blocker is the missing Qwen3.5-4B weights, not the toolchain. The repo venv has no `torch` installed at all; `/tmp/cudaenv` is the only torch interpreter on the host — the CPU-only `/tmp/torchenv` it replaced was deleted on 2026-11-13 |
+| CODE COMPLETE | YES | All modules, CLI entrypoints, scripts, and verification gates implemented. Gates **A–O, R, P: 17 PASS / 0 FAIL** with the torch interpreter (`.venv`/stdlib run: 16 PASS + R SKIP because no torch is importable there). Gate Q stays unmeasured — no leaderboard run |
+| DEFAULT MODEL | YES | `openbmb/MiniCPM5-2B` (`LlamaForCausalLM`, 42 layers, hidden 2048, 16 heads / 2 KV heads, head_dim 128, intermediate 6144, vocab 130560, untied embeddings, rope_theta 5e6, max_position 131072): **2,516,756,480 params**, one 5,033,557,096 B safetensors shard, 381 BF16 tensors (5,033,512,960 B), local copy at `models/MiniCPM5-2B` (10 files, 5,043,806,458 B). `Qwen/Qwen3.5-4B` is the alternative, selected by `--model` or `configs/training_lora_qwen.yaml` |
+| TUNING DEFAULT | YES | `training.tuning_mode: lora` in `configs/base.yaml`, `configs/training_lora.yaml` is the default `--config`, and `python3 scripts/train.py` with no arguments loads it. `--tuning {full,lora,qlora}` overrides. Full FT still exists (`configs/training_full.yaml`) but does not fit a 16 GB card: `--dry-run --tuning full` on the default config (MiniCPM5-2B, 2,516,756,480 params, seq 8192, micro-batch 1, gradient checkpointing on) prints **TOTAL 43.62 GB**, `verdict: does_not_fit` (weights 10.07 + gradients 10.07 + optimizer 20.13 + activations 2.82 + chunked logits 0.53, vocab 130560) — formula output, not a measured peak. The shipped LoRA default estimates **8.54 GB / `fits`**, QLoRA **4.76 GB / `fits`** |
+| SYNTHETIC TESTED | YES | `python3 tests/run_tests.py` → 516 passed / 13 skipped / 0 failed; `.venv/bin/python -m pytest -q` → 522 / 7 / 0; `PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q` → 528 / 1 / 0. `/tmp/cudaenv` (`torch 2.15.0+cu132`, transformers 5.22.2) is the torch interpreter of record; the repo venv has no `torch` |
+| REAL DATASET TESTED | PARTIAL | Real splits present under `./data` (`train` 1545 samples, `public_test` 634) and exercised: `inspect_data.py` / `run_eda.py` / `prepare_dataset.py` (**4850** decision points = 4368 train + 482 val, 0 sample drops, 19 `unobservable_ref_target` point drops) / collator truncation measurement with the **MiniCPM tokenizer**: full-sequence tokens p50 6198, p90 8435, p95 9089, p99 10075, max 11037 (val p99 9309, max 9623); at 8192, **4298 kept / 488 truncated (11.17 %) / 70 dropped `target_value_truncated` (1.60 %)**, val 477 kept / 41 truncated / 5 dropped, and 0 kept prompts lose the tool schema block or the `# Công cụ khả dụng` catalog. No training epoch has run on it |
+| REAL MODEL TESTED | YES (forward/backward) | MiniCPM5-2B + LoRA r16 bf16 on the local RTX 5070 Ti (16.57 GB, `sm_120`), gradient checkpointing, micro-batch 1, chunked CE (1024), batch **padded to exactly 8192 tokens**, no `PYTORCH_CUDA_ALLOC_CONF` → **one train-only step: OK, peak allocated 14.37 GB, peak reserved 15.17 GB**, loss 2.911356, 3.78 s wall. A real adapter save + reload and a greedy generation also ran. Quality is not established: the **base** model did not reliably close with `</action>` (it sometimes ended with EOS; the guard raised rather than parsing a truncated decision). With the format spec in the prompt it produced one clean action block in 13 tokens. No fine-tuned checkpoint has been evaluated |
+| GPU TRAINING TESTED | PARTIAL | One LoRA **train step + eval step + epoch-end adapter save in the same process** fits at seq **padded to exactly 8192** without `PYTORCH_CUDA_ALLOC_CONF`: 14.37 GB allocated / **15.17 GB reserved** peak, i.e. **1.40 GB reserved headroom** on the 16.57 GB card (eval-only step: 8.34 GB / 9.48 GB, ~1.0 s; save inside the cycle: 245 ms). The train-only step alone also peaks at 14.37 / 15.17 GB; with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` the train-only step reserves 14.88 GB instead (optional, saves 0.29 GB reserved and 0 allocated). seq **12288 OOMs** ("Tried to allocate 502.00 MiB; 14.02 GiB allocated, 123.88 MiB free"), and seq 8192 OOMs **without** chunked CE in train (`ForCausalLMLoss` upcasts the whole `[seq, vocab]` logits to fp32, 8192×130560×4 ≈ 3.98 GiB) or in eval before `evaluate` was chunked. No whole epoch, no convergence number, no full fine-tune |
+| QLORA | NO (not executed) | Implemented for real — `BitsAndBytesConfig` NF4 with double quant, `prepare_model_for_kbit_training`, no `.to()` on a quantized model, and the CLI refuses to silently downgrade — but **GPU execution was not tested**: `bitsandbytes` is not installed in the torch environment used here |
+| COLAB | NO (not executed) | `notebooks/finetune_qwen35_colab.ipynb` (Qwen3.5-4B walkthrough, `notebooks/README_colab.md`) has **never been run on Colab**. Verified only: valid JSON, every code cell `ast.parse`s, every flag it uses exists in the scripts' `--help`. Its VRAM/time table is labelled ESTIMATE |
 | ASR TESTED | PARTIAL | Gipformer-68M-RNNT (int8, `sherpa-onnx`, CPU) on all **1545** real train utterances: WER **17.91 %** / CER **11.13 %**, sentence exact match 8.74 %, RTF ~0.011 (82 ms mean latency), 0 errors. The ASR metric layer is measured; the end-task score is not |
 | DOCKER BUILT | NO | Docker daemon unavailable in execution container. `docker/Dockerfile` was re-pinned to `nvidia/cuda:12.8.1` + `whl/cu128` because cu124 ships no `sm_120` kernels, but the image was **never built and never run** — status `NOT RUN / UNVERIFIED`, not passing |
 | W&B TRACKING | YES (offline) | `configs/training_lora_wandb.yaml` (copy of `training_lora.yaml`, three deltas: `report_to: ["wandb"]`, `wandb.enabled: true`, `wandb.mode: 'offline'`) drives `lifemate.tracking.WandbTracker`. Measured offline: 2 logged steps with 5 secrets/PII values in the payload, 0 hits in the 15,813 B wandb wrote. Needs **both** `report_to: ["wandb"]` and `wandb.enabled: true`; `WANDB_MODE` overrides the config value; `--smoke` bypasses tracking. `describe_environment()` is an allowlist (no `hostname`/`user`) after it leaked both. No run has ever been uploaded — see `docs/FINAL_TRAINING_EXPERIMENT_READINESS.md` Phụ lục C |
-| CLOUD SUBMIT TESTED | NO | CPU sandbox **reachable and verified** (auth via `~/.netrc`, created, executed code, deleted, `list()` → 0); GPU sandbox **denied at the org entitlement**: `Permission denied: this organization is not entitled to create GPU sandboxes` (identical for all 7 shapes). 0 GPU-seconds consumed, no `nvidia-smi`, no training. Data (1.1 GB) and weights (8.68 GiB) have no delivery route, and the job spec's host bind-mounts cannot exist in a serverless sandbox — `cloud/README.md` |
+| CLOUD SUBMIT TESTED | NO | No cloud GPU is needed: everything above ran on the local RTX 5070 Ti. The cloud path stays unrelated and unproven. CPU sandbox **reachable and verified** (auth via `~/.netrc`, created, executed code, deleted, `list()` → 0); GPU sandbox **denied at the org entitlement**: `Permission denied: this organization is not entitled to create GPU sandboxes` (identical for all 7 shapes). 0 GPU-seconds consumed, no `nvidia-smi`, no training. Data (1.1 GB) and the Qwen-era 8.68 GiB weight download have no delivery route, and the job spec's host bind-mounts cannot exist in a serverless sandbox — `cloud/README.md` |
+| W&B REQUIRED | NO | W&B is optional and off by default (`training.report_to: []`, `wandb.enabled: false`). Training, evaluation and inference all run without it; metrics fall back to `<output_dir>/<run_name>/metrics.jsonl` |
 | COMPETITION VALIDATED | NO | Official leaderboard evaluation not conducted |
 
 Detailed readiness and handoff specifications: `docs/IMPLEMENTATION_READINESS_REPORT.md`.
@@ -111,9 +145,11 @@ python3 scripts/run_eda.py --data-root tests/fixtures/synthetic_lifemate --split
 # 3. Prepare causal SFT dataset (decision points, prompt masking)
 python3 scripts/prepare_dataset.py --data-root tests/fixtures/synthetic_lifemate --split train --output outputs/datasets
 
-# 4. Train model (full fine-tuning is default; LoRA is selectable)
-python3 scripts/train.py --dry-run --param-count 4000000000 --tuning full
-python3 scripts/train.py --dry-run --param-count 4000000000 --tuning lora
+# 4. Train (LoRA on MiniCPM5-2B is the default; full FT is explicit)
+python3 scripts/train.py --dry-run          # no weights loaded, preflight only
+python3 scripts/train.py                    # configs/training_lora.yaml
+python3 scripts/train.py --tuning qlora     # 4-bit base; needs bitsandbytes (untested on GPU here)
+python3 scripts/train.py --config configs/training_full.yaml   # ~70 GB, 80 GB-class GPU
 
 # 5. Closed-loop agent inference (synthetic self-test via mock environment)
 #    The scripted generator reads a JSON map sample_id -> raw model outputs;
@@ -228,7 +264,8 @@ src/lifemate/
 ├── models/                 # model loading and inference wrappers
 │   ├── checkpoint.py       # save and resume checkpoint utilities
 │   ├── generation.py       # greedy and sampled text generation
-│   └── loader.py           # tokenizer and causal LM loader
+│   ├── loader.py           # tokenizer and causal LM loader
+│   └── profiles.py         # per-family prompt/terminator/stop-ids/LoRA targets
 ├── tracking/               # experiment tracking and artifact storage
 │   ├── artifact_manager.py # directory hashing and artifact packaging
 │   └── wandb_tracker.py    # Weights & Biases telemetry client

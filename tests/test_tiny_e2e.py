@@ -195,6 +195,10 @@ def test_tiny_full_train_and_reload() -> None:
         model_dir = make_tiny_model_and_tokenizer(Path(tmp) / "model")
         ckpt_root = Path(tmp) / "ckpts"
         cfg = load_config(None)
+        # The fixture base IS this directory: name it so the checkpoint records a
+        # base identity that resolves to the same profile, which is what the
+        # adapter/base compatibility guard compares.
+        cfg.model.name = str(model_dir)
         cfg.training.output_dir = str(ckpt_root)
         cfg.training.precision = "float32"
         cfg.training.num_train_epochs = 1
@@ -266,6 +270,10 @@ def test_tiny_lora_train_and_adapter_change() -> None:
         model_dir = make_tiny_model_and_tokenizer(Path(tmp) / "model")
         ckpt_root = Path(tmp) / "ckpts_lora"
         cfg = load_config(None)
+        # The fixture base IS this directory: naming it makes the checkpoint
+        # record a base identity that resolves to the same profile, which is what
+        # the adapter/base compatibility guard compares before merging.
+        cfg.model.name = str(model_dir)
         cfg.training.output_dir = str(ckpt_root)
         cfg.training.precision = "float32"
         cfg.training.num_train_epochs = 1
@@ -333,6 +341,10 @@ def test_tiny_lora_merge_loads() -> None:
         model_dir = make_tiny_model_and_tokenizer(Path(tmp) / "model")
         ckpt_root = Path(tmp) / "ckpts_lora"
         cfg = load_config(None)
+        # The fixture base IS this directory: naming it makes the checkpoint
+        # record a base identity that resolves to the same profile, which is what
+        # the adapter/base compatibility guard compares before merging.
+        cfg.model.name = str(model_dir)
         cfg.training.output_dir = str(ckpt_root)
         cfg.training.precision = "float32"
         cfg.training.num_train_epochs = 1

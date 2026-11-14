@@ -18,13 +18,23 @@ lifemate = "lifemate.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pyyaml>=6"]
+# Floors are the versions VERIFIED on the training box (torch 2.15.0+cu132,
+# transformers 5.22.2, peft 0.21.2, accelerate 1.15.0). MiniCPM5-2B's config.json
+# declares transformers_version 5.6.2 and Qwen3.5-4B needs the `qwen3_5` classes,
+# neither of which exists at 4.44 — the old floor could not load either model.
 train = [
-    "torch>=2.3",
-    "transformers>=4.44",
-    "peft>=0.11",
+    "torch>=2.15",
+    "transformers>=5.22",
+    "peft>=0.21",
     "accelerate>=0.33",
     "datasets>=2.20",
     "wandb>=0.17",
+]
+qlora = [
+    "bitsandbytes>=0.43",
+    "peft>=0.21",
+    "torch>=2.15",
+    "transformers>=5.22",
 ]
 asr = [
     "numpy>=1.20",
@@ -40,8 +50,8 @@ onnx = [
     "numpy>=1.20",
 ]
 asr-whisper = [
-    "torch>=2.3",
-    "transformers>=4.44",
+    "torch>=2.15",
+    "transformers>=5.22",
     "soundfile>=0.12",
 ]
 cloud = [

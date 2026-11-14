@@ -392,9 +392,13 @@ def _load_generator(cfg: Any, args: argparse.Namespace, current_id: Callable[[],
         temperature=cfg.agent.temperature,
         max_new_tokens=cfg.agent.max_new_tokens,
     )
+    # Base identity comes from the config, not the checkpoint directory: a saved
+    # tokenizer loses the family name, and the profile decides the prompt
+    # template, the terminator and the decode stop ids.
     return HFGenerator(
         bundle.model,
         bundle.tokenizer,
+        model_name=cfg.model.name,
         max_new_tokens=cfg.agent.max_new_tokens,
         temperature=cfg.agent.temperature,
         device=getattr(bundle, "device", None),

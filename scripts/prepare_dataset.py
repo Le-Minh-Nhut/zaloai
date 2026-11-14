@@ -83,7 +83,9 @@ def _fit_stats(records: list[dict], tokenizer: object | None, max_seq_length: in
 
     Two different outcomes must never be conflated (a previous version reported
     only "n_fit", which read as "everything fits" while the collator was
-    silently middle-truncating 75% of the records):
+    silently middle-truncating most of the records — measured 11.17 % of train
+    prompts at max_seq_length 8192 with the DEFAULT MiniCPM5-2B tokenizer, and
+    48.1 % at 5632):
 
     * **truncated** — `kept=True` but the prompt lost its middle; the example is
       still trained on, with the request prefix intact;
@@ -91,7 +93,9 @@ def _fit_stats(records: list[dict], tokenizer: object | None, max_seq_length: in
       (a target that alone exceeds the budget cannot be supervised at all) and
       `target_value_truncated` (a `tool_call` whose reference ID/name lived in
       the middle the cut removed; supervising it teaches an identifier the model
-      was never shown). 0 of the latter at 8192, 122 at 4096.
+      was never shown). Measured with the DEFAULT model at 8192: 70 dropped
+      (1.60 %), 0 losing a tool schema block; the earlier "0 at 8192, 122 at
+      4096" figures were Qwen3.5-4B numbers.
     """
     if tokenizer is None:
         # No tokenizer: the char/4 heuristic UNDER-counts Vietnamese by ~2.5x,

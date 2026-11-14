@@ -43,7 +43,7 @@ lora:
   bias: none
 
 model:
-  name: Qwen/Qwen3.5-4B
+  name: openbmb/MiniCPM5-2B
   torch_dtype: bfloat16
   device: cuda
 

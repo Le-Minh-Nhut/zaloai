@@ -5,13 +5,19 @@ Gated on torch/transformers/peft so stdlib/non-torch interpreters skip cleanly.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from lifemate.errors import LifeMateError  # noqa: E402
 
 try:
     import torch
     import transformers
     import peft
+
     HAVE_DEPS = True
 except ImportError:
     HAVE_DEPS = False
@@ -189,8 +195,17 @@ def test_tiny_generation_chain() -> None:
         validation = validate_submission(sub_path, [sample_id])
         assert validation["ok"] is True
 
-        # 5. max_new_tokens is respected
+        # 5. max_new_tokens is respected, and a decode that hits the budget
+        #    without </action> is an explicit failure, not a parsed decision.
         gen_short = HFGenerator(model, tok, max_new_tokens=2, temperature=0.0)
-        out_short = gen_short.generate(messages)
-        assert gen_short.stats.generated_tokens <= 2
-        assert isinstance(out_short, str)
+        try:
+            out_short = gen_short.generate(messages)
+        except LifeMateError as exc:
+            assert "budget" in str(exc) and "truncated" in str(exc), exc
+            assert gen_short.stats.truncated_by_budget is True
+            assert gen_short.stats.generated_tokens <= 2
+        else:
+            # The tiny model happens to emit the marker inside 2 tokens.
+            assert isinstance(out_short, str)
+            assert gen_short.stats.generated_tokens <= 2
+            assert gen_short.stats.truncated_by_budget is False

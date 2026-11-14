@@ -81,7 +81,11 @@ def test_resolve_model_mode():
     assert loader.resolve_model_mode("full", None) == "base"
     assert loader.resolve_model_mode("full", "outputs/ckpt-100") == "full"
     assert loader.resolve_model_mode("lora", "outputs/ckpt-100") == "lora"
-    for bad in ("qlora", "adapter", ""):
+    # qlora is a supported tuning mode: its checkpoints are ordinary LoRA
+    # adapters, so the resolved mode is "lora".
+    assert loader.resolve_model_mode("qlora", "outputs/ckpt-100") == "lora"
+    assert loader.resolve_model_mode("qlora", None) == "base"
+    for bad in ("adapter", ""):
         try:
             loader.resolve_model_mode(bad, "x")
         except LifeMateError as exc:

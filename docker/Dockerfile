@@ -21,6 +21,9 @@
 #     layer surface).
 #   * NO pip install at run time and no network access in the entrypoint: the
 #     container is meant to run with `--network none`.
+#   * the base-model IDENTITY is explicit (MODEL_NAME, default openbmb/MiniCPM5-2B)
+#     and independent of how it is loaded (MODEL_MODE) and where a fine-tune lives
+#     (CHECKPOINT). Its weights are pre-mounted, never fetched.
 #   * runs as an unprivileged user (uid 10001).
 #   * HEALTHCHECK is intentionally absent: the workload is a one-shot batch job
 #     with no listening port and no network.
@@ -83,6 +86,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONPATH=/app/src \
     SPLIT=public_test \
     MODEL_MODE=full \
+    MODEL_NAME=openbmb/MiniCPM5-2B \
+    MODEL_ROOT=/models \
+    HF_HOME=/models/hf-cache \
     ASR=gipformer
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -101,7 +107,7 @@ COPY --chown=lifemate:lifemate configs /app/configs
 COPY --chown=lifemate:lifemate docker/entrypoint.sh /app/docker/entrypoint.sh
 
 RUN chmod +x /app/docker/entrypoint.sh \
-    && mkdir -p /data /models /models/asr /history /outputs \
+    && mkdir -p /data /models /models/asr /models/hf-cache /history /outputs \
     && chown -R lifemate:lifemate /data /models /history /outputs /app
 
 USER lifemate
@@ -111,6 +117,13 @@ WORKDIR /app
 #   /data        dataset root (read-only)
 #   /models      checkpoint directory (read-only)
 #   /models/asr  Gipformer ONNX model directory (read-only; whisper is optional host extra)
+#   /models/hf-cache
+#                Hugging Face cache holding the BASE model weights named by MODEL_NAME
+#                (read-only; HF_HOME, so hub ids resolve to hub/models--<org>--<name>/
+#                snapshots/<rev>/). Alternative: mount a plain weights directory and
+#                point MODEL_NAME at it (-e MODEL_NAME=/models/MiniCPM5-2B).
+#                Either way the weights are mounted, never downloaded: HF_HUB_OFFLINE=1
+#                makes the loader pass local_files_only=True.
 #   /history     history ASR transcripts FILE (read-only; mount the single jsonl, e.g.
 #                -v "$PWD/outputs/asr/history_transcripts.jsonl":/history/history_transcripts.jsonl:ro
 #                then pass -e HISTORY_TRANSCRIPTS=/history/history_transcripts.jsonl).

@@ -1,8 +1,12 @@
 # Full-parameter SFT (DEFAULT tuning mode). Qwen3.5-4B, bf16 autocast, fp32 master weights.
 #
 # Memory plan (decimal GB, estimate — see docs/TRAINING_GUIDE.md):
-#   4.2e9 params: weights 16.8 + grads 16.8 + AdamW 33.7 = 67 GB steady state,
-#   + activations (grad ckpt) 1.5 => an 80 GB-class GPU is the practical minimum.
+#   `--dry-run --tuning full` with this config's model (MiniCPM5-2B,
+#   2,516,756,480 params) prints TOTAL 43.62 GB: weights 10.07 + grads 10.07
+#   + AdamW 20.13 + activations 2.82 (grad ckpt) + chunked logits 0.53.
+#   With `--model Qwen/Qwen3.5-4B --param-count 4205751296` it prints 70.99 GB.
+#   Either way `verdict: does_not_fit` a 16 GB card; full FT needs an
+#   80 GB-class GPU (or ZeRO-3 sharding).
 #   Parameters stay fp32 (AdamW writes its update into the parameter tensor; a bf16
 #   master quantises a 5e-6 step away). bf16 comes from autocast, not from the dtype.
 training:
@@ -23,8 +27,11 @@ training:
   save_strategy: epoch
   eval_strategy: epoch
   seed: 42
-  max_seq_length: 8192             # 4096 truncated 75% of the real SFT records and cut the
-                                   # "# Công cụ khả dụng" section from 176 of them
+  # MiniCPM5-2B, MEASURED at 8192: 4298 kept / 488 truncated (11.17%) / 70 dropped
+  # target_value_truncated (1.60%); val 477 / 41 / 5 (1.04%). 5632: 2101 truncated
+  # (48.1%) / 608 dropped (13.92%). 12288: 0 truncated but OOMs a 16 GB card.
+  # (Qwen3.5-4B only, stale: 4096 truncated 75% and cut "# Công cụ khả dụng".)
+  max_seq_length: 8192
   validation_ratio: 0.1
   optimizer: adamw_torch
   resume_from_checkpoint: null
@@ -33,7 +40,7 @@ training:
   report_to: []
 
 model:
-  name: Qwen/Qwen3.5-4B
+  name: openbmb/MiniCPM5-2B
   torch_dtype: bfloat16
   device: cuda
 

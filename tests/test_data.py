@@ -685,9 +685,12 @@ def test_load_config_defaults_without_files():
     from lifemate.config import load_config
 
     cfg = load_config()
-    assert cfg.training.tuning_mode == "full"
+    # DEFAULT tuning mode is now LoRA: full fine-tuning needs ~80 GB and cannot
+    # run on the reference 16 GB card. --tuning full / YAML keep it reachable.
+    assert cfg.training.tuning_mode == "lora"
     assert cfg.data.root == "./data"
-    assert cfg.model.name == "Qwen/Qwen3.5-4B"
+    # DEFAULT is MiniCPM5-2B; Qwen3.5-4B remains an explicit alternative.
+    assert cfg.model.name == "openbmb/MiniCPM5-2B"
     assert cfg.asr.backend == "gipformer"  # gipformer peer cut over default ASR backend
     assert cfg.inference.use_mock_env is False
     assert cfg.wandb.enabled is False

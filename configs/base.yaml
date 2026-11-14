@@ -7,7 +7,7 @@ data:
   max_samples: null
 
 model:
-  name: Qwen/Qwen3.5-4B
+  name: openbmb/MiniCPM5-2B
   torch_dtype: bfloat16
   attn_implementation: null
   trust_remote_code: false
@@ -23,7 +23,8 @@ lora:
 
 training:
   method: sft
-  tuning_mode: full          # DEFAULT: full-parameter fine-tuning
+  tuning_mode: lora          # DEFAULT: LoRA (full FT estimates 43.62 GB for MiniCPM5-2B
+                             # at seq 8192 — does_not_fit a 16 GB card; see training_full.yaml)
   output_dir: outputs/checkpoints
   precision: bfloat16
   learning_rate: 5.0e-6
@@ -39,9 +40,13 @@ training:
   save_strategy: epoch
   eval_strategy: epoch
   seed: 42
-  max_seq_length: 8192       # 4096 truncated 75% of the real SFT records (see TRAINING_GUIDE §4)
+  # MiniCPM5-2B tokenizer, MEASURED: 4298 kept / 488 truncated (11.17%) /
+  # 70 dropped target_value_truncated (1.60%); val 477 / 41 / 5 (1.04%).
+  # 5632 truncates 48.1%; 12288 truncates nothing but OOMs a 16 GB card.
+  max_seq_length: 8192
   validation_ratio: 0.1
   optimizer: adamw_torch
+  loss_chunk_tokens: 1024    # chunked CE; 0 = transformers' whole-vocab fp32 loss
   resume_from_checkpoint: null
   dataloader_num_workers: 0
   save_total_limit: 2

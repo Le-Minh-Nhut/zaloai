@@ -14,30 +14,46 @@ Truncation policy is deliberately asymmetric:
   the left, keeping both the head (spoken request and world context) and the tail
   (tools, prior steps, format spec) while dropping older conversation history;
 * the ``# Yêu cầu`` section and the ``# Công cụ khả dụng`` catalog are *pinned*:
-  the request to the prefix, the whole catalog (plus steps and format spec) to the
-  tail, with only what precedes the catalog middle-truncated inside the remaining
-  budget. Pinning the catalog is what keeps ``### <tool> (kind=...)`` readable for
-  the tool the target calls: a plain middle cut spliced a hole through it for 3 of
-  the 3324 ``tool_call`` prompts (all ``contacts.search``, whose ``query`` argument
-  name appears nowhere else in the prompt). Residual risk: the splice boundary can
-  still land inside a history turn or — when the catalog alone exceeds the budget —
-  inside the catalog;
+  the request to the prefix, then the catalog. When the catalog plus the
+  steps/format tail fits the remaining budget the whole tail is pinned and only
+  the middle is cut. When it does NOT fit (MiniCPM5-2B's tokenizer renders the
+  catalog at ~7833 tokens against 7714 remaining at 8192) the whole catalog is
+  kept anyway, the tail is added only if it still fits, and the cut moves into
+  the context/history head; only a catalog that alone exceeds the budget is cut
+  inside. Measured with the real MiniCPM tokenizer over 3170 train / 352 val
+  ``tool_call`` records: 0 kept prompts lose the ``### <tool> (kind=...)`` block
+  or the catalog at 8192 (70 train / 5 val records are instead DROPPED as
+  ``target_value_truncated``, because the deeper head cut removes the history
+  value the target copies), and 0 lost, 0 dropped, 0 truncated at 12288.
+  The pre-fix behaviour severed the block for 70/3170 train and 5/352 val
+  records (the fallback middle cut), which is what this path replaces.
+  Residual risk: the splice boundary can still land inside a history turn, and a
+  catalog longer than the whole budget is still cut inside;
 * a ``tool_call`` target whose **reference value** (``*_id``/``*_ref``/``*_name``)
   is no longer a substring of the truncated prompt is dropped with
   ``reason="target_value_truncated"``. The data builder performs the same check
   before truncation; after it, the record would supervise an identifier the
-  model was never shown. 0 records at 8192, 122 at 4096. Non-reference arguments
-  are exempt: the model legitimately composes text and dates.
+  model was never shown. Measured with the DEFAULT model (MiniCPM5-2B tokenizer)
+  at max_seq_length 8192: 70 / 4368 train (1.60 %) and 5 / 482 val (1.04 %)
+  records dropped, 488 train / 41 val prompts middle-truncated. At 5632 the same
+  rule drops 608 / 4368 (13.92 %) and 67 / 482 — which is why 8192 is the
+  shipped default. The earlier "0 records at 8192, 122 at 4096" figures were
+  measured with the Qwen3.5-4B tokenizer and do not apply to MiniCPM.
+  Non-reference arguments are exempt: the model legitimately composes text and
+  dates.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from lifemate.agent.protocol import ACTION_CLOSE, ACTION_OPEN
 from lifemate.errors import LifeMateError
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from lifemate.models.profiles import ModelProfile
 
 __all__ = [
     "CHATML_FALLBACK_TEMPLATE",
@@ -47,6 +63,7 @@ __all__ = [
     "assert_loss_masking",
     "build_supervised_example",
     "render_prompt_text",
+    "resolve_response_terminator",
     "to_torch_batch",
 ]
 
@@ -70,27 +87,39 @@ def apply_chat_template_text(
     messages: Sequence[Mapping[str, str]],
     *,
     add_generation_prompt: bool = True,
+    profile: ModelProfile | None = None,
 ) -> str:
-    """Render chat messages with thinking disabled (``enable_thinking=False``).
+    """Render chat messages with the profile's ``chat_template_kwargs``.
 
     Thinking must be off on both sides of the prompt contract: a template that
-    ends with an *open* `` thinking`` block would train the model to emit the
-    action inside its reasoning, and at inference leaves it mid-reasoning with
-    nothing telling it to stop.
+    ends with an *open* ``think`` block would train the model to emit the action
+    inside its reasoning, and at inference leaves it mid-reasoning with nothing
+    telling it to stop. Both supported profiles pass ``enable_thinking=False``,
+    which each of their templates turns into an empty closed block.
 
-    Only a ``TypeError`` naming ``enable_thinking`` means "this tokenizer does
-    not know the kwarg"; the plain call is retried. Any other exception is a real
-    template failure and propagates to the caller.
+    Only a ``TypeError`` naming one of the kwargs means "this tokenizer does not
+    know it"; the plain call is retried. Any other exception is a real template
+    failure and propagates to the caller.
     """
+    from lifemate.models.profiles import profile_for_tokenizer  # noqa: PLC0415 - lazy: models/__init__ imports this module
+
+    active = profile or profile_for_tokenizer(tokenizer)
     kwargs = {"tokenize": False, "add_generation_prompt": add_generation_prompt}
     try:
-        return tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
+        return tokenizer.apply_chat_template(
+            messages, **active.template_kwargs, **kwargs
+        )
     except TypeError as exc:
-        if "enable_thinking" not in str(exc):
+        unknown = [key for key in active.chat_template_kwargs if key in str(exc)]
+        if not unknown:
             raise
         return tokenizer.apply_chat_template(messages, **kwargs)
 
-def render_prompt_text(messages: Sequence[Mapping[str, str]], tokenizer: Any = None) -> str:
+def render_prompt_text(
+    messages: Sequence[Mapping[str, str]],
+    tokenizer: Any = None,
+    profile: ModelProfile | None = None,
+) -> str:
     """Render chat messages to text, preferring the tokenizer's chat template.
 
     Deterministic for identical inputs. Raises :class:`LifeMateError` when the
@@ -109,7 +138,9 @@ def render_prompt_text(messages: Sequence[Mapping[str, str]], tokenizer: Any = N
     apply_template = getattr(tokenizer, "apply_chat_template", None)
     if callable(apply_template):
         try:
-            rendered = apply_chat_template_text(tokenizer, normalised, add_generation_prompt=True)
+            rendered = apply_chat_template_text(
+                tokenizer, normalised, add_generation_prompt=True, profile=profile
+            )
         except Exception as exc:
             # Parity with inference (HFGenerator.build_prompt raises too): quietly
             # reformatting here would train on different prompt bytes than we serve.
@@ -127,26 +158,81 @@ def render_prompt_text(messages: Sequence[Mapping[str, str]], tokenizer: Any = N
     )
     return body + _FALLBACK_GENERATION_SUFFIX
 
-def _encode(tokenizer: Any, text: str) -> list[int]:
-    """Tokenize without special tokens (ids only); empty text yields ``[]``."""
+def _encode(tokenizer: Any, text: str, add_special_tokens: bool = False) -> list[int]:
+    """Tokenize ``text`` (ids only); empty text yields ``[]``.
+
+    ``add_special_tokens`` mirrors ``ModelProfile.prompt_add_special_tokens`` so
+    the prompt encode step is the same on both sides: the training path passes
+    the profile's value for the PROMPT, and ``HFGenerator`` passes the same value
+    when it tokenizes the rendered prompt. Targets never get special tokens.
+    """
     if not text:
         return []
     encode = getattr(tokenizer, "encode", None)
     if callable(encode):
         try:
-            ids = encode(text, add_special_tokens=False)
+            ids = encode(text, add_special_tokens=add_special_tokens)
         except TypeError:  # pragma: no cover - minimal tokenizers
             ids = encode(text)
     else:  # pragma: no cover - callable tokenizer
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids = tokenizer(text, add_special_tokens=add_special_tokens)["input_ids"]
     return [int(i) for i in ids]
 
+def eos_token_ids(tokenizer_or_config: Any) -> list[int]:
+    """Every EOS id an object declares, as ints.
+
+    MiniCPM declares TWO (``[1, 130073]``) and the old ``isinstance(value, int)``
+    test silently ignored the list, so the collator supervised ``</s>`` instead
+    of the ``<|im_end|>`` the chat template actually emits.
+    """
+    value = getattr(tokenizer_or_config, "eos_token_id", None)
+    if value is None:
+        return []
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple, set)):
+        return sorted({int(item) for item in value if isinstance(item, int) and not isinstance(item, bool)})
+    return []
+
+def resolve_response_terminator(
+    tokenizer: Any, profile: ModelProfile | None = None
+) -> tuple[int | None, str]:
+    """Token id that ends an assistant turn, plus where it came from.
+
+    The supervised terminator must be the token the CHAT TEMPLATE emits
+    (``<|im_end|>`` for both supported families), not ``tokenizer.eos_token_id``:
+    MiniCPM's ``eos_token`` is ``</s>`` (1) while its template closes every turn
+    with ``<|im_end|>`` (130073), so the old code supervised a terminator the
+    model never produces. Qwen's ``eos_token`` already IS ``<|im_end|>``, which
+    is why the bug was invisible with one model.
+
+    Returns ``(id, source)``; ``source`` is ``profile:<name>`` when the profile's
+    terminator text resolved to exactly one id, else ``tokenizer_eos:<ids>``.
+    The trailing newline the template writes after the terminator is NOT
+    supervised: it carries no decision, and hiding it keeps the loss on the
+    action block plus its terminator only.
+    """
+    from lifemate.models.profiles import profile_for_tokenizer  # noqa: PLC0415 - lazy
+
+    active = profile or profile_for_tokenizer(tokenizer)
+    terminator = active.response_terminator
+    if terminator:
+        ids = _encode(tokenizer, terminator)
+        if len(ids) == 1:
+            return ids[0], f"profile:{active.name}"
+    eos = eos_token_ids(tokenizer)
+    if len(eos) == 1:
+        return eos[0], f"tokenizer_eos:{eos[0]}"
+    if eos:
+        return eos[0], f"tokenizer_eos:{eos}[0]"
+    return None, "none"
+
 def _eos_id(tokenizer: Any) -> int | None:
-    for attr in ("eos_token_id",):
-        value = getattr(tokenizer, attr, None)
-        if isinstance(value, int):
-            return value
-    return None
+    """First EOS id, kept for callers that only need "the" terminator."""
+    eos = eos_token_ids(tokenizer)
+    return eos[0] if eos else None
 
 #: Section header that opens the spoken request in a decision prompt
 #: (:func:`lifemate.agent.prompt_builder.build_decision_prompt`). The request is
@@ -155,9 +241,16 @@ def _eos_id(tokenizer: Any) -> int | None:
 REQUEST_MARKER = "# Yêu cầu"
 #: Section header that opens the tool catalog. A target ``tool_call`` names a
 #: tool whose ``### <tool> (kind=...)`` block must be readable, and the block can
-#: sit anywhere inside the catalog, so the whole catalog is pinned to the tail
-#: instead of being cut in half by the middle cut (measured: the catalog fits the
-#: tail budget of every prepared record).
+#: sit anywhere inside the catalog, so the catalog is pinned to the tail instead
+#: of being cut in half by the middle cut.
+#:
+#: The earlier note that the catalog "fits the tail budget of every prepared
+#: record" was measured with the Qwen tokenizer and is FALSE for MiniCPM5-2B:
+#: its tokenizer renders the catalog at ~7833 tokens, leaving 7714 of the 8192
+#: budget, so the pin was skipped and the fallback middle cut severed the
+#: ``### <tool> (kind=...)`` block of the tool the target calls for 45/2979
+#: (1.51 %) train and 2/326 (0.61 %) val ``tool_call`` prompts. The pin now has
+#: a second, catalog-aware path instead of falling back to a full middle cut.
 TOOLS_MARKER = "# Công cụ khả dụng"
 _SECTION_SEP = "\n\n"
 
@@ -175,6 +268,23 @@ def _split_at_request(text: str) -> tuple[str, str] | None:
     nxt = text.find(_SECTION_SEP + "# ", body_start)
     end = len(text) if nxt < 0 else nxt
     return text[:end], text[end:]
+
+def _split_catalog(text: str) -> tuple[str, str, str] | None:
+    """Split ``(before, catalog, after)``; ``None`` when the catalog is unmarked.
+
+    ``catalog`` starts at its ``# Công cụ khả dụng`` heading and ends before the
+    next ``\n\n# `` heading, so the section can be pinned as one indivisible unit
+    while ``after`` (prior steps, response format) stays separately placeable.
+    """
+    split = _split_at_tools_section(text)
+    if split is None:
+        return None
+    before, catalog_and_after = split
+    nxt = catalog_and_after.find(_SECTION_SEP + "# ", len(_SECTION_SEP)) 
+    if nxt < 0:
+        return before, catalog_and_after, ""
+    return before, catalog_and_after[:nxt], catalog_and_after[nxt:]
+
 
 def _split_at_tools_section(text: str) -> tuple[str, str] | None:
     """Split ``(before, catalog-and-after)``; ``None`` when unmarked.
@@ -286,8 +396,13 @@ def build_supervised_example(
     target_text: str,
     max_seq_length: int,
     head_keep_fraction: float = 0.35,
+    profile: ModelProfile | None = None,
 ) -> dict[str, Any]:
     """Tokenise one (prompt, target) pair with target-only labels.
+
+    The supervised sequence is ``prompt + target + terminator``: the terminator
+    comes from the model profile (see :func:`resolve_response_terminator`), and
+    the newline the chat template writes after it is deliberately NOT supervised.
 
     Returns the dict documented on :class:`SupervisedExample`. A dropped example
     comes back with ``kept=False``, a ``reason`` and empty token lists, so the
@@ -300,13 +415,19 @@ def build_supervised_example(
     if not isinstance(target_text, str) or not target_text.strip():
         return SupervisedExample(kept=False, reason="empty_target").to_dict()
 
-    prompt_text = render_prompt_text(messages, tokenizer)
-    prompt_ids = _encode(tokenizer, prompt_text)
+    prompt_text = render_prompt_text(messages, tokenizer, profile)
+    # Same encode flag as HFGenerator.generate() uses on the identical string.
+    from lifemate.models.profiles import profile_for_tokenizer  # noqa: PLC0415 - lazy
+
+    prompt_flags = (profile or profile_for_tokenizer(tokenizer)).prompt_add_special_tokens
+    # Only the FIRST piece carries the flag: the render already contains the BOS,
+    # so applying it to a later fragment would inject a second one mid-prompt.
+    prompt_ids = _encode(tokenizer, prompt_text, add_special_tokens=prompt_flags)
     target_ids = _encode(tokenizer, target_text)
     if not target_ids:
         return SupervisedExample(kept=False, reason="empty_target").to_dict()
 
-    eos = _eos_id(tokenizer)
+    eos, _source = resolve_response_terminator(tokenizer, profile)
     has_eos = bool(target_ids) and eos is not None and target_ids[-1] == eos
     if not has_eos:
         if eos is None:
@@ -330,19 +451,47 @@ def build_supervised_example(
             # inferred without, and it lives at the very start of the body, so a
             # plain middle cut would discard it as soon as history grows.
             prefix_text, rest_text = split
-            prefix_ids = _encode(tokenizer, prefix_text)
+            prefix_ids = _encode(tokenizer, prefix_text, add_special_tokens=prompt_flags)
             if len(prefix_ids) < budget:
                 remaining = budget - len(prefix_ids)
                 # Pin the tool catalog (and everything after it) to the tail so a
                 # middle cut cannot delete the schema block of the tool the target
                 # calls; only what precedes the catalog is middle-truncated.
-                catalog = _split_at_tools_section(rest_text)
-                tail_ids = _encode(tokenizer, catalog[1]) if catalog is not None else []
+                catalog = _split_catalog(rest_text)
+                tail_ids = (
+                    _encode(tokenizer, catalog[1] + catalog[2], add_special_tokens=False)
+                    if catalog is not None
+                    else []
+                )
                 if 0 < len(tail_ids) < remaining:
                     head_ids = _middle_truncate(
                         _encode(tokenizer, catalog[0]), remaining - len(tail_ids), head_keep_fraction
                     )
                     prompt_ids = prefix_ids + head_ids + tail_ids
+                elif catalog is not None and _encode(tokenizer, catalog[1]):
+                    # The catalog plus everything after it does not fit. Keep the
+                    # WHOLE catalog first (it is what makes the target answerable),
+                    # then the response-format/steps tail if it still fits, and
+                    # give only what remains to the context+history head. Only the
+                    # catalog's own overflow forces a cut inside it.
+                    before_text, catalog_text, after_text = catalog
+                    catalog_ids = _encode(tokenizer, catalog_text)
+                    after_ids = _encode(tokenizer, after_text)
+                    if len(catalog_ids) <= remaining:
+                        keep_after = (
+                            after_ids if len(catalog_ids) + len(after_ids) <= remaining else []
+                        )
+                        head_budget = remaining - len(catalog_ids) - len(keep_after)
+                        head_ids = _middle_truncate(
+                            _encode(tokenizer, before_text, add_special_tokens=prompt_flags),
+                            head_budget,
+                            head_keep_fraction,
+                        )
+                        prompt_ids = prefix_ids + head_ids + catalog_ids + keep_after
+                    else:
+                        prompt_ids = prefix_ids + _middle_truncate(
+                            catalog_ids, remaining, head_keep_fraction
+                        )
                 else:
                     rest_ids = _encode(tokenizer, rest_text)
                     prompt_ids = prefix_ids + _middle_truncate(rest_ids, remaining, head_keep_fraction)

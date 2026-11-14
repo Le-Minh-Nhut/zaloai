@@ -180,7 +180,7 @@ def gate_b_imports() -> dict[str, Any]:
 
 
 def gate_c_config() -> dict[str, Any]:
-    """Defaults load, tuning_mode is 'full', YAML files parse, unknown keys rejected."""
+    """Defaults load, tuning_mode is 'lora', YAML files parse, unknown keys rejected."""
     code = r"""
 import json, pathlib
 from lifemate.config import load_config
@@ -213,8 +213,8 @@ print(json.dumps(out))
     except (json.JSONDecodeError, IndexError):
         return _result("C", "config", FAIL, f"unparsable probe output: {_tail(probe['stdout'])}")
     problems = []
-    if data.get("tuning_mode") != "full":
-        problems.append(f"training.tuning_mode={data.get('tuning_mode')!r}, expected 'full'")
+    if data.get("tuning_mode") != "lora":
+        problems.append(f"training.tuning_mode={data.get('tuning_mode')!r}, expected 'lora'")
     if not data.get("defaults_ok"):
         problems.append("defaults do not look sane")
     if data.get("errors"):
@@ -227,7 +227,7 @@ print(json.dumps(out))
         "C",
         "config",
         PASS,
-        f"defaults ok, tuning_mode=full, {len(data.get('yaml_loaded') or [])} YAML file(s) load, unknown override rejected",
+        f"defaults ok, tuning_mode=lora, {len(data.get('yaml_loaded') or [])} YAML file(s) load, unknown override rejected",
     )
 
 
@@ -395,25 +395,64 @@ except Exception as exc:
     return _result("G", "loss masking", PASS, "prompt labels masked to -100; test_training.py masking tests pass (gradient anti-leak torch-gated)")
 
 
-def gate_h_full_default() -> dict[str, Any]:
-    """Full fine-tuning is the default; the dry-run preflight reports it."""
+def gate_h_lora_default() -> dict[str, Any]:
+    """LoRA is the default: the dry-run plan JSON must say ``"tuning_mode": "lora"``.
+
+    Asserted against the JSON plan ``scripts/train.py --dry-run`` prints, not
+    against the prose: the preflight text contains the word "full" on every run
+    (``tuning mode : lora`` … ``switch to LoRA``), so a substring check on the
+    combined output passed even for a ``full`` regression.
+    """
     probe = _run(
         [sys.executable, "scripts/train.py", "--dry-run", "--param-count", "4000000000"],
         timeout=300,
     )
     combined = (probe["stdout"] or "") + (probe["stderr"] or "")
     if probe["code"] != 0:
-        return _result("H", "full-default", FAIL, f"train.py --dry-run exited {probe['code']}: {_tail(combined)}")
-    if "tuning_mode" not in combined.lower() and "tuning" not in combined.lower():
-        return _result("H", "full-default", FAIL, "dry-run output does not mention the tuning mode")
-    if "full" not in combined.lower():
-        return _result("H", "full-default", FAIL, "dry-run output does not state tuning_mode=full")
+        return _result("H", "lora-default", FAIL, f"train.py --dry-run exited {probe['code']}: {_tail(combined)}")
+    observed = _dry_run_plan_field(probe["stdout"] or "", "tuning_mode")
+    if observed is None:
+        return _result(
+            "H",
+            "lora-default",
+            FAIL,
+            f"no JSON plan with a tuning_mode field in the dry-run output: {_tail(combined)}",
+        )
+    if observed != "lora":
+        return _result(
+            "H",
+            "lora-default",
+            FAIL,
+            f"dry-run plan reports tuning_mode={observed!r}, expected 'lora' (the default)",
+        )
     return _result(
         "H",
-        "full-default",
+        "lora-default",
         PASS,
-        "train.py --dry-run reports tuning_mode=full and a preflight verdict; GPU training: NOT RUN (no CUDA-enabled torch build, no weights)",
+        "dry-run plan JSON reports tuning_mode=lora (the default); GPU training: NOT RUN (no CUDA-enabled torch build, no weights)",
     )
+
+
+def _dry_run_plan_field(stdout: str, field: str) -> Any:
+    """Value of ``field`` in the JSON plan block ``scripts/train.py --dry-run`` prints.
+
+    ``scripts/train.py`` prints the header ``plan (dry run, …)`` followed by one
+    ``json.dumps(plan, indent=2)`` object, so everything after that line up to
+    the closing brace is the plan. Returns ``None`` when no such block parses.
+    """
+    marker = "plan (dry run"
+    index = stdout.find(marker)
+    if index < 0:
+        return None
+    body = stdout[stdout.find("\n", index) + 1 :]
+    start = body.find("{")
+    if start < 0:
+        return None
+    try:
+        plan, _end = json.JSONDecoder().raw_decode(body[start:])
+    except ValueError:
+        return None
+    return plan.get(field) if isinstance(plan, dict) else None
 
 
 def gate_i_lora() -> dict[str, Any]:
@@ -736,9 +775,9 @@ def gate_r_tiny_e2e() -> dict[str, Any]:
     if venv_py.is_file():
         candidates.append((str(venv_py), ".venv/bin/python"))
     candidates.append((sys.executable, "sys.executable"))
-    torch_py = Path("/tmp/torchenv/bin/python")
+    torch_py = Path("/tmp/cudaenv/bin/python")
     if torch_py.is_file():
-        candidates.append((str(torch_py), "/tmp/torchenv/bin/python"))
+        candidates.append((str(torch_py), "/tmp/cudaenv/bin/python"))
 
     for py_bin, label in candidates:
         probe = _run([py_bin, "-c", "import torch, transformers, peft; print('ok')"], timeout=15)
@@ -752,7 +791,7 @@ def gate_r_tiny_e2e() -> dict[str, Any]:
             "R",
             "tiny-model CPU e2e",
             SKIP,
-            "torch, transformers, peft not importable in .venv/bin/python, sys.executable, or /tmp/torchenv/bin/python",
+            f"torch, transformers, peft not importable in {', '.join(label for _, label in candidates)}",
         )
 
     probe = _run(
@@ -932,7 +971,7 @@ GATES: dict[str, Callable[[], dict[str, Any]]] = {
     "E": gate_e_synthetic_eda,
     "F": gate_f_causal_ordering,
     "G": gate_g_loss_masking,
-    "H": gate_h_full_default,
+    "H": gate_h_lora_default,
     "I": gate_i_lora,
     "J": gate_j_mock_agent_multistep,
     "K": gate_k_missing_info_out_of_scope,

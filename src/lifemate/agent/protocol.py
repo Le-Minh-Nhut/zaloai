@@ -15,6 +15,7 @@ Pure stdlib: importable without torch/transformers.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -177,6 +178,18 @@ def parse_action(text: str) -> Action:
     open_idx = raw.rfind(ACTION_OPEN, 0, close_idx)
     if open_idx == -1:
         return _invalid(raw, "found </action> without a matching <action> opening tag")
+    reasoning_start = open_reasoning_start(raw[:open_idx])
+    if reasoning_start is not None:
+        # The model opened a reasoning block and never closed it before the
+        # action. Executing that would act on a half-finished thought: the block
+        # is reflexion, not a decision. Reported as invalid so the loop feeds the
+        # error back instead of calling a tool.
+        return _invalid(
+            raw,
+            "action block appears inside an unterminated reasoning block "
+            "(an open think tag with no matching close); close the reasoning "
+            "block before emitting the action",
+        )
     return _parse_payload(raw[open_idx + len(ACTION_OPEN) : close_idx], raw)
 
 
@@ -186,6 +199,33 @@ __all__ = [
     "FINISH_ACTION",
     "Action",
     "make_tool_call",
+    "open_reasoning_start",
     "parse_action",
     "render_action",
 ]
+
+#: Matches an open or close reasoning tag, tolerating the U+200B zero-width space
+#: some templates put inside the angle brackets. Measured: neither MiniCPM5-2B's
+#: nor Qwen3's shipped template contains U+200B, but a tokenizer that adds it
+#: must not defeat the guard.
+_THINK_TAG = re.compile(r"<\u200b?(/)?think\u200b?>")
+
+def open_reasoning_start(text: str) -> int | None:
+    """Index where an unterminated reasoning block starts, or ``None``.
+
+    Nesting is tracked so ``think .. /think .. think`` reports the LAST open
+    block. An action that begins after this index is inside reasoning the model
+    never finished, so it is not a decision yet.
+    """
+    depth = 0
+    start: int | None = None
+    for match in _THINK_TAG.finditer(text if isinstance(text, str) else ""):
+        if match.group(1):
+            depth = max(0, depth - 1)
+            if depth == 0:
+                start = None
+        else:
+            if depth == 0:
+                start = match.start()
+            depth += 1
+    return start

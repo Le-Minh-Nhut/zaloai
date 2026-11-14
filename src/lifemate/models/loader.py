@@ -1,4 +1,4 @@
-"""Model + tokenizer loading for Qwen-family causal LMs, with LoRA support.
+"""Model + tokenizer loading for supported causal LMs, with LoRA support.
 
 Design rules enforced here:
 
@@ -30,6 +30,8 @@ __all__ = [
     "count_parameters",
     "is_local_or_offline",
     "load_model_and_tokenizer",
+    "build_bnb_config",
+    "require_bitsandbytes",
     "resolve_dtype",
     "resolve_model_mode",
 ]
@@ -48,6 +50,64 @@ DTYPE_MAP = {
 
 #: Upper bound for ``max_new_tokens``: one decision block is a few dozen tokens.
 MAX_NEW_TOKENS_CEILING = 4096
+
+#: 4-bit quantizations the loader can actually execute.
+QUANTIZATIONS = ("none", "nf4")
+
+
+def require_bitsandbytes() -> Any:
+    """Import ``bitsandbytes`` or raise an actionable error.
+
+    Isolated so a test can stub ``sys.modules['bitsandbytes']`` and exercise the
+    configuration path on a machine where the wheel is absent (it is absent in
+    the torch environment of record).
+    """
+    try:
+        import bitsandbytes as bnb  # noqa: PLC0415 - optional dependency
+    except Exception as exc:
+        raise LifeMateError(
+            "4-bit (QLoRA) loading requires the 'bitsandbytes' package: "
+            f"pip install bitsandbytes ({type(exc).__name__}: {exc})"
+        ) from exc
+    return bnb
+
+
+def build_bnb_config(torch_dtype: Any, quant_type: str = "nf4", double_quant: bool = True) -> Any:
+    """``BitsAndBytesConfig`` for 4-bit loading with bf16 compute.
+
+    Compute dtype follows the training precision; the stored weights are nf4 so
+    the frozen base costs ~0.5 byte/param instead of 2.
+    """
+    try:
+        from transformers import BitsAndBytesConfig  # noqa: PLC0415 - optional path
+    except ImportError as exc:  # pragma: no cover - transformers absent
+        raise LifeMateError(
+            f"4-bit loading requires transformers>=4.30 for BitsAndBytesConfig: {exc}"
+        ) from exc
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type=quant_type,
+        bnb_4bit_compute_dtype=torch_dtype,
+        bnb_4bit_use_double_quant=bool(double_quant),
+    )
+
+
+def _check_quantization(quantization: str | None, device: str) -> str:
+    """Validate + normalise a quantization request (``none``/``nf4``)."""
+    key = str(quantization or "none").strip().lower()
+    if key not in QUANTIZATIONS:
+        raise LifeMateError(
+            f"unsupported quantization {quantization!r}; expected one of {QUANTIZATIONS}"
+        )
+    if key == "none":
+        return "none"
+    if not str(device).startswith("cuda"):
+        raise LifeMateError(
+            f"quantization={key!r} needs a CUDA device; got device={device!r} "
+            "(bitsandbytes 4-bit has no CPU fallback here)"
+        )
+    require_bitsandbytes()
+    return key
 
 
 @dataclass
@@ -143,13 +203,14 @@ def resolve_model_mode(tuning_mode: str | None, checkpoint: str | Path | None) -
     an adapter checkpoint to be usable for inference.
     """
     mode = "full" if tuning_mode is None else str(tuning_mode).strip().lower()
-    if mode not in ("full", "lora"):
+    if mode not in ("full", "lora", "qlora"):
         raise LifeMateError(
-            f"unsupported tuning_mode {tuning_mode!r}; expected 'full' or 'lora'"
+            f"unsupported tuning_mode {tuning_mode!r}; expected 'full', 'lora' or 'qlora'"
         )
     if checkpoint is None or str(checkpoint).strip() == "":
         return "base"
-    return mode
+    # qlora checkpoints are ordinary LoRA adapters; the base is just loaded 4-bit.
+    return "lora" if mode in ("lora", "qlora") else mode
 
 
 def count_parameters(model: Any) -> dict[str, int]:
@@ -194,7 +255,8 @@ def load_model_and_tokenizer(
     trainable: bool = False,
     for_training: bool = False,
     temperature: float = 0.0,
-    max_new_tokens: int = 512,
+    max_new_tokens: int | None = None,
+    quantization: str = "none",
 ) -> ModelBundle:
     """Load a causal LM (+ optional LoRA adapter) and its tokenizer.
 
@@ -222,6 +284,7 @@ def load_model_and_tokenizer(
             f"device={device!r} requested but torch.cuda.is_available() is False; "
             "pass device='cpu' for a dry run or run on a GPU host"
         )
+    quant_mode = _check_quantization(quantization, device)
     dtype_name, note = bf16_note(torch_dtype, device)
     dtype = resolve_dtype(dtype_name, device)
     # Offline when either the base id/path or the checkpoint resolves locally.
@@ -239,13 +302,21 @@ def load_model_and_tokenizer(
         base_source = str(checkpoint)
 
     model = _load_causal_lm(
-        AutoModelForCausalLM, base_source, dtype, local_only, trust_remote_code, attn_implementation
+        AutoModelForCausalLM,
+        base_source,
+        dtype,
+        local_only,
+        trust_remote_code,
+        attn_implementation,
+        quant_mode=quant_mode,
     )
 
     if mode == "lora" and checkpoint:
-        model = _attach_lora_adapter(model, checkpoint, trainable=trainable)
+        model = _attach_lora_adapter(model, checkpoint, trainable=trainable, base_name=model_name_or_path)
 
-    if str(device):
+    if str(device) and quant_mode == "none":
+        # A bitsandbytes 4-bit model is already placed by accelerate; calling
+        # ``.to()`` on it raises.
         try:
             model.to(device)
         except Exception as exc:  # pragma: no cover - device/driver issues
@@ -271,6 +342,7 @@ def load_model_and_tokenizer(
         "checkpoint": str(checkpoint) if checkpoint else None,
         "model_mode": mode,
         "torch_dtype": str(dtype),
+        "quantization": quant_mode,
         "device": str(device),
         "attn_implementation": attn_implementation,
         "trust_remote_code": bool(trust_remote_code),
@@ -353,6 +425,8 @@ def _load_causal_lm(
     local_only: bool,
     trust: bool,
     attn_implementation: str | None,
+    *,
+    quant_mode: str = "none",
 ) -> Any:
     """Load the causal LM; unsupported architectures raise ``LifeMateError``."""
     kwargs: dict[str, Any] = {
@@ -363,6 +437,10 @@ def _load_causal_lm(
     }
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+    if quant_mode == "nf4":
+        # Placed by accelerate from the quantization config; no ``.to()`` later.
+        kwargs["quantization_config"] = build_bnb_config(dtype)
+        kwargs["device_map"] = {"": 0}
     try:
         result = AutoModelForCausalLM.from_pretrained(source, **kwargs)
     except ValueError as exc:
@@ -389,14 +467,28 @@ def _load_causal_lm(
     return loaded
 
 
-def _attach_lora_adapter(model: Any, checkpoint: str | Path, *, trainable: bool) -> Any:
-    """Wrap ``model`` with the PEFT adapter stored in ``checkpoint``."""
+def _attach_lora_adapter(
+    model: Any, checkpoint: str | Path, *, trainable: bool, base_name: str | None = None
+) -> Any:
+    """Wrap ``model`` with the PEFT adapter stored in ``checkpoint``.
+
+    Refuses to attach an adapter recorded against a different model family
+    before a single weight is touched: a MiniCPM adapter on a Qwen base would
+    otherwise load "successfully" with freshly initialised projections and
+    generate nonsense.
+    """
     path = Path(str(checkpoint))
     if not path.exists():
         raise LifeMateError(
             f"LoRA adapter checkpoint not found: {path}. Pass the directory written by "
             "models.checkpoint.save_checkpoint(is_lora=True)."
         )
+    try:
+        from lifemate.models.checkpoint import assert_adapter_base_matches  # noqa: PLC0415 - lazy
+
+        assert_adapter_base_matches(path, base_name)
+    except ImportError:  # pragma: no cover - checkpoint module always present
+        pass
     try:
         from peft import PeftModel
     except ImportError as exc:

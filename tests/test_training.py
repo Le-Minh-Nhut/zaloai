@@ -587,17 +587,17 @@ def _tiny_lm(vocab_size: int = 200, hidden: int = 16):
 # --------------------------------------------------------------------------- #
 # tuning mode selection
 # --------------------------------------------------------------------------- #
-def test_full_is_the_default_tuning_mode() -> None:
-    """Config defaults and the CLI default are both ``full``."""
-    assert load_config().training.tuning_mode == "full"
-    assert load_config(ROOT / "configs" / "base.yaml").training.tuning_mode == "full"
+def test_lora_is_the_default_tuning_mode() -> None:
+    """Config defaults and the CLI default are both ``lora``; full stays explicit."""
+    assert load_config().training.tuning_mode == "lora"
+    assert load_config(ROOT / "configs" / "base.yaml").training.tuning_mode == "lora"
     assert load_config(ROOT / "configs" / "training_full.yaml").training.tuning_mode == "full"
     out = _run([sys.executable, "scripts/train.py", "--help"])
     assert out.returncode == 0, out.stderr
-    assert "--tuning {full,lora}" in out.stdout, out.stdout
-    assert "default: from config, or 'full'" in out.stdout, "the CLI must advertise full as the default"
+    assert "--tuning {full,lora,qlora}" in out.stdout, out.stdout
+    assert "default: from config, or 'lora'" in out.stdout, "the CLI must advertise lora as the default"
     assert load_config(ROOT / "configs" / "training_lora.yaml").training.tuning_mode == "lora"
-    print("  tuning mode -> full by default (config + CLI), lora only when configured")
+    print("  tuning mode -> lora by default (config + CLI), full only when configured")
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -606,11 +606,19 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 
 def test_configs_round_trip_through_load_config() -> None:
     """Every shipped config parses with load_config (unknown keys would raise)."""
-    for name in ("base", "training_full", "training_lora", "inference", "evaluation", "wandb"):
+    for name in (
+        "base",
+        "training_full",
+        "training_lora",
+        "training_lora_qwen",
+        "inference",
+        "evaluation",
+        "wandb",
+    ):
         path = ROOT / "configs" / f"{name}.yaml"
         assert path.is_file(), f"missing configs/{name}.yaml"
         cfg = load_config(path)
-        assert cfg.training.tuning_mode in {"full", "lora"}
+        assert cfg.training.tuning_mode in {"full", "lora", "qlora"}
     lora_cfg = load_config(ROOT / "configs" / "training_lora.yaml")
     assert (lora_cfg.lora.r, lora_cfg.lora.alpha, lora_cfg.lora.dropout) == (16, 32, 0.05)
     full_cfg = load_config(ROOT / "configs" / "training_full.yaml")
@@ -834,6 +842,10 @@ def test_memory_preflight_math_is_exact() -> None:
     checkpoint   = weights + grads     = 8.00 GB
     """
     cfg = load_config()
+    # This fixture hand-checks the FORMULA against the Qwen3.5-4B shape
+    # (32 layers / hidden 2560), so it pins that profile explicitly; the
+    # MiniCPM defaults are covered by test_preflight_shape_differs_per_profile.
+    cfg.model.name = "Qwen/Qwen3.5-4B"
     cfg.training.tuning_mode = "full"
     cfg.training.per_device_train_batch_size = 1
     cfg.training.gradient_accumulation_steps = 1
@@ -846,25 +858,33 @@ def test_memory_preflight_math_is_exact() -> None:
     assert report["gradients_gb"] == 4.0, report
     assert report["optimizer_gb"] == 8.0, report
     assert report["activations_gb"] == 1.68, report
-    assert report["total_gb"] == 17.68, report
+    # logits + CE: transformers upcasts the whole [seq, vocab] tensor to fp32.
+    # Qwen3.5-4B vocab is 248320 -> 1024 * 248320 * 4 = 1.017 GB.
+    assert report["vocab_size"] == 248320, report
+    assert report["logits_gb"] == 1.02, report
+    assert report["total_gb"] == 18.69, report
     assert report["checkpoint_size_gb"] == 8.0, report
     assert report["verdict"] == "unknown", report["verdict"]
     assert report["available_gb"] is None
     assert "layers(32)" in report["heuristic"], report["heuristic"]
 
     checkpointed = run_memory_preflight(
-        param_count=1_000_000_000, cfg=_cfg_with(gradient_checkpointing=True), seq_len=1024,
+        param_count=1_000_000_000,
+        cfg=_cfg_with(gradient_checkpointing=True, tuning_mode="full"),
+        seq_len=1024,
         gpu_info={"gpu": "unavailable"},
     )
     # k=2: 32*1024*1*2560*2*2 = 335,544,320 bytes -> 0.34 GB
     assert checkpointed["activations_gb"] == 0.34, checkpointed
-    assert checkpointed["total_gb"] == 16.34, checkpointed
+    # 4.00 + 4.00 + 8.00 + 0.34 + 1.02 logits
+    assert checkpointed["total_gb"] == 17.35, checkpointed
     print("  preflight full -> 4.00 + 4.00 + 8.00 + 1.68 = 17.68 GB (hand-checked, fp32 masters, 32 layers)")
 
 def test_memory_preflight_verdicts_and_lora() -> None:
     """fits/tight/does_not_fit boundaries and the LoRA accounting."""
     cfg = _cfg_with(gradient_checkpointing=False, tuning_mode="full")
-    total_bytes = int(17.6777216e9)  # 4+4+8 GB + 32*1024*2560*10*2 bytes
+    # 4+4+8 GB + 32*1024*2560*10*2 activation bytes + 1024*248320*4 logit bytes
+    total_bytes = 17_677_721_600 + 1_017_118_720
     for free, expected in (
         (total_bytes * 2, "fits"),
         (int(total_bytes / 0.95), "tight"),
@@ -888,14 +908,16 @@ def test_memory_preflight_verdicts_and_lora() -> None:
     # adapter = 0.5% of 1e9 = 5e6 params -> grads 0.01 GB, optimizer 0.04 GB
     assert lora["trainable_params"] == 5_000_000, lora
     assert lora["weights_gb"] == 2.0
+    assert lora["adapter_gb"] == 0.01, lora
     assert lora["gradients_gb"] == 0.01, lora
     assert lora["optimizer_gb"] == 0.04, lora
-    # 2.0 weights + 0.01 grads + 0.04 optimizer + 0.34 activations
-    assert lora["total_gb"] == 2.39, lora
+    # 2.0 base + 0.01 adapter weights + 0.01 grads + 0.04 optimizer + 0.34 act
+    # + 1.02 logits = 3.41 (each term is rounded to 2dp before the sum)
+    assert lora["total_gb"] == 3.41, lora
     assert lora["activations_gb"] == 0.34, lora
     text = format_report(lora)
     assert "verdict" in text and "TOTAL" in text and "estimate, not a measurement" in text
-    print("  preflight -> 3 verdicts correct; LoRA 2.39 GB vs 16.34 GB full (fp32 masters, 32 layers)")
+    print("  preflight -> 3 verdicts correct; LoRA 3.41 GB vs 17.35 GB full (fp32 masters + fp32 logits)")
 
 def test_real_run_reports_measured_trainable_after_lora_configure() -> None:
     """A non-dry-run path preflights twice: first without weights, then with the model.
@@ -931,6 +953,20 @@ def test_real_run_reports_measured_trainable_after_lora_configure() -> None:
 
 def _cfg_with(**overrides):
     cfg = load_config()
+    # The hand-computed preflight fixtures below are arithmetic for the
+    # Qwen3.5-4B shape (32 layers, hidden 2560), so they pin that profile
+    # explicitly now that MiniCPM5-2B is the default.
+    cfg.model.name = overrides.pop("model_name", "Qwen/Qwen3.5-4B")
+    for key, value in overrides.items():
+        setattr(cfg.training, key, value)
+    return cfg
+
+def _mini_cfg(**overrides):
+    """Default-config fixture pinned to the shipped MiniCPM5-2B profile (vocab 130560)."""
+    cfg = load_config()
+    cfg.model.name = "openbmb/MiniCPM5-2B"
+    cfg.training.tuning_mode = overrides.pop("tuning_mode", "lora")
+    cfg.training.gradient_checkpointing = overrides.pop("gradient_checkpointing", True)
     for key, value in overrides.items():
         setattr(cfg.training, key, value)
     return cfg
@@ -957,6 +993,186 @@ def test_memory_preflight_rejects_bad_seq_len() -> None:
         print("  preflight -> seq_len 0 rejected")
         return
     raise AssertionError("seq_len=0 must raise")
+
+def test_preflight_logits_term_models_the_chunked_path() -> None:
+    """The headline logits term is the CE slice the trainer actually upcasts.
+
+    With ``loss_chunk_tokens=1024`` at seq 8192 / vocab 130560 the shipped run
+    upcasts ``[1024, vocab]`` (0.53 GB), not ``[8192, vocab]`` (4.28 GB); the
+    unchunked cost is reported separately as ``logits_unchunked_gb``.
+    ``loss_chunk_tokens <= 0`` means "no chunking", so both terms coincide.
+    """
+    from lifemate.training.memory_preflight import run_memory_preflight
+
+    vocab = 130560  # the shipped MiniCPM5-2B vocab, so use the default profile
+    chunked = run_memory_preflight(
+        param_count=1_000_000_000,
+        cfg=_mini_cfg(loss_chunk_tokens=1024),
+        seq_len=8192,
+        gpu_info={"gpu": "unavailable"},
+    )
+    assert chunked["vocab_size"] == vocab, chunked["vocab_size"]
+    assert chunked["logits_chunk_tokens"] == 1024, chunked["logits_chunk_tokens"]
+    assert chunked["logits_gb"] == round(1024 * vocab * 4 / 1e9, 2) == 0.53, chunked["logits_gb"]
+    assert chunked["logits_unchunked_gb"] == round(8192 * vocab * 4 / 1e9, 2) == 4.28, chunked
+    assert "CHUNKED" in chunked["heuristic"] and "chunk(1024)" in chunked["heuristic"], chunked["heuristic"]
+    assert "unchunked would be 4.28 GB" in chunked["logits_note"], chunked["logits_note"]
+
+    unchunked = run_memory_preflight(
+        param_count=1_000_000_000,
+        cfg=_mini_cfg(loss_chunk_tokens=0),
+        seq_len=8192,
+        gpu_info={"gpu": "unavailable"},
+    )
+    assert unchunked["logits_chunk_tokens"] == 8192, unchunked["logits_chunk_tokens"]
+    assert unchunked["logits_gb"] == unchunked["logits_unchunked_gb"] == 4.28, unchunked
+    assert "UNCHUNKED" in unchunked["heuristic"], unchunked["heuristic"]
+    print("  preflight logits -> chunked 0.53 GB headline vs unchunked 4.28 GB at seq 8192; 0 means no chunking")
+
+
+def test_model_shape_descends_into_text_config() -> None:
+    """Qwen3.5-4B's layers/hidden live under ``text_config``; the read must go there.
+
+    A top-level-only read silently returned 0 and fell through to the profile
+    fallback — right numbers, wrong provenance, and a trap for the next model.
+    """
+    from lifemate.training.memory_preflight import _model_shape
+
+    nested = {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "text_config": {
+            "num_hidden_layers": 32,
+            "hidden_size": 2560,
+            "vocab_size": 248320,
+            "intermediate_size": 9216,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+        },
+    }
+
+    class _Cfg:
+        def __init__(self, payload):
+            self.text_config = type("Sub", (), payload["text_config"])()
+
+    class _Param:
+        def numel(self) -> int:
+            return 10
+
+        requires_grad = False
+
+    class _Model:
+        def __init__(self) -> None:
+            self.config = _Cfg(nested)
+
+        def parameters(self):
+            return iter([_Param()])
+
+    cfg = load_config()
+    cfg.model.name = "Qwen/Qwen3.5-4B"
+    _params, layers, hidden, vocab, source = _model_shape(cfg, _Model())
+    assert (layers, hidden, vocab) == (32, 2560, 248320), (layers, hidden, vocab)
+    assert source.startswith("model ("), source
+
+    # Nothing resolvable anywhere -> the profile fallback, with the reason stated.
+    class _Empty:
+        config = None
+
+        def parameters(self):
+            return iter([])
+
+    _params, layers, hidden, _vocab, source = _model_shape(cfg, _Empty())
+    assert (layers, hidden) == (32, 2560), (layers, hidden)
+    assert "profile fallback" in source and "text_config" in source, source
+    print("  model shape -> text_config read first (32L/2560H), fallback states the reason")
+
+
+def test_fp16_grad_scaler_order_and_bf16_absence() -> None:
+    """Scaler call order is unscale -> clip -> step -> update; only fp16/CUDA builds one.
+
+    A T4 (fp16, no bf16) run without scaling produces inf/NaN grads and a
+    silently dead adapter. The order matters: clipping must see UNSCALED
+    gradients, and the update must go through the scaler's inf guard.
+    """
+    # No scaler for bf16/fp32, and none for fp16 without CUDA (the "T4 absent" case).
+    # Covers every spelling the code normalises (strip + lower, like the loader's
+    # DTYPE_MAP): "float16"/"fp16"/"half" are fp16; "bfloat16"/"bf16" are not.
+    for precision in ("bfloat16", "bf16", "float32", "float16", "fp16", "half", "FP16", "Half"):
+        trainer = SFTTrainer(
+            model=_StubModel(),
+            tokenizer=_CharTokenizer(),
+            collator=SupervisedCollator(pad_token_id=0),
+            train_records=[],
+            cfg=_loop_cfg(precision=precision),
+            device="cpu",
+            checkpoint_manager=CheckpointManager(tempfile.mkdtemp(), run_name="run", save_fn=_fake_save),
+        )
+        assert trainer.scaler is None, (precision, trainer.scaler)
+    if not _torch_available():
+        print("  grad scaler -> no scaler for bf16/fp32/fp16-on-CPU")
+        return
+
+    import torch  # noqa: PLC0415
+
+    torch.manual_seed(0)
+    calls: list[str] = []
+
+    class FakeScaler:
+        """Records the call order and applies the real unscale/factor ladder."""
+
+        def __init__(self, trainer) -> None:
+            self.trainer = trainer
+            self.saved: dict | None = None
+
+        def scale(self, loss):
+            calls.append("scale")
+            return loss
+
+        def unscale_(self, optimizer):
+            calls.append("unscale")
+            assert optimizer is self.trainer.optimizer, "unscale_ must target the live optimizer"
+
+        def step(self, optimizer):
+            calls.append("step")
+            optimizer.step()
+
+        def update(self):
+            calls.append("update")
+
+        def state_dict(self):
+            return {"scale": 1.0}
+
+        def load_state_dict(self, state):
+            self.saved = dict(state)
+
+    # Construction is decided by precision + device, so pin the normalisation on a
+    # CUDA-shaped trainer without touching the GPU: the scaler must appear for
+    # every fp16 spelling and never for bf16/fp32.
+    for precision, expect in (
+        ("float16", True), ("fp16", True), ("half", True), ("FP16", True), ("Half", True),
+        ("bfloat16", False), ("bf16", False), ("float32", False),
+    ):
+        candidate = _loop_trainer(
+            _tiny_lm(), _loop_records(1), _loop_cfg(precision=precision), tempfile.mkdtemp()
+        )
+        candidate.device = "cuda"  # gate only; no allocation happens here
+        built = candidate._make_grad_scaler()
+        assert (built is not None) is expect, (precision, built)
+        assert candidate.precision == precision.strip().lower(), candidate.precision
+
+    trainer = _loop_trainer(_tiny_lm(), _loop_records(2), _loop_cfg(), tempfile.mkdtemp(), max_steps=1)
+    trainer.scaler = FakeScaler(trainer)
+    original_clip = trainer._clip_gradients
+
+    def recording_clip() -> None:
+        calls.append("clip")
+        original_clip()
+
+    trainer._clip_gradients = recording_clip  # type: ignore[assignment]
+    result = trainer.run()
+    assert calls == ["scale", "unscale", "clip", "step", "update"], calls
+    assert result.steps == 1
+    print("  grad scaler -> fp16 order scale -> unscale -> clip -> step -> update; none for bf16/fp32/CPU")
+
 
 def test_optimizer_steps_always_progress() -> None:
     """A dataset smaller than one effective batch still yields a step per epoch.
@@ -1604,19 +1820,27 @@ def test_dry_run_prints_preflight_and_plan() -> None:
             "full",
             "--config",
             "configs/training_full.yaml",
+            # --model must beat the YAML (which now names MiniCPM5-2B); this
+            # assertion is the hand-checked Qwen3.5-4B arithmetic (32 layers).
+            "--model",
+            "Qwen/Qwen3.5-4B",
         ]
     )
     assert out.returncode == 0, (out.stdout, out.stderr)
     assert "Memory pre-flight" in out.stdout
     # 4e9 params, seq 8192, grad ckpt, 32 layers: weights 16.0 (fp32 master)
     # + grads 16.0 + AdamW 32.0 + activations 32*8192*1*2560*2*2 = 2.68 GB
-    assert "TOTAL              : 66.68 GB" in out.stdout, out.stdout
-    assert "weights            : 16.0 GB" in out.stdout, out.stdout
+    # + the CHUNKED fp32 logits the run actually upcasts, 1024*248320*4 = 1.02 GB
+    # (unchunked would be 8192*248320*4 = 8.14 GB, reported alongside) = 67.70
+    assert "TOTAL              : 67.7 GB" in out.stdout, out.stdout
+    assert "logits + CE        : 1.02 GB" in out.stdout, out.stdout
+    assert "unchunked 8.14 GB" in out.stdout, out.stdout
+    assert "base weights       : 16.0 GB" in out.stdout, out.stdout
     assert "sequence length    : 8192" in out.stdout, out.stdout
     assert "layers(32)" in out.stdout, out.stdout
     assert '"tuning_mode": "full"' in out.stdout
     assert "no model loaded, no training launched" in out.stdout
-    print("  dry run full -> 66.68 GB at seq 8192 (fp32 masters, 32 layers), plan printed, exit 0")
+    print("  dry run full -> 67.70 GB at seq 8192 (fp32 masters + 1024-token chunked logits), plan printed, exit 0")
 
     lora = _run(
         [
@@ -1629,17 +1853,60 @@ def test_dry_run_prints_preflight_and_plan() -> None:
             "lora",
             "--config",
             "configs/training_lora.yaml",
+            "--model",
+            "Qwen/Qwen3.5-4B",
         ]
     )
     assert lora.returncode == 0, (lora.stdout, lora.stderr)
     assert "tuning mode        : lora" in lora.stdout
-    # configs/training_lora.yaml: batch 1, accum 8, seq 8192, grad ckpt.
-    # weights 8.00 + grads 0.04 + optimizer 0.16 + activations 2.68 = 10.88 GB
+    # configs/training_lora.yaml + --model Qwen/Qwen3.5-4B: batch 1, accum 8,
+    # seq 8192, grad ckpt. base 8.00 + adapter 0.04 + grads 0.04 + optimizer
+    # 0.16 + activations 2.68 + chunked logits 1.02 = 11.94 GB
+    # (unchunked logits would add 7.12 GB back: 8.14 instead of 1.02)
     assert "gradients          : 0.04 GB" in lora.stdout, lora.stdout
     assert "optimizer state    : 0.16 GB" in lora.stdout, lora.stdout
     assert "sequence length    : 8192 (microbatch 1, accum 8)" in lora.stdout, lora.stdout
-    assert "TOTAL              : 10.88 GB" in lora.stdout, lora.stdout
-    print("  dry run lora -> 10.88 GB at seq 8192 (microbatch 1 x accum 8), exit 0")
+    assert "TOTAL              : 11.94 GB" in lora.stdout, lora.stdout
+    print("  dry run lora -> 11.94 GB at seq 8192 (microbatch 1 x accum 8, 1024-token chunked logits), exit 0")
+
+def test_fp16_overcommit_refused_before_launch() -> None:
+    """An fp16 run the preflight calls ``does_not_fit`` exits 3 with the measured fact.
+
+    MEASURED: LoRA bf16 at seq 8192 fits (14.37 GB allocated on a 16.57 GB card);
+    the same run at precision float16 OOMs on the first backward. The guard reads
+    the preflight VERDICT, so there is no hardcoded sequence limit.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    spec = importlib.util.spec_from_file_location("train_script_fp16_guard", ROOT / "scripts" / "train.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cfg = load_config()
+    cfg.training.precision = "float16"
+    cfg.training.max_seq_length = 8192
+    tight = {"verdict": "does_not_fit", "total_gb": 15.34, "available_gb": 15.17, "seq_len": 8192}
+    message = module._refuse_fp16_overcommit(cfg, tight)
+    assert message and "does not fit" in message and "MEASURED" in message, message
+    assert "bfloat16" in message and "seq 8192" in message, message
+
+    # Every non-refusal: a fitting verdict, and every non-fp16 spelling.
+    for verdict in ("fits", "tight", "unknown"):
+        assert module._refuse_fp16_overcommit(cfg, {**tight, "verdict": verdict}) is None, verdict
+    for precision in ("bfloat16", "bf16", "float32"):
+        cfg.training.precision = precision
+        assert module._refuse_fp16_overcommit(cfg, tight) is None, precision
+    for spelling in ("fp16", "half", "FP16"):
+        cfg.training.precision = spelling
+        assert module._refuse_fp16_overcommit(cfg, tight), spelling
+
+    # End to end: a real _preflight verdict that does not fit exits 3, not 1.
+    cfg.training.precision = "float16"
+    assert module._refuse_fp16_overcommit(
+        cfg, {"verdict": "does_not_fit", "total_gb": 1, "available_gb": 0.5, "seq_len": 8192}
+    )
+    print("  fp16 guard -> does_not_fit + fp16 refuses with the measured reason; fits/tight/bf16 pass through")
+
 
 def test_smoke_reports_environment_honestly() -> None:
     """--smoke runs end-to-end with a tiny model, or exits 3 saying why."""
@@ -1869,7 +2136,10 @@ def test_lora_trainable_count_matches_the_shipped_config() -> None:
     from lifemate.training.lora_finetuning import configure_lora, discover_target_modules  # noqa: PLC0415
     from lifemate.training.memory_preflight import run_memory_preflight  # noqa: PLC0415
 
-    cfg = load_config("configs/training_lora.yaml")
+    # The released Qwen3.5 architecture test uses the explicit Qwen config: the
+    # DEFAULT config now names MiniCPM5-2B (configs/training_lora_qwen.yaml is
+    # the one that advertises Qwen's hybrid auto-discovery).
+    cfg = load_config("configs/training_lora_qwen.yaml")
     assert cfg.lora.target_modules is None, "shipped config must stay on auto-discovery"
     with torch.device("meta"):
         model = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN3_5_4B_TEXT_CONFIG))
@@ -2081,6 +2351,10 @@ def test_partial_group_rescale_matches_mean() -> None:
         records = [{"messages": messages, "target": target} for _ in range(3)]
 
         cfg = load_config()
+        # Pin the base to the tiny fixture so the trainer and the hand-built
+        # reference examples resolve the SAME profile (and terminator); the
+        # default MiniCPM profile would supervise a different terminator id.
+        cfg.model.name = str(model_dir)
         cfg.training.num_train_epochs = 1
         cfg.training.per_device_train_batch_size = 1
         cfg.training.gradient_accumulation_steps = 8
@@ -2261,6 +2535,10 @@ def _resume_cfg(max_seq_length: int = 128):
     cfg.training.save_strategy = "steps"
     cfg.training.logging_steps = 1
     cfg.training.max_seq_length = max_seq_length
+    # These resume tests exercise FULL-mode bookkeeping (and assert that lora.r is
+    # ignored in full mode), so pin the mode instead of inheriting the new
+    # LoRA default.
+    cfg.training.tuning_mode = "full"
     cfg.model.device = "cpu"
     return cfg
 
@@ -2544,6 +2822,10 @@ def test_lora_resume_restores_adapter_and_enables_checkpointing() -> None:
 
     def _build(root: Path, max_steps: int):
         cfg = _resume_cfg(max_seq_length=64)
+        # The fixture builds Qwen3.5 hybrid blocks, so name Qwen: the profile then
+        # advertises the hybrid projections (in_proj_*/out_proj) rather than
+        # MiniCPM's 7, and configure_lora's profile/model cross-check passes.
+        cfg.model.name = "Qwen/Qwen3.5-4B"
         cfg.training.tuning_mode = "lora"
         cfg.training.num_train_epochs = 1
         cfg.training.output_dir = str(root)

@@ -1,65 +1,67 @@
-# Training guide — LifeMate action policy (Qwen3.5-4B)
+# Training guide — LifeMate action policy (default: MiniCPM5-2B + LoRA)
 
-Fine-tunes Qwen3.5-4B to emit one frozen action block per turn:
+Fine-tunes `openbmb/MiniCPM5-2B` to emit one frozen action block per turn:
 
 ```
 <action>{"type": "tool_call", "name": "alarm.set", "arguments": {"time": "06:30"}}</action>
 <action>{"type": "finish"}</action>
 ```
 
-**What was actually exercised on this machine, and what was not**
+`Qwen/Qwen3.5-4B` remains supported: `--model Qwen/Qwen3.5-4B` or
+`--config configs/training_lora_qwen.yaml`. Nothing in this guide is
+Qwen-specific unless it says so.
 
-| Item | Status here |
+## 0. What was measured here, and what was not
+
+| Item | Status on this machine |
 |---|---|
-| SFT data construction, alignment, leakage guards, splits | ✅ CPU-verified (`tests/test_trajectory.py`) |
-| Collator masking, drop policy, padding, checkpoint policy, preflight math | ✅ CPU-verified (`tests/test_training.py`) |
-| `prepare_dataset.py` on the synthetic fixture | ✅ CPU-verified |
-| `train.py --dry-run` (full + LoRA) | ✅ CPU-verified |
-| `train.py --smoke` (tiny model, 2 steps, CPU) | ✅ verified in a throwaway CPU venv with `torch`+`transformers` (24,736-param model, exit 0, `full/step-2` written) — **BLOCKED** in the repo venv, where the script correctly exits 3 and writes no checkpoint |
-| `train.py --smoke --tuning lora` | ✅ same venv (`peft`), 7 target modules discovered, adapter-only checkpoint written |
-| Real SIGTERM → `interrupt-<step>` → `--resume` | ✅ same venv: exited 130, `interrupt-8` written, resumed to step 12 |
-| Gradient anti-leak control | ✅ same venv: masked max relative grad delta 5e-8 vs 1.1e-1 for an unmasked (leaky) control |
-| Full 4B training on GPU | ❌ NOT RUN — GPU present (RTX 5070 Ti, 16303 MiB = 17.09 GB decimal / 15.92 GiB) and a CUDA-capable build **exists** at `/tmp/cudaenv` (`torch 2.15.0+cu132`, `sm_120`, bf16 OK), but no Qwen3.5-4B weights. The repo venv (`2.15.0+cpu`) and `/tmp/torchenv` stay CPU-only. Nothing below is a measured training result. |
+| SFT data construction, alignment, leakage guards, splits | measured, CPU (`tests/test_trajectory.py`) |
+| Collator masking, truncation/drop policy, padding, checkpoint policy, preflight math | measured, CPU (`tests/test_training.py`) |
+| `prepare_dataset.py` on the real splits with the MiniCPM tokenizer | measured (`--tokenizer` run; the figures below come from the collator's own measurement over the real records) |
+| `train.py --dry-run` (default LoRA, `--tuning full`, `--seq-len 12288`) | measured, estimator output only |
+| **train-only step**, real weights, seq padded to exactly **8192**, bf16, grad-ckpt, micro-batch 1, chunked CE 1024, no `PYTORCH_CUDA_ALLOC_CONF` | **measured on GPU**: OK — peak allocated **14.37 GB**, peak reserved **15.17 GB**, loss 2.911356, 3.78 s wall |
+| same **train-only step** with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | **measured on GPU**: OK — peak allocated **14.37 GB**, peak reserved **14.88 GB**, loss 2.911356, 3.82 s wall |
+| **eval-only step** (`SFTTrainer.evaluate`, chunked), seq padded to exactly 8192, no env var | 8.34 GB allocated / 9.48 GB reserved, 1.08 s (re-run: 8.34 / 9.48, 1.10 s) |
+| **train + eval + save cycle** (one train step → one eval step → one epoch-end adapter save, same process), padded to 8192, no env var | **measured**: 14.37 GB allocated / **15.17 GB reserved** peak, 5.03 s total — **1.40 GB reserved headroom** on the 16.57 GB card |
+| epoch-end adapter save inside that cycle | **measured**: 245 ms, 9 files written |
+| seq 12288 on the same card | **measured earlier in this repo, not re-run on 2026-11-14**: OOM, "Tried to allocate 502.00 MiB; 14.02 GiB allocated, 123.88 MiB free" |
+| seq 5632, chunking on vs off | **measured earlier in this repo, not re-run on 2026-11-14**: 14.98 / 15.17 GB off, 11.50 / 13.76 GB on (3.48 GB allocated saved) |
+| seq 8192 with chunking OFF | **measured earlier in this repo, not re-run on 2026-11-14**: OOM — `ForCausalLMLoss` upcast the whole `[seq, vocab]` logits to fp32 (8192 × 130560 × 4 ≈ 3.98 GiB) in one allocation |
+| chunked CE vs single-shot loss | **measured equivalent** (CPU): max relative deviation 8.6e-8 (all tokens supervised), 1.7e-7 (mixed `-100` masking), tolerance 1e-5 |
+| chunked **eval** vs single-shot eval (chunks 0/1024/5/1) | **measured identical**: `val_loss`, `val_token_accuracy`, `val_target_tokens` all equal, relative difference 0.0 on a real tiny Llama and 0.0 on a synthetic oracle |
+| adapter save + reload, greedy generation | **measured** on the real loaded model |
+| QLoRA on GPU | **NOT TESTED** — `bitsandbytes` is not installed in the torch environment used here |
+| A whole epoch, convergence, any leaderboard score | **not run** — measured worst case is one train step + one eval step + one save in the same process |
+| `precision: float16` at seq 8192 | **measured earlier in this repo, not re-run on 2026-11-14**: OOM on the first backward ("… 14.22 GiB in use") while the identical bf16 run fits, so fp16 buys nothing on this card; `scripts/train.py` warns on any fp16-on-CUDA run and refuses to launch when the preflight verdict is `does_not_fit` |
 
-No model weights are present locally: the Qwen3.5-4B checkpoint (738 tensors
-over 2 shards, 8.68 GiB) was never fetched. The real dataset **is** present (`./data`:
-`train` 1545 samples, `public_test` 634) and drove every count below — the
-shipped SFT build at `outputs/datasets/train/` is **4368 train + 482 val = 4850**
-decision points (0 sample drops, 19 `unobservable_ref_target` point drops:
-17 train / 2 val). Every memory number in this guide is an **estimate** from the
-formulas in `src/lifemate/training/memory_preflight.py`.
+The four `8192`-padded VRAM cases come from the sweep documented in §4; each ran
+in a fresh process with the batch padded to an explicit 8192 tokens, so the
+sequence length is identical across runs. Rows marked "measured earlier in this
+repo" are older runs that were not re-executed on 2026-11-14.
 
-Test and gate status on the current tree (not a training result): the suites are
-**479 / 485 / 491** (stdlib `passed=479 skipped=13` / `.venv` pytest `485 passed, 7 skipped` /
-`/tmp/cudaenv` pytest `491 passed, 1 skipped`; measured 2026-11-13) and `verify_all.py`
-gates are **17/17 PASS**, with **gate Q unmeasured because GPU work is paused**. The
-older `468 / 468 / 473` triple is historical: it was measured on `/tmp/torchenv`, a CPU
-venv deleted during the 2026-11-13 session — `/tmp/cudaenv` is the torch interpreter of
-record now, and four test files (`test_wandb_tracking`, `test_sandbox_probe`,
-`test_sandbox_credentials`, `test_sandbox_measured`) have been added since. Docker is
-**NOT RUN / UNVERIFIED**: the image was never built, and
-the old `cu124` pin could not run `sm_120` kernels, so it was changed to
-`cuda:12.8.1` + `whl/cu128`.
+Test suite on the current tree: `python3 tests/run_tests.py` → **516 passed / 13
+skipped / 0 failed**; `.venv/bin/python -m pytest -q` → **522 / 7 / 0**;
+`PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q` → **528 / 1 / 0**.
+`/tmp/cudaenv` (`torch 2.15.0+cu132`, transformers 5.22.2) is the torch
+interpreter of record. Docker is **NOT RUN / UNVERIFIED**.
 
 ---
 
 ## 1. Prepare the SFT dataset
 
-`prepare_dataset.py` converts gold trajectories into *causal decision points*: one
-(prompt, target action) pair per agent step.
+`prepare_dataset.py` converts gold trajectories into *causal decision points*:
+one (prompt, target action) pair per agent step.
 
 ```bash
-# real data (needs the official dataset extracted under --data-root)
+# real data with the real MiniCPM tokenizer (exact token counts, no weights loaded)
 python3 scripts/prepare_dataset.py \
     --data-root ./data --split train --output outputs/datasets \
-    --val-ratio 0.1 --seed 42
+    --tokenizer openbmb/MiniCPM5-2B --val-ratio 0.1 --seed 42 --max-seq-length 8192
 
-# with a real tokenizer for exact token counts (optional; downloads the tokenizer only)
-python3 scripts/prepare_dataset.py \
-    --data-root ./data --split train --output outputs/datasets \
-    --tokenizer Qwen/Qwen3.5-4B --max-seq-length 8192
+# without a tokenizer the counts are chars/4 ESTIMATES and the report says so
+python3 scripts/prepare_dataset.py --data-root ./data --split train --output outputs/datasets
 
-# synthetic fixture (works offline)
+# synthetic fixture (offline)
 python3 scripts/prepare_dataset.py \
     --data-root tests/fixtures/synthetic_lifemate --split train --output /tmp/sft_synth
 ```
@@ -69,40 +71,32 @@ Writes `outputs/datasets/train/`:
 ```
 train.jsonl   # {"sample_id","step_index","messages":[system,user],"target","meta"}
 val.jsonl
-manifest.json # counts, seed, ratio, id hashes, group hash, tokenization status
+manifest.json # counts, seed, ratio, id hashes, group hash, fit/truncation block
 stats.json    # decision-point accounting + drop reasons + token-size summary
 ```
 
 Prompts are rendered at preparation time and stored verbatim, so training cannot
-drift from the inference-time renderer (`agent/prompt_builder.py`).
+drift from the inference-time renderer.
 
-### Thinking is disabled in the rendered prompt
+### Thinking is disabled in the rendered prompt, on purpose
 
 `training/collator.py::render_prompt_text` and `models/generation.py::HFGenerator.build_prompt`
-both call the chat template with `enable_thinking=False`, so every prompt ends with the
-closed think block (`collator.NO_THINK_SUFFIX`: think open+close tags, then a blank line).
-Qwen3's default (flag absent) ends with an *open* think tag instead, which would supervise
-the action inside the reasoning block and leave inference
-mid-thought with no cue to stop. A tokenizer that rejects the kwarg is retried without it;
-the bare-tokenizer ChatML fallback appends the same closed-think suffix. A tokenizer that
-*has* a template and raises is a hard `LifeMateError` on both sides — never a silent
-reformat, which would train on prompt bytes inference never produces.
+both call the chat template with `enable_thinking=False` from the model profile.
+For MiniCPM5-2B that is an **officially supported mode**: the template renders an
+empty, already-closed think block (`\x3cthink\x3e\n\n\x3c/think\x3e\n\n`), which is
+byte-identical to what the template emits for a training assistant turn without
+`reasoning_content`. Measured tail ids: `[8, 130063, 9, 130063]`.
 
-**Read the warnings.** `visibility_limited` means the gold trajectory's final tool
-result is missing, so no terminal `finish` example could be built.
-`unobservable x-ref` means a write argument's value appears nowhere the model can
-see (request, context, rendered history window, earlier action, earlier
-observation, or the tool's own enum). Those targets are **dropped** rather than
-repaired — the rest of the trajectory is kept — and counted under
-`stats.json → dropped_decision_points.unobservable_ref_target`. The gold value is
-never injected into a prompt.
+A tokenizer that rejects the kwarg is retried without it; the bare-tokenizer
+ChatML fallback appends the same closed suffix. A tokenizer that *has* a template
+and raises is a hard `LifeMateError` on both sides — never a silent reformat.
 
-### Decision-point rules (why the data looks like this)
+### Decision-point rules
 
 | Gold trajectory | Emitted targets |
 |---|---|
 | N calls, all results present, last call ≠ `sys.ask_missing_info` | `call_0 … call_{N-1}`, then `finish` |
-| last call is `sys.ask_missing_info` | `…, ask_missing_info` and **no** `finish` (asking is terminal for that sample) |
+| last call is `sys.ask_missing_info` | `…, ask_missing_info` and **no** `finish` |
 | zero calls (out of scope) | a single `finish` |
 | last result missing | calls only, **no** `finish`; sample flagged `visibility_limited` |
 
@@ -110,58 +104,58 @@ Prompt *k* contains observations of steps `0..k-1` only. It never contains step
 *k*'s own observation, a later observation, or `label.final_state`
 (`assert_no_label_leak` hard-fails on violation).
 
+`visibility_limited` and `unobservable x-ref` are reported in `stats.json`;
+unobservable targets are **dropped**, never repaired, and the gold value is never
+injected into a prompt.
+
 ---
 
-## 2. Train — full fine-tuning (DEFAULT)
+## 2. Train — the default local workflow
 
 ```bash
-python3 scripts/train.py --config configs/training_full.yaml
+python3 scripts/train.py
 ```
 
-`--tuning` defaults to config setting (`full`); `training.tuning_mode: full` in the config agrees.
-Full mode means **every parameter** trains: `configure_full_finetuning` unfreezes
-everything and raises `LifeMateError` if `trainable != total`. The run never
-silently falls back to LoRA.
-
-### Multimodal towers policy (Qwen3.5 vision/audio towers)
-In LifeMate Track 1, audio inputs are processed by upstream decoupled ASR
-(Gipformer 68M int8 default, or PhoWhisper optional), and the causal LM operates on text decision prompts.
-If a multimodal variant of Qwen3.5 (exposing `visual`, `vision_tower`, `audio_tower`, etc.)
-is loaded:
-* `everything` (default): full FT trains **all** parameters (`trainable == total`).
-* `lm_only`: explicitly freezes vision/audio towers; only LM parameters train.
-The policy is printed at startup (`multimodal: policy=everything (towers: ...)`)
-and reflected in the trainable parameter count. Silent partial training is forbidden.
-```bash
-# override the tuning mode explicitly (LoRA)
-python3 scripts/train.py --config configs/training_full.yaml --tuning lora
-# LoRA config, own hyper-parameters
-python3 scripts/train.py --config configs/training_lora.yaml --tuning lora
-```
-
-### Other invocations
+No arguments means: `--config configs/training_lora.yaml` (MiniCPM5-2B, LoRA
+r=16/alpha=32/dropout=0.05, 8192 tokens, 3 epochs), because `--config` defaults
+to that file and `training.tuning_mode: lora` in it. `--tuning` defaults to the
+config value; when passed, it overrides the config **and** sets
+`training.quantization` explicitly (`qlora` → `nf4`, everything else → `none`).
+The run never silently downgrades `full` → LoRA.
 
 ```bash
 # plan only: no weights loaded, no training launched
-python3 scripts/train.py --dry-run --param-count 4000000000 --tuning full
+python3 scripts/train.py --dry-run
 
-# resume: continue from a step-<n> directory (verifies step/hash/tuning mode)
-# run_name defaults to the tuning mode, so a full-FT run lands in .../full/step-<n>
-python3 scripts/train.py --config configs/training_full.yaml --resume outputs/checkpoints/full/step-1500
-# the resume guard compares only optimisation-relevant settings.
-# MAY change across a resume: dataset mount (data.root/--dataset-dir), device, W&B names,
-#   ASR/inference paths, and checkpoint bookkeeping (logging/save/eval cadence, save_total_limit,
-#   report_to, dataloader_num_workers).
-# MAY NOT change: lr, weight decay, epochs, per-device batch size, grad accumulation, warmup,
-#   lr scheduler, gradient checkpointing, clip norm, seed, max_seq_length, validation_ratio,
-#   optimizer, precision, tuning mode, model identity/precision, and (in LoRA mode) LoRA hparams.
+# real run, explicit model override (Qwen3.5-4B stays one flag away)
+python3 scripts/train.py --model Qwen/Qwen3.5-4B
+python3 scripts/train.py --config configs/training_lora_qwen.yaml
 
-# explicit dataset location
-python3 scripts/train.py --dataset-dir outputs/datasets/train
-
-# short run
-python3 scripts/train.py --max-steps 20
+# other useful flags (all verified in `--help`)
+python3 scripts/train.py --dataset-dir outputs/datasets/train   # explicit dataset
+python3 scripts/train.py --output-dir /tmp/ckpt --run-name lora-8192
+python3 scripts/train.py --max-steps 20                          # short run
+python3 scripts/train.py --seq-len 5632                          # alias: --max-seq-length
+python3 scripts/train.py --device cuda --seed 7
+python3 scripts/train.py --smoke                                 # tiny CPU model, 2 steps
+python3 scripts/train.py --config configs/training_full.yaml --tuning full
 ```
+
+Full fine-tuning still exists and trains **every** parameter
+(`configure_full_finetuning` raises unless `trainable == total`), but it does not
+fit this card: `--dry-run --tuning full` on the DEFAULT config (MiniCPM5-2B,
+2,516,756,480 params, seq 8192, micro-batch 1, grad-ckpt, vocab 130560, shape
+from the `minicpm5` profile fallback) prints **TOTAL 43.62 GB**
+(weights 10.07 + gradients 10.07 + optimizer 20.13 + activations 2.82 + chunked
+logits 0.53) and `verdict: does_not_fit`. That is estimator arithmetic, not a
+measured peak.
+
+### Multimodal towers policy (Qwen3.5 variants only)
+
+If a multimodal variant exposing `visual`, `vision_tower`, `audio_tower` is
+loaded: `everything` (default) trains all parameters; `lm_only` explicitly freezes
+the towers and trains only the LM. The policy is printed at startup and reflected
+in the trainable count. Silent partial training is forbidden.
 
 Exit codes: `0` ok · `1` config/training error · `2` dataset missing · `3`
 environment cannot run the request (no torch/CUDA, model unloadable) · `130`
@@ -169,251 +163,384 @@ interrupted after saving `interrupt-<step>`.
 
 ---
 
-## 3. Hyper-parameters (starting point, **not tuned**)
+## 3. Sequence length: 8192, and why not 12288
 
-No hyper-parameter search has been run — no training run has happened at all (the
-weights are absent; the CUDA toolchain is not the blocker, see the table above).
-These are conservative literature defaults for 4B SFT.
+Measured with the real MiniCPM tokenizer over the real SFT records:
 
-| Setting | Full | LoRA | Rationale |
+| full-sequence tokens | train | val |
+|---|---|---|
+| p50 | 6198 | — |
+| p90 | 8435 | — |
+| p95 | 9089 | — |
+| p99 | 10075 | 9309 |
+| max | 11037 | 9623 |
+
+The **target alone is never the constraint** (max 165 tokens including the
+terminator).
+
+What each budget actually costs, at the 4368 train / 482 val decision points:
+
+| `max_seq_length` | train | val | measured memory (train step, chunked CE) |
 |---|---|---|---|
-| `learning_rate` | `5e-6` | `2e-4` | Full FT of a 4B model needs a small LR; LoRA tolerates ~40× more because only adapters move. |
-| `per_device_train_batch_size` | 1 | 1 | Memory-bound at seq 8192: with the measured LoRA adapter count (32,464,896 params) microbatch 2 estimates 14.17 GB = 91.7 % of the 15.45 GB sample free VRAM on this machine's card (16303 MiB = 17.09 GB decimal / 15.92 GiB; that 15.45 GB is one observed sample, not a constant — free varies 3.03–15.68 GB, see §4.1); microbatch 1 keeps **11.49 GB, 3.96 GB below** that sample. Effective batch is kept at 8 by `gradient_accumulation_steps` (8 full / 8 LoRA). |
-| `gradient_accumulation_steps` | 8 | 8 | Effective batch 8 sequences in both cases. |
-| `num_train_epochs` | 2 | 3 | Short action-format task; more epochs risk memorising the few hundred trajectories. |
-| `max_seq_length` | 8192 | 8192 | On the **current** build (4850 records) 4096 truncates **72.6 % (3520/4850)** and leaves **846 of 3242** kept `tool_call` prompts (26.1 %) without the parameter-schema block of the tool they were asked to call. At 8192 that is **47/4850 (0.97 %)** truncated overall, **47/4368 (1.08 %) train / 0/482 val**, and **0/3305** schema-block loss since the collator pins `# Công cụ khả dụng` to the preserved tail (2026-11-08) — the pre-pinning figure was 3/3324 on the superseded 4869-record build. The block is the literal `### <tool> (kind=` string in the decoded, truncated prompt, counted over every decision point whose target is a `tool_call` in `outputs/datasets/train/{train,val}.jsonl`. The largest record needs 9016 tokens (prompt + target + eos; a target is never truncated). Estimate first (`--dry-run`). |
-| `warmup_ratio` | 0.05 | 0.03 | Standard warmup stabilises the first steps. |
-| `lr_scheduler_type` | cosine | cosine | `linear`/`constant` also supported. |
-| `weight_decay` | 0.01 | 0.01 | Applied to matrices only (biases/norms excluded). |
-| `precision` | bfloat16 | bfloat16 | bf16 avoids fp16 loss-scaling failures; CPU runs silently use fp32. This is the **compute** dtype (autocast); full fine-tuning keeps fp32 master weights — see §4 — because a bf16 master quantises a 5e-6 step away (measured: 7.4 % of elements moved in bf16 vs 100 % in fp32 over 20 steps). |
-| `gradient_checkpointing` | true | true | ~5× smaller activation term, ~20% slower. |
-| `gradient_clip_norm` | 1.0 | 1.0 | Guards occasional spikes in tool-call JSON. |
-| `save_strategy` / `eval_strategy` | epoch | epoch | Few epochs; more granular checkpoints add little. |
-| `save_total_limit` | 2 | 2 | Keeps disk bounded; older step dirs are pruned. |
-| LoRA `r` / `alpha` / `dropout` | — | 16 / 32 / 0.05 | r=16 with alpha=2r is the conventional starting point. |
-| LoRA `target_modules` | — | auto (attention + MLP) | Discovery intersects known projection names with the model's real module names. |
+| 5632 | 3760 kept, 2101 truncated (48.1 %), 608 dropped (13.92 %) | 415 kept, 232 truncated, 67 dropped | 11.50 GB allocated / 13.76 GB reserved with chunking on (14.98 / 15.17 GB with it off) |
+| **8192** | **4298 kept, 488 truncated (11.17 %), 70 dropped `target_value_truncated` (1.60 %)** | **477 kept, 41 truncated (8.51 %), 5 dropped (1.04 %)** | **14.37 GB allocated / 15.17 GB reserved peak for the train+eval+save cycle; 1.40 GB headroom on 16.57 GB** (train-only step: same 14.37 / 15.17 GB) |
+| 12288 | 0 truncated, 0 dropped | 0 truncated, 0 dropped | **measured OOM** on this 16.57 GB card |
+
+**0 kept prompts lose the `### <tool> (kind=...)` schema block or the
+`# Công cụ khả dụng` catalog** at 8192. The 70 train / 5 val drops are
+`target_value_truncated`: a deeper head cut removed the history value a
+`tool_call` target copies, so the record would supervise an identifier the model
+was never shown. **That is a deliberate choice at 8192, not an oversight** — the
+alternative is picking a budget that OOMs.
+
+Two different outcomes are never conflated in `manifest.json`:
+
+* **truncated** — `kept=True`, prompt middle cut, request prefix and the tool
+  catalog pinned;
+* **dropped** — `kept=False`, counted by exact reason (`target_too_long`,
+  `target_value_truncated`). A target is never truncated.
+
+Qwen-era figures, which do **not** apply to MiniCPM: with the Qwen3.5-4B
+tokenizer, 8192 gave 47 truncated and 0 schema loss; 4096 gave 3520 truncated
+with 846/3305 schema-block loss.
 
 ---
 
-## 4. Memory plan for 4B full fine-tuning
+## 4. Memory reality on a 16 GB card
 
-Formula (decimal GB, `1e9` bytes) from `training/memory_preflight.py`:
+Measured on the local RTX 5070 Ti (16.57 GB, `sm_120`, bf16 supported,
+`torch 2.15.0+cu132`, `transformers 5.22.2`), MiniCPM5-2B + LoRA bf16,
+gradient checkpointing on, micro-batch 1:
 
+| Configuration | Result |
+|---|---|
+| **train-only step**, seq padded to exactly 8192, chunked CE 1024, no `PYTORCH_CUDA_ALLOC_CONF` | **OK — 14.37 GB allocated / 15.17 GB reserved peak**, loss 2.911356, 3.78 s wall |
+| **train-only step**, same batch, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | **OK — 14.37 GB allocated / 14.88 GB reserved peak**, loss 2.911356, 3.82 s wall (0.29 GB less reserved, identical allocation) |
+| **eval-only step** (`SFTTrainer.evaluate`, chunked), padded to 8192, no env var | 8.34 GB allocated / 9.48 GB reserved, 1.08 s (re-run identical) |
+| **train step + eval step + epoch-end adapter save**, same process, padded to 8192, no env var | **OK — 14.37 GB allocated / 15.17 GB reserved peak**, 5.03 s total, **1.40 GB reserved headroom** on the 16.57 GB card |
+| epoch-end adapter save (inside the cycle above) | 245 ms, 9 files |
+| seq 8192, chunking OFF | **OOM** — `ForCausalLMLoss` upcast the whole `[seq, vocab]` logits to fp32 (8192 × 130560 × 4 ≈ 3.98 GiB in one allocation) |
+| seq 12288, chunked CE | **OOM** — "Tried to allocate 502.00 MiB; 14.02 GiB allocated, 123.88 MiB free" |
+| seq 5632, chunking OFF | 14.98 GB allocated / 15.17 GB reserved |
+| seq 5632, chunking ON | 11.50 GB / 13.76 GB — chunking saved **3.48 GB allocated** |
+
+The last four rows are earlier measurements in this repo; they were **not**
+re-run in the 2026-11-14 sweep and their sequence lengths came from the
+collator on real records, not from an explicit pad.
+
+### Reproducing the four cases
+
+Every case is a fresh process, loads `models/MiniCPM5-2B` through
+`load_model_and_tokenizer` + `configure_lora`, builds its batch with
+`build_supervised_example` and then **pads it to exactly 8192 tokens**
+(`input_ids` = pad id, `attention_mask` = 0, `labels` = -100), and uses the same
+longest-fitting record of the same dataset (`outputs/datasets/train`, seed 42):
+
+```bash
+# 1. train-only, no allocator override
+/tmp/cudaenv/bin/python /tmp/measure_step.py train
+# 2. train-only, expandable segments
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True /tmp/cudaenv/bin/python /tmp/measure_step.py train_xseg
+# 3. eval-only
+/tmp/cudaenv/bin/python /tmp/measure_step.py eval
+# 4. train -> eval -> epoch-end adapter save, one process
+/tmp/cudaenv/bin/python /tmp/measure_step.py cycle
 ```
-weights          = params × 4                (fp32 master; AdamW writes the update
-                                              into the parameter tensor, so a bf16
-                                              master quantises a 5e-6 step away)
-gradients        = params × 4                (fp32, matching the master)
-optimizer state  = params × 8                (AdamW fp32 m, v + fp32 master)
-activations      = layers × seq × microbatch × hidden × k × 2   (bf16 compute)
-                   k = 2 with gradient checkpointing, else 10
-total            = weights + gradients + optimizer state + activations
-```
 
-LoRA is the same formula with `bpp = 2` (bf16 frozen base), and gradients /
-optimizer computed over the **adapter** count only, not `params`.
+All four **succeeded without** `PYTORCH_CUDA_ALLOC_CONF`; case 4 therefore needed
+no retry with it. `/tmp/measure_step.py` is a session-local harness (not in the
+repo); it is ~200 lines around the four calls above, so re-deriving it is cheap if
+the numbers are ever re-measured. The train step's loss is 2.911356 in cases 1, 2
+and 4. The eval
+step reports `val_loss` 0.760582 standalone and 0.55708 inside case 4 — the same
+batch, but case 4 evaluates **after** the adapter has taken one optimizer step.
+The earlier 0.059119 / 14.44 GB figures came from a run whose batch length was
+whatever the collator produced, not an explicit pad; they are superseded and
+deleted rather than kept as a second variant.
 
-With `params = 4.205751e9`, `layers = 32` (released `text_config`), `hidden = 2560`,
-`seq = 8192`, microbatch 1, gradient checkpointing on (`k = 2`):
+### `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: OPTIONAL
 
-`trainable_source` decides which LoRA line you are reading. The first preflight
-runs before any weights exist (`scripts/train.py:343`) and can only report the
-0.5 % placeholder; the second (`:430`, after the adapters are attached) reports
-`trainable_source: measured`. The table below is the **measured** path:
-32,464,896 trainable parameters (12 suffixes over 248 modules, 0.766 % of the
-4,205,751,296-parameter base) — not the old 0.5 % placeholder, whose 21,028,756
-must never be quoted as a measurement.
+Verdict for the shipped default: **OPTIONAL — not recommended, not required.**
+Measured delta on this card at seq 8192, train-only step:
 
-| Term | Full (grad ckpt) | LoRA (grad ckpt) |
+| | peak allocated | peak reserved |
 |---|---|---|
-| weights | 16.82 GB | 8.48 GB (bf16 base, frozen) |
-| gradients | 16.82 GB | 0.06 GB (adapter params, measured) |
-| optimizer state | 33.65 GB | 0.26 GB |
-| activations | 2.68 GB | 2.68 GB |
-| **total** | **69.98 GB** | **11.49 GB** |
-| checkpoint size | 33.65 GB | 8.54 GB |
-| verdict at the 15.45 GB free sample (see §4.1 — free varies 3.03–15.68 GB) | `does_not_fit` (4.09×) | **74.3 %** of that sample — `fits` **iff** free ≥ 12 GB at launch, 3.96 GB headroom at that sample |
+| unset | 14.37 GB | **15.17 GB** |
+| `expandable_segments:True` | 14.37 GB | **14.88 GB** |
 
-Gradient checkpointing **is** modelled: `memory_preflight` reads
-`training.gradient_checkpointing` and uses `k = 2` instead of `10`, so leaving the
-flag on cuts the activation term ~5x (at 8192, microbatch 1: 13.42 GB → 2.68 GB, so
-LoRA totals 22.22 GB without checkpointing vs 11.49 GB with it). It does not touch
-weights, gradients or optimizer state — those dominate, which is why full FT is unaffected.
+It saves 0.29 GB of *reserved* (fragmentation) memory and **nothing** of
+allocated memory, and the worst case (case 4: train + eval + save) already fits
+without it at 15.17 GB reserved against 16.57 GB — 1.40 GB headroom. Do **not**
+put it in the documented training command; add it only if a run on a busier card
+OOMs while `nvidia-smi` still shows free memory (fragmentation, not demand).
 
-Same estimator at `seq = 4096` for reference: full 69.15 GB, LoRA 10.14 GB
-(microbatch 1). Sequence length is therefore *not* the binding constraint for
-either mode; the fixed parameter/optimizer cost is.
+The preflight estimator (`python3 scripts/train.py --dry-run`) reports
+**8.54 GB** for the shipped LoRA 8192 configuration (weights 5.03 + gradients
+0.03 + optimizer 0.10 + activations 2.82 + chunked logits 0.53, vocab 130560,
+`fits`), against a measured 14.37 GB allocated / 15.17 GB reserved — the formula
+misses the frozen base's activation/transient cost, so it is optimistic by
+~5.8 GB here. It models the CHUNKED logits term (`chunk = min(1024, seq)`,
+0.53 GB); the unchunked whole-vocabulary upcast would be 4.28 GB. At 12288 it
+prints **9.95 GB** for a configuration that in fact OOMs on this card.
+**Treat the estimator as a plan, the measured peak as the answer.**
 
-### 4.1 Free VRAM here is a moving quantity, not a constant
-
-The requirement is fixed: **11.49 GB** for LoRA, **69.98 GB** for full FT. What
-moves is how much is free. Free VRAM on this host varies with a foreign tenant
-that shares the card, so it is not a property of the machine but of the moment:
-observed samples span **3.03 – 15.68 GB** within one day on the same card and
-driver, and two of those samples were **78 seconds apart** (7.72 → 3.03 GB,
-same foreign pid growing 7582 → 12062 MiB). The four-row timestamped table is in
-`docs/FINAL_TRAINING_EXPERIMENT_READINESS.md` §6.1b. Therefore the go/no-go
-check is not a documented number but a measurement **immediately before launch**:
+Before a real launch, measure free VRAM immediately — free VRAM on a shared card
+is not a constant:
 
 ```bash
 nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv,noheader
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader
 ```
 
-Rule: **free ≥ 12 GB** (the 11.49 GB requirement plus margin). Below that, wait
-for the tenant to exit and measure again — do not panic-reconfigure the run.
+Rule: free VRAM must exceed the **measured 15.17 GB reserved peak of the
+train+eval+save cycle** (plus whatever margin you want); if free is below that,
+wait and measure again rather than panic-reconfiguring the run.
 
-**Conclusion (estimator arithmetic, not a measured peak allocation):** 4B full
-fine-tuning (69.98 GB) needs an **≥80 GB class GPU** for headroom, and the current
-`tuning_mode` default is still `full` — so on this card a default run is a
-`does_not_fit` plan, not a run. 2× 40 GB with DeepSpeed ZeRO-3 optimizer sharding
-also works. LoRA at **11.49 GB** is estimated to fit this machine's card
-(17.09 GB total; 15.45 GB free at the measured sample — see §4.1, free varies
-3.03–15.68 GB, so the go/no-go is `fits` **iff** free ≥ 12 GB at launch) at
-**74.3 %** of that sample's free VRAM, with **3.96 GB**
-headroom; that is an assumption about allocator/devices overhead, not a
-measurement — confirm with a short real run and `torch.cuda.max_memory_allocated()`.
+### Why `loss_chunk_tokens` exists — and why the shipped default is executable
 
-bf16 speed in full fine-tuning comes from autocast (`SFTTrainer._autocast`),
-not from a bf16 parameter dtype: at `learning_rate: 5e-6` a bf16 parameter
-moves for only ~7 % of its elements per 20 steps (measured), i.e. the run is
-effectively frozen.
+`training.loss_chunk_tokens` (dataclass default **1024** in
+`lifemate/config.py`, written explicitly in `configs/base.yaml`; the LoRA configs
+inherit the default) makes the trainer compute cross-entropy in chunks along the
+sequence dimension, capping the fp32 logits temporary at `chunk × vocab × 4`
+bytes — 510 MiB at 1024 × 130560 instead of the 3.98 GiB whole-tensor upcast. It
+is consumed by **both** the train step (`trainer.py::chunked_causal_lm_loss`) and
+the validation step (`SFTTrainer.evaluate`).
 
-Always confirm on the target machine:
+* mathematically equivalent: per-chunk **sums** are accumulated and divided once
+  by the supervised-token count — dividing per chunk and averaging would
+  over-weight a short trailing chunk;
+* measured deviation from the single-shot loss: max 8.6e-8 with every token
+  supervised, 1.7e-7 with mixed `-100` masking (tolerance 1e-5);
+* **`loss_chunk_tokens: 0` restores the old single-shot path** — the model
+  computes its own loss, and at seq 8192 that path OOMs on this card.
 
-```bash
-python3 scripts/train.py --dry-run --param-count 4000000000 --tuning full
-```
+**The eval path had to be chunked too.** `SFTTrainer.evaluate` used to call the
+model WITH `labels`, which re-ran `ForCausalLMLoss`'s whole-vocabulary fp32 upcast
+and then made a second full `[seq, vocab]` copy via
+`logits[..., :-1, :].contiguous()`. Because `eval_strategy: epoch` is the shipped
+default, that would have OOM'd at the end of epoch 1 — after paying for the whole
+epoch. It now:
 
-The report prints the model's real free/total VRAM when CUDA is visible, and
-`verdict: unknown` (never a fake measurement) when it is not.
+* forwards **without** `labels`, so the model's own loss is never invoked;
+* runs `F.cross_entropy(..., reduction="sum", ignore_index=-100)` per sequence
+  chunk and divides by the supervised-token count once;
+* does `argmax` on the slice only, never on `[seq, vocab]`.
+
+Shift semantics are unchanged (`logits[..., :-1, :]` against `labels[..., 1:]`).
+Equivalence was measured, not assumed: identical `val_loss`,
+`val_token_accuracy` and `val_target_tokens` for chunk widths 0 / 1024 / 5 / 1
+(relative difference 0.0 on a real tiny Llama, 0.0 on a synthetic oracle). A
+model returning no logits falls back to its own loss, exactly as before.
+
+Measured on this card at seq 8192: the **eval step alone** costs 8.34 GB allocated
+/ 9.48 GB reserved in ~1.0 s; **one train step plus one eval step plus one
+epoch-end adapter save in the same process** peaks at 14.37 GB allocated /
+15.17 GB reserved, leaving **1.40 GB reserved headroom** on 16.57 GB; the save
+inside that cycle takes 245 ms. That combination — not the train step on its
+own — is why the shipped `eval_strategy: epoch` default is executable on a 16 GB
+card.
+
+**What was NOT run:** a whole epoch. The measured worst case is one train step +
+one eval step + one save in the same process.
+
+### QLoRA caveat
+
+`--tuning qlora` (or `training.quantization: nf4`) is implemented for real:
+`BitsAndBytesConfig` NF4 with double quantisation, `prepare_model_for_kbit_training`,
+no `.to()` on a quantized model, and the loader refuses 4-bit on a non-CUDA
+device with an actionable error. **GPU execution was NOT tested**: `bitsandbytes`
+is not installed in the torch environment used here, so no QLoRA number in this
+repo is a measurement. A QLoRA run is a LoRA run with a 4-bit frozen base — the
+adapter artifact is the same kind.
 
 ---
 
-## 5. Cloud / GPU run
+## 5. Hyper-parameters (starting point, **not tuned**)
 
-Local dry run first (this machine), then the real job on a GPU box:
+No hyper-parameter search has been run and no epoch has completed. These are
+conservative defaults.
+
+| Setting | Full | LoRA (shipped default) | Rationale |
+|---|---|---|---|
+| `learning_rate` | `5e-6` | `2e-4` | Full FT of a 2.5B model needs a small LR; LoRA tolerates ~40× more because only adapters move. |
+| `per_device_train_batch_size` | 1 | 1 | Memory-bound at seq 8192: the measured train+eval+save cycle peaks at 14.37 GB allocated / 15.17 GB reserved on a 16.57 GB card (1.40 GB reserved headroom). |
+| `gradient_accumulation_steps` | 8 | 8 | Effective batch 8 sequences. |
+| `num_train_epochs` | 2 | 3 | Short action-format task. |
+| `max_seq_length` | 8192 | 8192 | See §3. |
+| `warmup_ratio` | 0.05 | 0.03 | Standard warmup. |
+| `lr_scheduler_type` | cosine | cosine | `linear`/`constant` also supported. |
+| `weight_decay` | 0.01 | 0.01 | Matrices only (biases/norms excluded). |
+| `precision` | bfloat16 | bfloat16 | bf16 avoids fp16 loss-scaling failures; CPU runs use fp32. Full FT keeps fp32 master weights — AdamW's update lands in the parameter tensor, so a bf16 master quantises a 5e-6 step away. |
+| `gradient_checkpointing` | true | true | ~5× smaller activation term, ~20% slower. Modeled by the estimator (`k = 2` vs `10`). |
+| `gradient_clip_norm` | 1.0 | 1.0 | Guards occasional spikes in tool-call JSON. |
+| `save_strategy` / `eval_strategy` | epoch | epoch | Few epochs. Executable at 8192 because `evaluate` is chunked like the train step: the train+eval+save cycle peaks at 14.37 GB allocated / 15.17 GB reserved (§4). |
+| `save_total_limit` | 2 | 2 | Older `step-*` dirs pruned after each save. |
+| `loss_chunk_tokens` | 1024 | 1024 | See §4. |
+| LoRA `r` / `alpha` / `dropout` | — | 16 / 32 / 0.05 | Conventional starting point. |
+| LoRA `target_modules` | — | `null` → profile list | MiniCPM5-2B: `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj` — **measured** on the loaded model: 588 adapter tensors, **25,116,672 trainable params = 0.9881 %** of 2,541,873,152 total-with-adapter. |
+
+`lora.target_modules: null` on MiniCPM resolves to the profile's 7 projections;
+on Qwen it stays architecture-aware discovery (12 suffixes / 248 Linear modules
+/ 32,464,896 trainable — **Qwen numbers, measured on Qwen, not on MiniCPM**).
+If a model exposes projections its profile does not list, training fails and says
+which knob to turn instead of adapting a silent subset.
+
+---
+
+## 6. Checkpoints, resume, interruption
+
+Checkpoints land in `outputs/checkpoints/<run_name>/step-<n>/` (`run_name`
+defaults to the tuning mode, so a default run writes `.../lora/step-<n>`), and
+contain the model or adapter, the tokenizer, `lifemate_meta.json`,
+`training_state.json` and `optimizer_state.pt`. `training_state.json` is written
+last, so a checkpoint without state is visibly incomplete.
+
+### Identity validation
+
+* `lifemate_meta.json` records `model_name` and `model_profile`; the adapter
+  attach path (`loader._attach_lora_adapter`) and `export_model.py --merge-lora`
+  both call `checkpoint.assert_adapter_base_matches` **before any weight is
+  touched**. A MiniCPM adapter on a Qwen base (or the reverse) is a hard
+  `LifeMateError`; comparison is by profile family, so `openbmb/MiniCPM5-2B` and
+  the local `models/MiniCPM5-2B` count as the same base. When neither record
+  exists the check is a no-op and says so (`{"recorded": False}`).
+* The loader fails when the weight files do not provide every parameter
+  (`missing_keys`, tied weights excluded): a truncated download would otherwise
+  silently fine-tune a partly random model.
+
+### Resume semantics — exactly what exists
 
 ```bash
-# 1. this workstation: verify the plan and the dataset
-python3 scripts/prepare_dataset.py --data-root ./data --split train --output outputs/datasets
-python3 scripts/train.py --dry-run --param-count 4000000000 --tuning full
-
-# 2. GPU box: install the training extras once
-pip install -e '.[train]'
-
-# 3. GPU box: full fine-tuning, logged to W&B
-python3 scripts/train.py --config configs/training_full.yaml
-
-# optional: enable W&B in configs/wandb.yaml (enabled: true, project, entity, mode)
+# resume from ONE explicit step directory
+python3 scripts/train.py --resume outputs/checkpoints/lora/step-120
+# alias
+python3 scripts/train.py --resume-from outputs/checkpoints/lora/step-120
 ```
 
-Checkpoints land in `outputs/checkpoints/<run_name>/step-<n>/` and contain the
-model, the tokenizer, `training_state.json` and `optimizer_state.pt`. Upload the
-directory that suits your storage; nothing here uploads automatically.
+`--resume` takes a **`step-<n>` directory you name**. There is **no auto-latest**:
+`CheckpointManager.latest()` exists but no CLI path calls it. Resuming requires
+`training_state.json` in that directory and refuses when:
 
-### Metrics logging
+* the recorded step is not positive;
+* the checkpoint is LoRA and the run is full, or the reverse;
+* the dataset manifest hash differs (the split changed);
+* `config_hash` differs — it hashes `training.*` minus bookkeeping
+  (`resume_from_checkpoint`, `output_dir`, `logging_steps`, `save_strategy`,
+  `eval_strategy`, `save_total_limit`, `report_to`, `dataloader_num_workers`,
+  `method`), `model.*` minus `device`/`tokenizer_name`, and `lora.*` only in LoRA
+  mode. So **may change**: dataset mount, device, W&B names, ASR/inference paths,
+  checkpoint cadence. **May not change**: lr, weight decay, epochs, batch,
+  grad accumulation, warmup, scheduler, gradient checkpointing, clip norm, seed,
+  `max_seq_length`, `validation_ratio`, optimizer, precision, tuning mode, model
+  identity/precision, `loss_chunk_tokens` (it is not in the ignore list, so it
+  moves the digest), and (in LoRA mode) LoRA hyper-parameters.
 
-`training.report_to: ["wandb"]` (or `wandb.enabled: true`) routes metrics through
-`lifemate.tracking.WandbTracker`, which **redacts before sending**: keys matching
-`api_key|token|secret|password|credential` become `[REDACTED]`, and PII keys
-(`user_profile`, `audio_text`, `messages`, `history`, …) are replaced with
-`[DROPPED_PII]`. `scripts/train.py` never calls `wandb.init` itself, so there is
-no unredacted path.
-
-When W&B is disabled, uninstalled, or offline, metrics fall back to
-`<output_dir>/<run_name>/metrics.jsonl` (same redaction, one warning) — they are
-never silently dropped. `--smoke` uses a null tracker.
-
-Each step directory also gets `training_state.json` (step, epoch, seeds, RNG
-state, tuning mode, dataset manifest hash), `optimizer_state.pt`, and the saved
-model/adapter.
+Optimizer moments and RNG state are restored, so a resumed run continues rather
+than restarting from zero moments.
 
 ### Interruption and crash safety
 
-* `SIGINT`/`SIGTERM` set a stop flag; the current optimizer step finishes, an
-  `interrupt-<step>` checkpoint is written, the process exits `130`.
+* `SIGINT`/`SIGTERM` set a cooperative stop flag; the current optimizer step
+  finishes, `interrupt-<step>` is written, the process exits `130`, and the
+  printed hint is `python3 scripts/train.py --config <cfg> --resume <dir>`.
 * An unhandled exception writes `crash-<step>` metadata (best effort) and re-raises.
-* A step directory is never reused: resuming or re-running against a populated
-  `<output_dir>/<run_name>/step-<n>` raises instead of overwriting.
+* A populated `<output_dir>/<run_name>/step-<n>` is never overwritten.
 
 ---
 
-## 6. Fail-fast conditions
+## 7. Metrics logging (optional)
+
+`training.report_to: ["wandb"]` — or `wandb.enabled: true`, see
+`configs/training_lora_wandb.yaml` — routes metrics through
+`lifemate.tracking.WandbTracker`, which **redacts before sending**:
+`api_key|token|secret|password|credential` keys become `[REDACTED]`, PII keys
+(`user_profile`, `audio_text`, `messages`, `history`, …) become `[DROPPED_PII]`.
+`scripts/train.py` never calls `wandb.init` itself.
+
+W&B is **not required**: with it disabled, uninstalled or offline, metrics fall
+back to `<output_dir>/<run_name>/metrics.jsonl` (same redaction, one warning).
+`--smoke` uses a null tracker.
+
+---
+
+## 8. Fail-fast conditions
 
 | Condition | Behaviour |
 |---|---|
-| `--tuning` invalid | `train.py` exits 2 via argparse (argparse's usage-error code) |
+| `--tuning` invalid | argparse usage error, exit 2 |
 | Dataset dir has no `train.jsonl` | exit 2 + the exact `DatasetNotFound` text + the prepare command |
-| Zero usable examples after masking | `LifeMateError` naming the drop reasons (e.g. `target_too_long`) |
-| `target` too long for `max_seq_length` | example dropped, counted in `dropped["target_too_long"]`; the target is **never** truncated |
-| Model returns no `loss` | `LifeMateError` (labels were probably not passed) |
+| Zero usable examples after masking | `LifeMateError` naming the drop reasons |
+| `target` too long for `max_seq_length` | example dropped as `target_too_long`; the target is **never** truncated |
+| Model returns no `loss` | `LifeMateError` (labels were probably not passed) — unless `loss_chunk_tokens > 0`, where the loss is computed from logits |
 | Full mode, any parameter frozen | `LifeMateError` (`trainable != total`) |
 | LoRA target set empty | `LifeMateError` listing discovered module names |
 | LoRA attached but a non-`lora_` param trainable | `LifeMateError` |
-| Resume: LoRA↔full mismatch, manifest hash change, missing `training_state.json` | `LifeMateError` |
-| No torch / no CUDA for a real run | exit 3 with the preflight and a pointer to `--dry-run` / `--smoke` |
+| Profile lists fewer projections than the model has | `LifeMateError` naming the extras and the knob |
+| `quantization: nf4` on a non-CUDA device, or `bitsandbytes` missing | `LifeMateError` with the install hint |
+| Resume: LoRA↔full mismatch, manifest hash change, `config_hash` change, missing `training_state.json` | `LifeMateError` |
+| Adapter attached or merged onto another family's base | `LifeMateError` before any weight is touched |
+| No torch / no CUDA for a real run | exit 3 with a pointer to `--dry-run` / `--smoke` |
 
 ---
 
-## 7. Checking the training signal is honest
-
-Two properties are enforced by tests rather than promised by documentation:
+## 9. Checking the training signal is honest
 
 1. **Prompt tokens never reach the loss.** `labels` are `-100` over the prompt
-   and the target verbatim afterwards (`assert_loss_masking`). With torch present,
-   `test_gradient_independent_of_prompt_tokens` trains on the same target with two
-   different prompts and asserts the gradients are *identical* — a stronger check
-   than comparing tensors.
+   and the target verbatim afterwards (`assert_loss_masking`), and
+   `test_gradient_independent_of_prompt_tokens` asserts identical gradients for
+   two different prompts with the same target.
 2. **No causality leak.** `tests/test_trajectory.py` asserts by marker string that
-   prompt *k* contains observations `< k` only, that no future result is borrowed,
-   and that `final_state` never appears.
+   prompt *k* contains observations `< k` only and that `final_state` never
+   appears.
+3. **Prompt/target bytes equal what inference serves.** The supervised region is
+   exactly the target plus the template's terminator: measured last supervised id
+   **130073** (`<|im_end|>`), id 1 (`</s>`) never in the supervised region, `<s>`
+   exactly once, and target-standalone ids identical to target-in-context ids.
 
-Validation reports `val_loss` (teacher-forced token cross-entropy) and
-`val_token_accuracy` (share of correct target tokens). Neither is the competition
-metric: use `scripts/evaluate.py` for action-level scoring.
+Validation reports `val_loss` and `val_token_accuracy`; neither is the competition
+metric — use `scripts/evaluate.py`.
 
 ### CPU tiny-model validation
 
-To verify the real transformers training loop without downloading Qwen weights or requiring a GPU, build a local randomly-initialized model and run CPU validation:
-
 ```bash
-# 0. Build the tiny model and tokenizer in /tmp/tiny_lifemate (run once)
+# 0. Build a tiny random model + tokenizer in /tmp/tiny_lifemate (run once)
 python3 -c "from pathlib import Path; from tests.test_tiny_e2e import make_tiny_model_and_tokenizer; make_tiny_model_and_tokenizer(Path('/tmp/tiny_lifemate'))"
 
-# 1. Prepare SFT dataset with tiny tokenizer
-python scripts/prepare_dataset.py --data-root tests/fixtures/synthetic_lifemate --split train --output /tmp/sft_tiny --tokenizer /tmp/tiny_lifemate
+# 1. Prepare SFT records with the tiny tokenizer
+python3 scripts/prepare_dataset.py --data-root tests/fixtures/synthetic_lifemate --split train --output /tmp/sft_tiny --tokenizer /tmp/tiny_lifemate
 
 # 2. Full fine-tune 4 steps on CPU
-python scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_full --max-steps 4 --seq-len 512 --config configs/training_full.yaml --device cpu
+python3 scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_full --max-steps 4 --seq-len 512 --config configs/training_full.yaml --device cpu
 
-# 3. Resume from step 4 to step 6 (monotonic step counter)
-python scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_full --resume /tmp/ckpt_full/full/step-4 --max-steps 6 --seq-len 512 --config configs/training_full.yaml --device cpu
+# 3. Resume from step 4 to step 6
+python3 scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_full --resume /tmp/ckpt_full/full/step-4 --max-steps 6 --seq-len 512 --config configs/training_full.yaml --device cpu
 
-# 4. LoRA fine-tune 4 steps on CPU (proves adapter gradient flow)
-python scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_lora --max-steps 4 --tuning lora --device cpu
+# 4. LoRA 4 steps on CPU (proves adapter gradient flow)
+python3 scripts/train.py --model /tmp/tiny_lifemate --dataset-dir /tmp/sft_tiny/train --output-dir /tmp/ckpt_lora --max-steps 4 --tuning lora --device cpu
 
-# 5. Export and merge LoRA adapter into base weights
-python scripts/export_model.py --ckpt /tmp/ckpt_lora --merge-lora --output /tmp/merged
+# 5. Export/merge the adapter
+python3 scripts/export_model.py --ckpt /tmp/ckpt_lora --merge-lora --output /tmp/merged
 ```
 
-*Coverage limit*: A tiny random model proves that data pipelines, collators, gradient backprop, optimizer steps, checkpointing, resume, and adapter merge plumbing work end to end on CPU. It does not validate model generation quality, reasoning capabilities, or convergence on real competition data.
+*Coverage limit*: a tiny random model proves data pipelines, collators, gradient
+backprop, optimizer steps, checkpointing, resume and adapter merge plumbing work
+end to end on CPU. It says nothing about generation quality or convergence.
 
 ---
 
-## 8. Files in this slice
+## 10. Files in this slice
 
 ```
-src/lifemate/data/preprocessing.py      normalisation, duplicate hashing, feature buckets
 src/lifemate/data/trajectory_builder.py causal decision points, alignment, leak guard
 src/lifemate/data/split_builder.py      deterministic stratified split + leakage guard
-src/lifemate/training/collator.py       prompt masking, truncation/drop policy, padding
+src/lifemate/models/profiles.py         per-family prompt/terminator/LoRA/decode facts
+src/lifemate/training/collator.py       masking, truncation/drop policy, padding
 src/lifemate/training/full_finetuning.py
-src/lifemate/training/lora_finetuning.py
+src/lifemate/training/lora_finetuning.py (configure_lora / configure_qlora)
 src/lifemate/training/memory_preflight.py
-src/lifemate/training/trainer.py        own SFT loop, checkpoints, resume, interrupts
+src/lifemate/training/trainer.py        own SFT loop, chunked CE, checkpoints, resume
 src/lifemate/training/callbacks.py      StopController, trackers
-configs/{base,training_full,training_lora,inference,evaluation,wandb}.yaml
+configs/{base,training_full,training_lora,training_lora_qwen,training_lora_wandb}.yaml
 scripts/prepare_dataset.py  scripts/train.py
-tests/test_trajectory.py  tests/test_training.py
+tests/test_trajectory.py  tests/test_training.py  tests/test_model_profiles.py
 ```

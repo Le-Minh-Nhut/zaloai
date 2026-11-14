@@ -33,13 +33,16 @@ __all__ = [
     "load_config",
     "dump_config",
     "TUNING_MODES",
+    "QUANTIZATIONS",
     "ASR_BACKENDS",
     "ASR_QUANTIZATIONS",
     "ASR_RUNTIMES",
     "ASR_DECODINGS",
 ]
 
-TUNING_MODES = ("full", "lora")
+TUNING_MODES = ("full", "lora", "qlora")
+#: Quantization applied to the frozen base model (``nf4`` = QLoRA only).
+QUANTIZATIONS = ("none", "nf4")
 ASR_BACKENDS = ("gipformer", "whisper", "oracle", "none")
 ASR_QUANTIZATIONS = ("int8", "fp32")
 ASR_RUNTIMES = ("onnx", "pytorch")
@@ -59,7 +62,9 @@ class DataConfig:
 class ModelConfig:
     """Base model / tokenizer identity and load options."""
 
-    name: str = "Qwen/Qwen3.5-4B"
+    #: DEFAULT: MiniCPM5-2B. Qwen/Qwen3.5-4B stays a supported alternative
+    #: (``--model Qwen/Qwen3.5-4B`` or configs/training_lora_qwen.yaml).
+    name: str = "openbmb/MiniCPM5-2B"
     torch_dtype: str = "bfloat16"
     attn_implementation: str | None = None
     trust_remote_code: bool = False
@@ -83,7 +88,9 @@ class TrainingConfig:
     """SFT training loop settings."""
 
     method: str = "sft"
-    tuning_mode: str = "full"
+    tuning_mode: str = "lora"
+    #: "none" | "nf4": 4-bit frozen base (QLoRA). Requires bitsandbytes on CUDA.
+    quantization: str = "none"
     output_dir: str = "outputs/checkpoints"
     precision: str = "bfloat16"
     learning_rate: float = 5e-6
@@ -102,6 +109,11 @@ class TrainingConfig:
     max_seq_length: int = 8192
     validation_ratio: float = 0.1
     optimizer: str = "adamw_torch"
+    #: Cross-entropy chunk width over the sequence dimension (0 = the model's own
+    #: single-shot loss). transformers upcasts the whole [seq, vocab] logits
+    #: tensor to fp32, which is 3.98 GiB at seq 8192 x vocab 130560 (measured OOM
+    #: on a 16 GB card); chunking caps that temporary at chunk*vocab*4 bytes.
+    loss_chunk_tokens: int = 1024
     resume_from_checkpoint: str | None = None
     dataloader_num_workers: int = 0
     save_total_limit: int = 2
@@ -217,6 +229,20 @@ class AppConfig:
         if self.training.tuning_mode not in TUNING_MODES:
             raise ConfigError(
                 f"training.tuning_mode must be one of {TUNING_MODES}, got {self.training.tuning_mode!r}"
+            )
+        if self.training.quantization not in QUANTIZATIONS:
+            raise ConfigError(
+                f"training.quantization must be one of {QUANTIZATIONS}, got {self.training.quantization!r}"
+            )
+        if self.training.tuning_mode == "qlora" and self.training.quantization == "none":
+            raise ConfigError(
+                "tuning_mode='qlora' requires training.quantization='nf4'; "
+                "a qlora run that silently loads the base in 16-bit is not QLoRA"
+            )
+        if self.training.tuning_mode != "qlora" and self.training.quantization != "none":
+            raise ConfigError(
+                f"training.quantization={self.training.quantization!r} requires "
+                "tuning_mode='qlora' (4-bit weights cannot be fully fine-tuned)"
             )
         if self.training.validation_ratio < 0 or self.training.validation_ratio >= 1:
             raise ConfigError("training.validation_ratio must be in [0, 1)")

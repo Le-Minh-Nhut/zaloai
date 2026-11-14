@@ -11,10 +11,68 @@ with `tool_calls` and `state_hash` taken verbatim from the official ToolEnv.
 
 > Status: the real dataset **is present** (`./data`: `train` 1545 samples,
 > `public_test` 634) and the per-split `zaic_tools` SDK imports via
-> `lifemate.env.official.check_official_sdk`; model weights, a CUDA torch build
-> and cloud credentials are **absent**. Data-side code has been exercised on the
-> real splits, model-side code only on synthetic fixtures — real-model
-> validation has not been run.
+> `lifemate.env.official.check_official_sdk`. The default model
+> `openbmb/MiniCPM5-2B` is present at `models/MiniCPM5-2B` and one LoRA
+> forward/backward step on it was measured on the local GPU; no epoch, no full
+> fine-tune and no leaderboard score exists. Cloud credentials are absent and no
+> cloud GPU is used by any path described here.
+
+## Model families: one profile object
+
+`lifemate/models/profiles.py` is the **only** place family behaviour lives. No
+other module branches on a model name; callers pass `ModelConfig.name` (or a
+tokenizer/model object) to `resolve_profile()` and read the answer.
+
+```python
+from lifemate.models.profiles import resolve_profile
+profile = resolve_profile("openbmb/MiniCPM5-2B")   # or "Qwen/Qwen3.5-4B", or a local dir
+```
+
+Matching is a substring test on a lower-cased, `_`→`-` normalised identity, so a
+hub id and a local `models/MiniCPM5-2B` directory resolve to the same profile;
+an unmatched name yields `GENERIC_PROFILE`, which reproduces the pre-profile
+behaviour exactly.
+
+### `ModelProfile` interface
+
+| Field | Consumed by | Meaning |
+|---|---|---|
+| `chat_template_kwargs` | `collator.apply_chat_template_text` (training **and** `HFGenerator.build_prompt`) | kwargs for `tokenizer.apply_chat_template`; both supported families pass `enable_thinking=False` |
+| `response_terminator` | `collator.resolve_response_terminator` | text that ends an assistant turn; the **supervised** terminator is its token id, not `tokenizer.eos_token_id` |
+| `speculative_stop_ids` | `generation.resolve_stop_ids` | extra decode stop ids unioned onto every declared eos |
+| `lora_target_modules` | `lora_finetuning.configure_lora` | projections to adapt; empty means architecture-aware discovery |
+| `default_max_new_tokens` | `HFGenerator` only when the caller passes no value | profile fallback 192 MiniCPM / 512 Qwen; the shipped scripts pass `agent.max_new_tokens` (512 for both) explicitly, so the config value is what a run uses |
+| `prompt_add_special_tokens` | `collator` prompt encode and `HFGenerator.generate` | `False` when the template already emits `<s>` (a second one would be a duplicated BOS) |
+| `preflight_params` / `_layers` / `_hidden` / `_vocab` / `_source` | `memory_preflight._model_shape`, logits pricing | verified fallbacks used only when no `config.json` is readable — the source string is quoted in the report so an estimate never poses as a measurement |
+| `name`, `family`, `aliases`, `notes` | `resolve_profile`, logs, checkpoint identity errors | matching and diagnostics |
+
+Declared but **not** read at runtime today (documented facts, asserted by
+`tests/test_model_profiles.py`): `default_seq_length` (each caller passes its own
+budget), `no_think_suffix` (the ChatML fallback uses the module-level
+`collator.NO_THINK_SUFFIX`), `architecture_fallbacks`, `supports_thinking`.
+
+### The invariant: one rendered prompt contract
+
+Training and inference share a single prompt contract, verified at token-ID level
+(`tests/test_model_profiles.py::test_chat_template_parity_at_token_id_level`):
+
+* `collator.render_prompt_text` and `HFGenerator.build_prompt` both render via
+  `apply_chat_template_text` with the same profile kwargs — identical bytes;
+* the inference prompt token ids are an **exact prefix** of the training ids;
+* the supervised region is exactly `target + terminator`, last id **130073**
+  (`<|im_end|>`), with id 1 (`</s>`) never supervised and `<s>` exactly once;
+* the template's trailing `\n` (220) after `<|im_end|>` is deliberately **not**
+  supervised;
+* a tokenizer that *has* a template and raises is a hard `LifeMateError` on both
+  sides, never a silent reformat — a ChatML fallback exists only for tokenizers
+  with no template at all.
+
+Why the profile exists at all: the pre-profile code appended
+`tokenizer.eos_token_id` = **1** (`</s>`) for MiniCPM while the template emits
+**130073**, and tokenized prompts with the default `add_special_tokens=True`,
+producing two BOS ids. Qwen was unaffected (`eos_token` *is* `<|im_end|>`), which
+is exactly why the behaviour belongs in a per-family object rather than a
+condition.
 
 ## End-to-end dataflow
 
@@ -47,6 +105,7 @@ flowchart TD
 | env | `lifemate/env/*` | `OfficialToolEnv` (zaic_tools adapter) and `MockToolEnv` |
 | agent | `lifemate/agent/*` | protocol, prompt builder, registry, executor, stop policy, loop |
 | models | `lifemate/models/*` | model/tokenizer loading, HF generator, checkpoint IO |
+| models | `lifemate/models/profiles.py` | `ModelProfile` / `resolve_profile`: the single place per-family prompt, terminator, stop-id, LoRA-target and decode facts live |
 | asr | `lifemate/asr/*` | backend protocol, gipformer (default)/whisper/oracle backends, WER/CER |
 | training | `lifemate/training/*` | SFT collator/trainer, full + LoRA, memory preflight |
 | evaluation | `lifemate/evaluation/metrics.py` | pure-stdlib decision metrics |
