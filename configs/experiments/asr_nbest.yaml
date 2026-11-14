@@ -1,0 +1,6 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# N-best ASR decoding, beam width 3.
+features:
+  asr:
+    nbest_enabled: true
+    nbest_size: 3

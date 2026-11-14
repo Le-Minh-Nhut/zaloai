@@ -13,7 +13,12 @@ from __future__ import annotations
 from typing import Any, Iterable, Sequence
 
 from lifemate.errors import ConfigError, LifeMateError
-from lifemate.models.loader import count_parameters
+from lifemate.models.loader import (
+    assert_no_quantized_trainable,
+    count_parameters,
+    is_adapter_parameter_name,
+    quantized_parameters,
+)
 
 __all__ = [
     "ATTENTION_MLP_SUFFIXES",
@@ -23,6 +28,7 @@ __all__ = [
     "discover_target_modules",
     "load_adapter",
     "merge_adapter",
+    "quantization_summary",
     "save_adapter",
 ]
 
@@ -74,24 +80,63 @@ def configure_qlora(
     ``prepare_model_for_kbit_training`` upcasts LayerNorms/outputs to fp32 and
     never casts the 4-bit weights, which is exactly why a plain
     ``model.to(dtype)`` must not be used around it.
+
+    Gradient checkpointing has exactly ONE owner: :func:`configure_lora`, which
+    enables it with ``use_reentrant=False`` and re-registers the input-grad hook.
+    The k-bit preparation is therefore called with
+    ``use_gradient_checkpointing=False``; enabling it there too would enable the
+    same feature twice with different kwargs (and its default kwargs would skip
+    the input-grad hook).
     """
     try:
         from peft import prepare_model_for_kbit_training  # noqa: PLC0415 - lazy
     except Exception as exc:  # pragma: no cover - peft absent
         raise LifeMateError(f"QLoRA requires the 'peft' package: {exc}") from exc
-    if not bool(getattr(getattr(model, "config", None), "quantization_config", None)):
+    quant = quantization_summary(model)
+    if not quant["quantized"]:
         raise LifeMateError(
             "configure_qlora received an unquantized model; load it with "
             "quantization='nf4' first (a QLoRA run on 16-bit weights is just LoRA "
             "with a misleading name)"
         )
     training = getattr(cfg, "training", cfg)
-    prepared = prepare_model_for_kbit_training(
-        model,
-        use_gradient_checkpointing=bool(getattr(training, "gradient_checkpointing", False)),
-    )
+    prepared = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     report = configure_lora(prepared, cfg, target_modules)
+    peft_model = report["model"]
+
+    trainable = [
+        (name, param)
+        for name, param in peft_model.named_parameters()
+        if bool(getattr(param, "requires_grad", False))
+    ]
+    base_trainable_params = sum(
+        int(param.numel()) for name, param in trainable if not is_adapter_parameter_name(name)
+    )
+    adapter = [(name, param) for name, param in trainable if is_adapter_parameter_name(name)]
+    adapter_trainable_params = sum(int(param.numel()) for _, param in adapter)
+    quantized = quantized_parameters(peft_model)
+
+    if base_trainable_params:
+        raise LifeMateError(
+            f"QLoRA base is not frozen: {base_trainable_params:,} non-adapter parameter(s) "
+            f"are trainable (e.g. {next(n for n, _ in trainable if not is_adapter_parameter_name(n))!r})"
+        )
+    assert_no_quantized_trainable(peft_model)
+    if not adapter or any(not param.is_floating_point() for _, param in adapter):
+        raise LifeMateError(
+            "QLoRA attached no floating-point adapter parameter: nothing would train "
+            f"({len(adapter)} adapter tensor(s) trainable)"
+        )
+    if not quant["is_4bit_nf4"]:
+        raise LifeMateError(
+            f"configure_qlora requires a 4-bit nf4 quantization_config; got {quant}"
+        )
+
     report["tuning_mode"] = "qlora"
+    report["base_trainable_params"] = 0
+    report["adapter_trainable_params"] = adapter_trainable_params
+    report["n_quantized_parameters"] = len(quantized)
+    report["quantized_dtypes"] = sorted({str(param.dtype) for _, param in quantized})
     report["quantization"] = {
         "load_in_4bit": True,
         "bnb_4bit_quant_type": "nf4",
@@ -100,6 +145,35 @@ def configure_qlora(
         "source": "active checkpoint config.quantization_config",
     }
     return report
+
+def quantization_summary(model: Any) -> dict:
+    """Read ``config.quantization_config`` (object or dict) without trusting it.
+
+    ``is_4bit_nf4`` is the only claim QLoRA is allowed to make: 4-bit loading
+    with nf4 storage. Anything else (8-bit, gptq, torchao) is refused rather
+    than silently treated as QLoRA.
+    """
+    qcfg = getattr(getattr(model, "config", None), "quantization_config", None)
+    if qcfg is None:
+        return {"quantized": False, "is_4bit_nf4": False, "load_in_4bit": None,
+                "quant_type": None, "method": None}
+
+    def _get(source: Any, key: str, default: Any = None) -> Any:
+        if isinstance(source, dict):
+            return source.get(key, default)
+        return getattr(source, key, default)
+
+    load_in_4bit = bool(_get(qcfg, "load_in_4bit", False) or _get(qcfg, "_load_in_4bit", False))
+    quant_type = _get(qcfg, "bnb_4bit_quant_type")
+    method = _get(qcfg, "quant_method")
+    method = getattr(method, "value", method)
+    return {
+        "quantized": True,
+        "is_4bit_nf4": bool(load_in_4bit and str(quant_type).lower() == "nf4"),
+        "load_in_4bit": load_in_4bit,
+        "quant_type": quant_type,
+        "method": method,
+    }
 
 def _resolve_targets(model: Any, configured: Iterable[str] | None) -> list[str]:
     if configured:

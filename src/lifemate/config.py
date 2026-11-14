@@ -105,6 +105,13 @@ class TrainingConfig:
     logging_steps: int = 10
     save_strategy: str = "epoch"
     eval_strategy: str = "epoch"
+    #: Step cadence for ``save_strategy: steps`` / ``eval_strategy: steps``.
+    #: ``0`` falls back to ``logging_steps`` (the pre-existing behaviour), so a
+    #: config that never sets them keeps working while the two cadences become
+    #: independent knobs. Cadence is bookkeeping, not maths: excluded from
+    #: ``config_fingerprint``.
+    save_steps: int = 0
+    eval_steps: int = 0
     seed: int = 42
     max_seq_length: int = 8192
     validation_ratio: float = 0.1
@@ -206,6 +213,20 @@ class CloudConfig:
     artifact_name: str = "lifemate-full"
 
 
+def _default_feature_config() -> Any:
+    """``FeatureConfig()`` when the optional features slice is importable, else ``None``.
+
+    Kept lazy so ``lifemate.config`` has no hard dependency on
+    ``lifemate.features``: a checkout without that package keeps loading every
+    config, with all experimental switches implicitly off.
+    """
+    try:  # pragma: no cover - depends on which slice the checkout carries
+        from .features.config import FeatureConfig  # noqa: PLC0415
+
+        return FeatureConfig()
+    except ImportError:  # pragma: no cover - features slice absent
+        return None
+
 @dataclass
 class AppConfig:
     """Root config object: ``data``, ``model``, ``lora``, ... sections."""
@@ -220,6 +241,11 @@ class AppConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     cloud: CloudConfig = field(default_factory=CloudConfig)
+    #: Optional experimental-feature switches (``src/lifemate/features``). Placed
+    #: LAST so positional construction of the sections above cannot shift. The
+    #: slice is optional: when the package is absent the field is ``None`` and
+    #: every feature is implicitly off.
+    features: Any = field(default_factory=_default_feature_config)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -266,16 +292,56 @@ class AppConfig:
             )
         if self.asr.backend == "gipformer" and self.asr.runtime == "pytorch":
             raise ConfigError("pytorch runtime not implemented; use onnx")
-        if self.asr.backend == "gipformer" and "1.5" in (self.asr.model_id or ""):
-            raise ConfigError(
-                "gipformer1.5 is rejected; LifeMate target is g-group-ai-lab/gipformer-68M-rnnt"
-            )
+        if self.asr.backend == "gipformer" and self.asr.model_id:
+            # Spec-aware, in place of the old "1.5 is rejected because it is a
+            # different model" substring rule. A KNOWN id is accepted here — which
+            # artifact set it needs, and whether this machine has it, is a
+            # load-time question answered by lifemate.asr.model_specs — so an
+            # optional 1.5 checkpoint can be selected without a config edit. An
+            # unknown gipformer id stays a config error listing the known ones.
+            # Stdlib-only import: validate() must not need sherpa_onnx.
+            from .asr.model_specs import KNOWN_MODEL_IDS, spec_key  # noqa: PLC0415
+
+            if spec_key(self.asr.model_id) is None:
+                raise ConfigError(
+                    f"unknown gipformer model_id {self.asr.model_id!r}; known ids: "
+                    f"{', '.join(KNOWN_MODEL_IDS)}. Add a GipformerSpec to "
+                    "src/lifemate/asr/model_specs.py to support another checkpoint "
+                    f"(the default is {KNOWN_MODEL_IDS[0]})"
+                )
         if self.agent.max_steps < 1:
             raise ConfigError("agent.max_steps must be >= 1")
+        self._validate_features()
+
+    def _validate_features(self) -> None:
+        """Apply the feature registry's own rules (dependencies, conflicts, values).
+
+        Silent no-op when the optional slice is absent; a registry error becomes a
+        :class:`ConfigError` so every entry point reports a config problem the same
+        way.
+        """
+        if self.features is None:
+            return
+        try:  # pragma: no cover - depends on which slice the checkout carries
+            from .features.registry import REGISTRY  # noqa: PLC0415
+        except ImportError:  # pragma: no cover - features slice absent
+            return
+        validate = getattr(REGISTRY, "validate_or_raise", None)
+        if not callable(validate):  # pragma: no cover - older registry
+            return
+        try:
+            validate(self.features)
+        except Exception as exc:
+            raise ConfigError(f"features: {exc}") from exc
 
     def to_dict(self) -> dict[str, Any]:
         """Plain nested ``dict`` copy of the config."""
-        return dataclasses.asdict(self)
+        d = dataclasses.asdict(self)
+        # ``dataclasses.asdict`` recurses into FeatureConfig and leaks its
+        # bookkeeping ``provenance`` mapping; FeatureConfig.to_dict drops it.
+        if hasattr(self.features, "to_dict"):
+            d["features"] = self.features.to_dict()
+        return d
 
 
 # --------------------------------------------------------------------------- #

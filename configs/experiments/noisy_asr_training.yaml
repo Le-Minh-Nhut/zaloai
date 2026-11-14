@@ -1,0 +1,6 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Training on ASR transcripts for 25% of samples instead of gold transcripts.
+features:
+  training:
+    noisy_asr_training_enabled: true
+    noisy_asr_ratio: 0.25

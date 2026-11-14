@@ -1276,6 +1276,11 @@ def test_resume_guards_mismatch() -> None:
         path = manager.save(
             5, {"state": {"step": 5, "is_lora": False, "dataset_manifest_hash": "hash_a"}}
         )
+        # This fixture is a hand-built state with no weights and no ``progress``
+        # block, i.e. a schema-1 checkpoint by construction. The guards under test
+        # (tuning mode, manifest hash, missing state) must therefore be reachable
+        # on the best-effort path; exact resume of a schema-1 checkpoint is a
+        # separate, deliberate refusal covered in tests/test_training_resume.py.
 
         def _trainer(**kwargs):
             return SFTTrainer(
@@ -1288,24 +1293,34 @@ def test_resume_guards_mismatch() -> None:
                 **kwargs,
             )
 
-        assert _trainer().resume(path) == 5
+        assert _trainer(best_effort=True).resume(path) == 5
         for kwargs, needle in (
             ({"is_lora": True}, "lora"),
             ({"dataset_manifest_hash": "hash_b"}, "manifest"),
         ):
             try:
-                _trainer(**kwargs).resume(path)
+                _trainer(best_effort=True, **kwargs).resume(path)
             except LifeMateError as exc:
                 assert needle in str(exc).lower(), str(exc)
             else:
                 raise AssertionError(f"resume with {kwargs} must fail")
         try:
-            _trainer().resume(Path(tmp) / "run" / "step-999")
+            _trainer(best_effort=True).resume(Path(tmp) / "run" / "step-999")
         except LifeMateError as exc:
             assert "training_state" in str(exc) or "no training_state" in str(exc).lower()
         else:
             raise AssertionError("resume from a stateless dir must fail")
-        print("  resume -> step 5 restored; lora/full, hash change, stateless dir all fail")
+        # Exact resume of the same schema-1 fixture is refused outright (J).
+        try:
+            _trainer().resume(path)
+        except LifeMateError as exc:
+            assert "predates exact-resume" in str(exc), str(exc)
+        else:
+            raise AssertionError("a schema-1 checkpoint must be refused for an exact resume")
+        print(
+            "  resume -> step 5 restored (best-effort, schema 1); lora/full, hash change, "
+            "stateless dir all fail; exact resume of schema 1 refused"
+        )
 
 class _StubModel:
     """Model that accepts resume calls (no torch)."""

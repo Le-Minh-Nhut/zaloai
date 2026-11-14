@@ -12,6 +12,7 @@ __all__ = [
     "ProhibitedAccessError",
     "ConfigError",
     "SchemaError",
+    "FeatureConfigurationError",
 ]
 
 
@@ -68,3 +69,13 @@ class ConfigError(LifeMateError):
 
 class SchemaError(LifeMateError):
     """Raised when a record cannot be interpreted even tolerantly."""
+
+
+class FeatureConfigurationError(LifeMateError):
+    """Raised for an invalid feature-flag combination or override.
+
+    Subclasses :class:`LifeMateError`, so the scripts' existing
+    ``except LifeMateError`` handlers already turn it into their normal failure
+    exit code; :func:`lifemate.features.registry.validate_or_raise` only adds
+    the actionable, flag-naming message.
+    """

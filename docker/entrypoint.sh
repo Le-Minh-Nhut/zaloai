@@ -29,7 +29,43 @@
 #                refuses by default (exit 2); a diagnostic run opts out with
 #                EXTRA_ARGS=--allow-missing-history.
 #                Mount it read-only; a set-but-unreadable path exits 2.
+#   ASR_MODEL_ID gipformer checkpoint id (default: g-group-ai-lab/gipformer-68M-rnnt).
+#                Any other value must come with asr.gipformer_v15 enabled: it is
+#                forwarded as `--override asr.model_id=<id>`, and refusing the pair
+#                keeps a non-default ASR checkpoint from silently moving the baseline.
+#   ASR_MODEL_DIR
+#                ONNX directory for the gipformer backend (default: /models/asr).
+#                Forwarded as `--override asr.model_dir=<dir>` only when the
+#                directory holds tokens.txt, as before; an EXPLICIT value without
+#                one exits 2 instead of silently loading something else.
 #   EXTRA_ARGS   additional CLI args (optional, word-split on purpose)
+#
+# Optional features. Each switch below is OFF unless its variable is set to a truthy
+# value. The entrypoint never enables, rewrites, unsets or case-folds one: `python`
+# reads the same names straight from os.environ
+# (src/lifemate/features/overrides.py). They are validated here so a typo fails
+# before any weight is touched:
+#
+#   LIFEMATE_FEATURE_ASR_GIPFORMER_V15              asr.gipformer_v15
+#   LIFEMATE_FEATURE_ASR_MULTI_ASR                  asr.multi_asr
+#   LIFEMATE_FEATURE_ASR_NBEST                      asr.nbest
+#   LIFEMATE_FEATURE_AUDIO_RMS_NORMALIZATION        audio.rms_normalization
+#   LIFEMATE_FEATURE_AUDIO_VAD                      audio.vad
+#   LIFEMATE_FEATURE_DECODING_CONSTRAINED           decoding.constrained
+#   LIFEMATE_FEATURE_POSTPROCESSING_ENHANCED_SCHEMA_GUARDRAIL
+#                                                   postprocessing.enhanced_schema_guardrail
+#   LIFEMATE_FEATURE_PROMPT_ITN                     prompt.itn
+#   LIFEMATE_FEATURE_PROMPT_NBEST_FORMAT            prompt.nbest_format
+#   LIFEMATE_FEATURE_TRAINING_NOISY_ASR             training.noisy_asr
+#   LIFEMATE_FEATURE_TRAINING_SLOT_MASKING          training.slot_masking
+#   LIFEMATE_FEATURE_TRAINING_TOOL_DROPOUT          training.tool_dropout
+#
+# Truthy: 1|true|yes|on. Falsy: 0|false|no|off. Case-insensitive, exactly the
+# TRUE_TEXT/FALSE_TEXT sets in overrides.py. Any other value, or any other name
+# under the prefix, exits 2 (python would raise on both).
+#
+# Requires bash >= 4 for ${!prefix@} and ${var,,}; the image ships bash 5.1
+# (ubuntu22.04).
 set -euo pipefail
 
 SPLIT="${SPLIT:-public_test}"
@@ -52,6 +88,92 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 MODEL_ROOT="${MODEL_ROOT:-/models}"
 export HF_HOME="${HF_HOME:-$MODEL_ROOT/hf-cache}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+
+# ASR checkpoint knobs. The default is the baseline the image was measured with
+# (`GIPFORMER_SPECS[DEFAULT_SPEC_KEY]` in src/lifemate/asr/model_specs.py).
+ASR_DEFAULT_MODEL_ID="g-group-ai-lab/gipformer-68M-rnnt"
+ASR_MODEL_ID="${ASR_MODEL_ID:-$ASR_DEFAULT_MODEL_ID}"
+# The default path is a convention, not a promise: an absent /models/asr is normal
+# (ASR=none, or a host checkout) and only skips the override. An EXPLICIT path that
+# holds no tokens.txt is a mount mistake and fails below.
+asr_model_dir_explicit=0
+if [[ -n "${ASR_MODEL_DIR-}" ]]; then
+    asr_model_dir_explicit=1
+fi
+ASR_MODEL_DIR="${ASR_MODEL_DIR:-/models/asr}"
+
+# Every optional feature, in alphabetical order (so the summary is sorted without
+# `sort`). This list is the entrypoint's declaration of the ids it advertises;
+# tests/test_docker_entrypoint.py pins it to lifemate.features.registry.FEATURES.
+FEATURE_VARS=(
+    LIFEMATE_FEATURE_ASR_GIPFORMER_V15
+    LIFEMATE_FEATURE_ASR_MULTI_ASR
+    LIFEMATE_FEATURE_ASR_NBEST
+    LIFEMATE_FEATURE_AUDIO_RMS_NORMALIZATION
+    LIFEMATE_FEATURE_AUDIO_VAD
+    LIFEMATE_FEATURE_DECODING_CONSTRAINED
+    LIFEMATE_FEATURE_POSTPROCESSING_ENHANCED_SCHEMA_GUARDRAIL
+    LIFEMATE_FEATURE_PROMPT_ITN
+    LIFEMATE_FEATURE_PROMPT_NBEST_FORMAT
+    LIFEMATE_FEATURE_TRAINING_NOISY_ASR
+    LIFEMATE_FEATURE_TRAINING_SLOT_MASKING
+    LIFEMATE_FEATURE_TRAINING_TOOL_DROPOUT
+)
+
+feature_truthy() {
+    # Same truth set as overrides.TRUE_TEXT; case-insensitive like `_read_bool`.
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+validate_feature_env() {
+    # Read-only pass over LIFEMATE_FEATURE_*: nothing is exported, unset or
+    # case-folded, so `python` sees exactly what the operator passed. An unknown
+    # name or an unreadable value is refused here (exit 2) rather than surfacing
+    # as a traceback after the weights are loaded -- `parse_env_overrides` raises
+    # on both.
+    local name value lowered
+    for name in "${!LIFEMATE_FEATURE_@}"; do
+        value="${!name}"
+        lowered="${value,,}"
+        case "$lowered" in
+            1|true|yes|on|0|false|no|off) ;;
+            *)
+                echo "ERROR: $name=$value is not a feature boolean." >&2
+                echo "       Accepted values: 1|0|true|false|yes|no|on|off (case-insensitive)." >&2
+                exit 2
+                ;;
+        esac
+        if [[ " ${FEATURE_VARS[*]} " != *" $name "* ]]; then
+            echo "ERROR: $name does not name a known feature." >&2
+            echo "       Known feature variables: ${FEATURE_VARS[*]}" >&2
+            exit 2
+        fi
+    done
+}
+
+feature_summary() {
+    # One stderr line naming the enabled features; NONE when nothing is set.
+    local name enabled=()
+    for name in "${FEATURE_VARS[@]}"; do
+        [[ -n "${!name-}" ]] || continue
+        if feature_truthy "${!name}"; then
+            enabled+=("$name")
+        fi
+    done
+    if [[ "${#enabled[@]}" -eq 0 ]]; then
+        echo "lifemate: features=NONE" >&2
+    else
+        local IFS=,
+        echo "lifemate: features=${enabled[*]}" >&2
+    fi
+}
+
+# Runs before the explicit-command branch: `python scripts/train.py` reads the same
+# variables, so an invalid one must fail the same way for training and inference.
+validate_feature_env
 
 # An explicit command wins over the built-in inference default, so the same image
 # also runs training (``docker run IMAGE python scripts/train.py --config ...``,
@@ -182,8 +304,30 @@ if [[ -n "$CONFIG" ]]; then
     cmd+=(--config "$CONFIG")
 fi
 
-if [[ -d "/models/asr" && -f "/models/asr/tokens.txt" ]]; then
-    cmd+=(--override "asr.model_dir=/models/asr")
+if [[ "$ASR_MODEL_ID" != "$ASR_DEFAULT_MODEL_ID" ]]; then
+    # A non-default gipformer checkpoint is a different artifact set, not a
+    # different path: selecting it is exactly what asr.gipformer_v15 means
+    # (registry: "Decode with the Gipformer-1.5 checkpoint instead of
+    # gipformer-68M-rnnt"). Refuse the id alone so an operator cannot move the
+    # baseline by editing one variable.
+    if ! feature_truthy "${LIFEMATE_FEATURE_ASR_GIPFORMER_V15:-0}"; then
+        echo "ERROR: ASR_MODEL_ID=$ASR_MODEL_ID differs from the baseline $ASR_DEFAULT_MODEL_ID" >&2
+        echo "       but LIFEMATE_FEATURE_ASR_GIPFORMER_V15 is not enabled." >&2
+        echo "       A non-default ASR checkpoint silently changes the baseline; enable the" >&2
+        echo "       feature with it: -e LIFEMATE_FEATURE_ASR_GIPFORMER_V15=1" >&2
+        echo "       (or set features.asr.gipformer_v15_enabled=true in a --config YAML)." >&2
+        exit 2
+    fi
+    cmd+=(--override "asr.model_id=$ASR_MODEL_ID")
+fi
+
+if [[ -d "$ASR_MODEL_DIR" && -f "$ASR_MODEL_DIR/tokens.txt" ]]; then
+    cmd+=(--override "asr.model_dir=$ASR_MODEL_DIR")
+elif [[ "$asr_model_dir_explicit" -eq 1 ]]; then
+    echo "ERROR: ASR_MODEL_DIR=$ASR_MODEL_DIR holds no tokens.txt." >&2
+    echo "       Mount the gipformer ONNX directory there (-v <dir>:/models/asr:ro) or unset" >&2
+    echo "       ASR_MODEL_DIR to keep the /models/asr default." >&2
+    exit 2
 fi
 # History transcripts: an explicitly configured file must be usable. Degrading to
 # blank history would silently drop 66.1% of public_test prompts' prior turns, so a
@@ -216,5 +360,6 @@ fi
 
 echo "lifemate: split=$SPLIT model_mode=$MODEL_MODE model=$MODEL_NAME asr=$ASR device=$DEVICE output=$OUTPUT"
 echo "lifemate: offline (HF_HUB_OFFLINE=$HF_HUB_OFFLINE TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE)"
+feature_summary
 check_local_weights
 exec "${cmd[@]}"

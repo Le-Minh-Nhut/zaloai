@@ -1,0 +1,5 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Inverse text normalisation of ASR text before prompting.
+features:
+  prompt:
+    itn_enabled: true

@@ -26,14 +26,20 @@ from lifemate.errors import LifeMateError
 __all__ = [
     "DTYPE_MAP",
     "ModelBundle",
+    "adapter_requires_grad",
+    "assert_no_quantized_trainable",
+    "base_requires_grad",
     "bf16_note",
     "count_parameters",
     "is_local_or_offline",
+    "is_quantized_parameter",
     "load_model_and_tokenizer",
     "build_bnb_config",
+    "quantized_parameters",
     "require_bitsandbytes",
     "resolve_dtype",
     "resolve_model_mode",
+    "train_mode",
 ]
 
 #: String dtype names accepted from config → torch dtype attribute names.
@@ -224,6 +230,97 @@ def count_parameters(model: Any) -> dict[str, int]:
             trainable += n
     return {"total": total, "trainable": trainable, "frozen": total - trainable}
 
+#: PEFT parameter names that are adapter state, not base weights.
+ADAPTER_NAME_MARKERS = ("lora_", "modules_to_save")
+
+#: bitsandbytes parameter classes (integer-backed; never differentiable).
+QUANTIZED_PARAMETER_TYPES = ("Params4bit", "Int8Params", "Params4bitCPU")
+
+def is_adapter_parameter_name(name: str) -> bool:
+    """Whether ``name`` belongs to a PEFT adapter rather than the base model."""
+    return any(marker in str(name) for marker in ADAPTER_NAME_MARKERS)
+
+def is_quantized_parameter(param: Any) -> bool:
+    """Whether ``param`` is integer/4-bit backed (bitsandbytes or equivalent).
+
+    Checked by class name and by dtype, so a stand-in quantized holder is
+    detected without importing bitsandbytes: only floating-point tensors can
+    carry gradients, and ``Params4bit`` stores packed uint8.
+    """
+    if type(param).__name__ in QUANTIZED_PARAMETER_TYPES:
+        return True
+    method = getattr(param, "is_floating_point", None)
+    if callable(method):  # torch.Tensor: method
+        try:
+            return not bool(method())
+        except Exception:  # pragma: no cover - exotic holders
+            return False
+    flag = getattr(getattr(param, "dtype", None), "is_floating_point", None)
+    return bool(isinstance(flag, bool) and not flag)  # torch.dtype: plain attribute
+
+def quantized_parameters(model: Any) -> list[tuple[str, Any]]:
+    """``[(name, param)]`` for every integer/4-bit parameter of ``model``."""
+    return [
+        (name, param)
+        for name, param in getattr(model, "named_parameters", lambda: [])()
+        if is_quantized_parameter(param)
+    ]
+
+def assert_no_quantized_trainable(model: Any) -> None:
+    """Raise naming the parameter when a quantized weight is trainable."""
+    offenders = [
+        name for name, param in quantized_parameters(model) if bool(getattr(param, "requires_grad", False))
+    ]
+    if offenders:
+        raise LifeMateError(
+            f"quantized parameter {offenders[0]!r} has requires_grad=True "
+            f"({len(offenders)} such parameter(s)); an nf4/integer base cannot be trained. "
+            "Freeze it and train adapters (tuning_mode='qlora')."
+        )
+
+def train_mode(model: Any, *, training: bool) -> Any:
+    """``model.train()`` / ``model.eval()`` only — never touches ``requires_grad``."""
+    if training:
+        model.train()
+    else:
+        model.eval()
+    return model
+
+def base_requires_grad(model: Any, *, tuning_mode: str | None, training: bool) -> bool:
+    """Whether the *base* weights train: full fine-tuning, and only while training."""
+    del model  # decision is config-driven; kept in the signature for symmetry/testability
+    if not training:
+        return False
+    return str(tuning_mode or "full").strip().lower() not in ("lora", "qlora")
+
+def adapter_requires_grad(model: Any, *, training: bool) -> bool:
+    """PEFT adapters are trainable only while training; never at inference."""
+    del model
+    return bool(training)
+
+def apply_base_requires_grad(
+    model: Any, *, tuning_mode: str | None, training: bool, quantization: str = "none"
+) -> bool:
+    """Apply decision 2 to ``model`` and return the base decision.
+
+    A quantized base is frozen unconditionally (nf4/int8 weights are integer
+    backed and not differentiable); trying to unfreeze one raises
+    :class:`LifeMateError` naming the parameter, and the post-condition re-checks
+    that no quantized parameter ended up trainable.
+    """
+    base = base_requires_grad(model, tuning_mode=tuning_mode, training=training)
+    if str(quantization or "none").strip().lower() != "none":
+        base = False
+    for name, param in getattr(model, "named_parameters", lambda: [])():
+        if base and is_quantized_parameter(param):
+            raise LifeMateError(
+                f"quantized parameter {name!r} cannot require grad: the base is integer-backed, "
+                "so only adapters may train (tuning_mode='qlora')"
+            )
+        param.requires_grad_(bool(base))
+    assert_no_quantized_trainable(model)
+    return base
+
 
 def _default_generation_config(tokenizer: Any, temperature: float, max_new_tokens: int) -> dict[str, Any]:
     """Decode defaults: greedy unless ``temperature > 0``; bounded new tokens."""
@@ -311,9 +408,6 @@ def load_model_and_tokenizer(
         quant_mode=quant_mode,
     )
 
-    if mode == "lora" and checkpoint:
-        model = _attach_lora_adapter(model, checkpoint, trainable=trainable, base_name=model_name_or_path)
-
     if str(device) and quant_mode == "none":
         # A bitsandbytes 4-bit model is already placed by accelerate; calling
         # ``.to()`` on it raises.
@@ -326,16 +420,39 @@ def load_model_and_tokenizer(
             ) from exc
 
     effective_trainable = trainable or for_training
-    if effective_trainable:
-        model.train()
-        if mode in ("base", "full") and tuning_mode != "lora":
-            for param in model.parameters():
-                param.requires_grad_(True)
-    else:
-        model.eval()
+
+    # Decision 2, before any adapter exists: only full fine-tuning trains the
+    # base, and a quantized (nf4/integer) base is frozen unconditionally.
+    base_trainable = apply_base_requires_grad(
+        model,
+        tuning_mode=tuning_mode,
+        training=effective_trainable,
+        quantization=quant_mode,
+    )
+
+    # Decision 3: adapters train only while training.
+    adapter_trainable = adapter_requires_grad(model, training=effective_trainable)
+    if mode == "lora" and checkpoint:
+        model = _attach_lora_adapter(
+            model, checkpoint, trainable=adapter_trainable, base_name=model_name_or_path
+        )
+        for name, param in model.named_parameters():
+            if is_adapter_parameter_name(name):
+                param.requires_grad_(bool(adapter_trainable))
+
+    # Inference: nothing may keep a gradient, adapters included.
+    if not effective_trainable:
         for param in model.parameters():
             param.requires_grad_(False)
+
+    # Decision 1: mode only.
+    train_mode(model, training=effective_trainable)
+
+    # Post-condition: a quantized/integer parameter can never be trainable.
+    assert_no_quantized_trainable(model)
+
     params = count_parameters(model)
+    quantized = quantized_parameters(model)
     gen_cfg = _default_generation_config(tokenizer, temperature, max_new_tokens)
     meta: dict[str, Any] = {
         "model_name": model_name_or_path,
@@ -349,6 +466,9 @@ def load_model_and_tokenizer(
         "local_files_only": local_only,
         "for_training": bool(for_training),
         "trainable": bool(effective_trainable),
+        "base_trainable": bool(base_trainable),
+        "adapter_trainable": bool(adapter_trainable and mode == "lora" and bool(checkpoint)),
+        "n_quantized_parameters": len(quantized),
         "n_parameters": params,
         "generation_config": gen_cfg,
         "note": note,
@@ -428,7 +548,27 @@ def _load_causal_lm(
     *,
     quant_mode: str = "none",
 ) -> Any:
-    """Load the causal LM; unsupported architectures raise ``LifeMateError``."""
+    """Load the causal LM; unsupported architectures raise ``LifeMateError``.
+
+    ``AutoModelForCausalLM`` is the only interface. Introspected in the installed
+    transformers 5.22.2 (``/tmp/cudaenv``):
+
+    * ``MODEL_FOR_CAUSAL_LM_MAPPING_NAMES["qwen3_5"] == "Qwen3_5ForCausalLM"`` and
+      ``CONFIG_MAPPING_NAMES["qwen3_5"] == "Qwen3_5Config"``, so the plain Auto
+      path already covers the released multimodal ``qwen3_5`` config;
+    * a released-style directory (nested ``text_config``, ``architectures:
+      ["Qwen3_5ForConditionalGeneration"]``, ``model.language_model.*`` shard keys,
+      extra ``model.visual.*``/``mtp.*`` tensors, no ``lm_head.weight``) loads
+      through that path with **0 missing / 0 unexpected** keys and returns a
+      ``Qwen3_5ForCausalLM`` exposing ``.logits``/``.loss``/``.generate``;
+      transformers applies its ``PrefixChange`` conversion and drops the towers.
+
+    So no ``AUTOMODEL_OVERRIDES`` table is added: a family override would be dead
+    code that has to be maintained. If a future transformers build stops mapping a
+    family, the failure here is a loud ``LifeMateError`` naming the source, and
+    the fix is to pin/patch transformers — not to silently substitute a class.
+    MiniCPM (``LlamaForCausalLM``) therefore also stays on the plain path.
+    """
     kwargs: dict[str, Any] = {
         "torch_dtype": dtype,
         "trust_remote_code": bool(trust),

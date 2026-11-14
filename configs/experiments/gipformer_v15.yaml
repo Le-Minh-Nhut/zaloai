@@ -1,0 +1,5 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Gipformer-1.5 ASR checkpoint (instead of g-group-ai-lab/gipformer-68M-rnnt).
+features:
+  asr:
+    gipformer_v15_enabled: true

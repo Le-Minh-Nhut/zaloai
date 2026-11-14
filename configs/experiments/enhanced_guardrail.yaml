@@ -1,0 +1,5 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Enhanced schema guardrail on tool-call arguments.
+features:
+  postprocessing:
+    enhanced_schema_guardrail_enabled: true

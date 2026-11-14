@@ -56,7 +56,47 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--model-dir", default=None, help="local directory with the ONNX model files")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing predictions file")
+    parser.add_argument(
+        "--alt-decoding",
+        choices=("greedy_search", "modified_beam_search"),
+        default=None,
+        help=(
+            "decode every utterance a second time with this method and record the "
+            "result as hypothesis rank 1 (a real second recogniser output, not a synthesis)"
+        ),
+    )
+    parser.add_argument(
+        "--transcript-records",
+        default=None,
+        help=(
+            "also write the per-sample transcript JSONL consumed by "
+            "prepare_dataset.py --nbest-transcripts/--noisy-asr-transcripts"
+        ),
+    )
+    try:  # optional slice: absent -> no feature flags at all
+        from lifemate.features.overrides import add_feature_arguments  # noqa: PLC0415
+
+        add_feature_arguments(parser)
+    except ImportError:  # pragma: no cover - features slice absent
+        pass
     return parser.parse_args(argv)
+
+def _feature_config(cfg: Any, args: argparse.Namespace) -> Any:
+    """Resolve the feature chain; ``None`` when the slice is absent."""
+    try:
+        from lifemate.features.config import FeatureConfig  # noqa: PLC0415
+        from lifemate.features.overrides import build_feature_config  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - features slice absent
+        return None
+    if getattr(cfg, "features", None) is None:  # wiring not landed: defaults
+        cfg.features = FeatureConfig()
+    features, _provenance = build_feature_config(cfg, args)
+    cfg.features = features
+    return features
+
+def _flag(features: Any, section: str, name: str) -> bool:
+    """One feature flag; ``False`` when the object (or its section) is absent."""
+    return bool(getattr(getattr(features, section, None), name, False))
 
 def _apply_overrides(cfg: Any, args: argparse.Namespace) -> Any:
     if args.data_root:
@@ -73,10 +113,31 @@ def _reference(sample: Any) -> str:
     """Gold transcript; empty when the split carries no labels."""
     return str(getattr(sample, "audio_text", "") or "")
 
-def _transcribe_all(backend: Any, samples: list[Any], split: str) -> list[dict[str, Any]]:
-    """One row per sample. Failures keep an empty hypothesis and a reason."""
-    from lifemate.asr.normalization import to_llm_text  # noqa: PLC0415
+def _transcribe_all(
+    backend: Any,
+    samples: list[Any],
+    split: str,
+    alt_backend: Any = None,
+    features: Any = None,
+) -> list[dict[str, Any]]:
+    """One row per sample. Failures keep an empty hypothesis and a reason.
+
+    ``alt_backend`` (optional) decodes the same audio with another method; its
+    text is stored as ``alt_hypothesis`` so a transcript file can carry two real
+    recogniser outputs per utterance.
+    """
     from lifemate.data.loader import read_sample_audio  # noqa: PLC0415
+    from lifemate.text.itn import apply_itn_pipeline  # noqa: PLC0415
+
+    itn = _flag(features, "prompt", "itn_enabled")
+
+    def _agent_text(value: str) -> str:
+        """Exactly what the agent's prompt sees for this recogniser string.
+
+        ``apply_itn_pipeline(enabled=False)`` IS ``to_llm_text``, so the off path
+        stays byte-identical; ``prompt.itn`` adds the surface-form pass on top.
+        """
+        return apply_itn_pipeline(value, enabled=itn) if value else ""
 
     backend_name = getattr(backend, "name", "unknown")
     rows: list[dict[str, Any]] = []
@@ -110,7 +171,7 @@ def _transcribe_all(backend: Any, samples: list[Any], split: str) -> list[dict[s
         # scripts/infer.py::_transcribe, so a scored hypothesis equals the prompt text.
         text = str(getattr(result, "text", "") or "")
         row["raw_hypothesis"] = str(getattr(result, "raw_text", None) or text)
-        row["hypothesis"] = to_llm_text(text) if text else ""
+        row["hypothesis"] = _agent_text(text)
         row["latency_s"] = round(float(getattr(result, "latency_s", 0.0) or 0.0), 4)
         duration = getattr(result, "duration_s", None)
         row["duration_s"] = float(duration) if isinstance(duration, (int, float)) else None
@@ -118,9 +179,67 @@ def _transcribe_all(backend: Any, samples: list[Any], split: str) -> list[dict[s
         if row["error"]:
             row["hypothesis"] = ""
             row["raw_hypothesis"] = ""
+        if alt_backend is not None and not row["error"]:
+            try:
+                alt = alt_backend.transcribe(audio_path, sample_id=row["id"])
+                alt_text = str(getattr(alt, "text", "") or "")
+                if not getattr(alt, "error", None) and alt_text:
+                    row["alt_hypothesis"] = _agent_text(alt_text)
+            except ProhibitedAccessError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a failed alt decode is not fatal
+                row["alt_error"] = f"{type(exc).__name__}: {exc}"[:300]
         rows.append(row)
         print(f"[{index}/{len(samples)}] {row['id']}: {len(row['hypothesis'])} chars")
     return rows
+
+def _hypotheses_of(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Distinct, real recogniser outputs of one row (best first, no synthesis)."""
+    hypotheses: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rank, (text, source) in enumerate(
+        (
+            (str(row.get("hypothesis") or ""), "asr"),
+            (str(row.get("alt_hypothesis") or ""), "asr:alt_decoding"),
+        )
+    ):
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        hypotheses.append({"text": text, "rank": len(hypotheses), "source": source})
+    return hypotheses
+
+def _transcript_records(rows: list[dict[str, Any]], backend: Any, cfg: Any) -> list[dict[str, Any]]:
+    """Per-sample transcript records consumed by ``prepare_dataset.py``.
+
+    One hypothesis per row unless ``--alt-decoding`` was given, in which case the
+    second decoding's text becomes rank 1. A single decoding exposes exactly one
+    string (``TranscriptResult`` carries ``text``/``raw_text``, not alternatives),
+    so without ``--alt-decoding`` the file is 1-best and
+    ``load_transcripts(..., require_multi=True)`` refuses it instead of
+    pretending a 1-best list is a multi-hypothesis one.
+    """
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if row["error"]:
+            continue
+        records.append(
+            {
+                "sample_id": row["id"],
+                "split": row["split"],
+                "hypotheses": _hypotheses_of(row),
+                "asr_model": str(getattr(backend, "model_id", "") or getattr(backend, "name", "") or ""),
+                "asr_revision": str(getattr(backend, "revision", "") or ""),
+                "asr_config": {
+                    "backend": str(getattr(backend, "name", "") or ""),
+                    "quantization": getattr(backend, "quantization", None),
+                    "decoding_method": str(
+                        getattr(cfg.asr, "decoding_method", None) or ""
+                    ) if getattr(cfg, "asr", None) is not None else "",
+                },
+            }
+        )
+    return records
 
 def _rtf(rows: list[dict[str, Any]]) -> float | None:
     """Real-time factor: processing seconds per audio second (lower is better)."""
@@ -130,10 +249,30 @@ def _rtf(rows: list[dict[str, Any]]) -> float | None:
         return None
     return total_latency / total_duration
 
+def _feature_report(cfg: Any) -> dict[str, Any]:
+    """JSON-ready feature report; ``{}`` when the optional slice is absent."""
+    try:
+        from lifemate.features.report import (  # noqa: PLC0415
+            feature_report_dict,
+            format_feature_report,
+        )
+    except ImportError:  # pragma: no cover - features slice absent
+        return {}
+    features = getattr(cfg, "features", None)
+    if features is None:  # pragma: no cover - slice present but off
+        return {}
+    print(
+        format_feature_report(features, model_id=cfg.model.name, asr_id=cfg.asr.model_id),
+        file=sys.stderr,
+    )
+    return feature_report_dict(features, model_id=cfg.model.name, asr_id=cfg.asr.model_id)
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         cfg = _apply_overrides(load_config(args.config), args)
+        features = _feature_config(cfg, args)
+        feature_report = _feature_report(cfg)
     except LifeMateError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_DATA
@@ -170,9 +309,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_DATA
     backend_name = str(getattr(backend, "name", "unknown"))
 
+    alt_backend = None
+    if args.alt_decoding:
+        try:
+            alt_backend = create_asr_backend(cfg, decoding_method=args.alt_decoding)
+        except Exception as exc:  # noqa: BLE001 - the alt decode is optional
+            print(f"warning: --alt-decoding {args.alt_decoding} unavailable ({exc})", file=sys.stderr)
+
     started = time.perf_counter()
     try:
-        rows = _transcribe_all(backend, samples, args.split)
+        rows = _transcribe_all(
+            backend, samples, args.split, alt_backend=alt_backend, features=features
+        )
     except ProhibitedAccessError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_DATA
@@ -201,6 +349,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_report = dict(size_reporter())
         except Exception as exc:  # noqa: BLE001 - size accounting is informative only
             model_report = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    if args.transcript_records:
+        records_path = Path(args.transcript_records)
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        records = _transcript_records(rows, backend, cfg)
+        with records_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            n_multi = sum(1 for record in records if len(record["hypotheses"]) > 1)
+        print(
+            f"transcript records: {records_path} ({len(records)} sample(s), "
+            f"{n_multi} with >1 hypothesis)"
+        )
 
     print(f"backend: {backend_name}")
     print(f"n={len(rows)} n_failed={n_failed}")
@@ -237,6 +398,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "quantization": getattr(backend, "quantization", None),
         "model_size": model_report,
     }
+    if feature_report and feature_report.get("mode") != "BASELINE":
+        # Only an EXPERIMENTAL run records provenance: a baseline sidecar stays
+        # byte-identical to the pre-wiring file. No transcript text in here.
+        metrics["run"]["features"] = feature_report
     sidecar = output.with_name(output.name + ".metrics.json")
     sidecar.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -94,6 +94,119 @@ def test_resolve_model_mode():
             raise AssertionError(f"tuning_mode {bad!r} should be rejected")
 
 
+def test_train_mode_touches_only_mode():
+    """``train_mode`` flips train/eval and never touches requires_grad."""
+
+    class _Recorder:
+        def __init__(self):
+            self.training = None
+            self.requires_grad_calls = []
+
+        def train(self):
+            self.training = True
+            return self
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def parameters(self):
+            raise AssertionError("train_mode must not iterate parameters")
+
+        def requires_grad_(self):
+            raise AssertionError("train_mode must not touch requires_grad")
+
+    model = _Recorder()
+    assert loader.train_mode(model, training=True) is model and model.training is True
+    assert loader.train_mode(model, training=False) is model and model.training is False
+
+def test_base_requires_grad_is_full_tuning_only_while_training():
+    """Full → True; lora/qlora/inference → False, regardless of the model."""
+    model = object()
+    assert loader.base_requires_grad(model, tuning_mode="full", training=True) is True
+    assert loader.base_requires_grad(model, tuning_mode=None, training=True) is True
+    for mode in ("lora", "qlora", "LoRA"):
+        assert loader.base_requires_grad(model, tuning_mode=mode, training=True) is False, mode
+    for mode in ("full", "lora", "qlora"):
+        assert loader.base_requires_grad(model, tuning_mode=mode, training=False) is False, mode
+
+def test_adapter_requires_grad_only_while_training():
+    assert loader.adapter_requires_grad(object(), training=True) is True
+    assert loader.adapter_requires_grad(object(), training=False) is False
+
+def test_is_quantized_parameter_detects_integer_and_bnb_classes():
+    """Quantized = integer dtype OR a bitsandbytes parameter class name."""
+
+    class _Dtype:
+        """Mirrors ``torch.dtype``: ``is_floating_point`` is a plain bool."""
+
+        def __init__(self, is_floating_point):
+            self.is_floating_point = is_floating_point
+
+    class _Param:
+        def __init__(self, dtype, is_floating_point=None):
+            self.dtype = dtype
+            if is_floating_point is not None:
+                self.is_floating_point = lambda: is_floating_point
+
+    class Params4bit:  # class name is what the loader matches
+        dtype = _Dtype(False)
+
+    uint8, bf16 = _Dtype(False), _Dtype(True)
+    assert loader.is_quantized_parameter(_Param(uint8)) is True
+    assert loader.is_quantized_parameter(_Param(bf16)) is False
+    assert loader.is_quantized_parameter(_Param(uint8, is_floating_point=False)) is True
+    assert loader.is_quantized_parameter(_Param(bf16, is_floating_point=True)) is False
+    assert loader.is_quantized_parameter(Params4bit()) is True
+    assert loader.is_quantized_parameter(object()) is False
+
+def test_assert_no_quantized_trainable_names_the_parameter():
+    """A trainable integer parameter raises and names it; frozen ones do not."""
+
+    class _Q:
+        dtype = None
+
+        def __init__(self, n):
+            self.n = n
+            self.requires_grad = False
+
+        def numel(self):
+            return self.n
+
+        def is_floating_point(self):
+            return False
+
+    class _Model:
+        def __init__(self, params):
+            self._params = params
+
+        def named_parameters(self):
+            return list(self._params)
+
+        def parameters(self):
+            return [p for _, p in self._params]
+
+    frozen = _Q(8)
+    loader.assert_no_quantized_trainable(_Model([("layers.0.q_proj.weight", frozen)]))
+    loader.assert_no_quantized_trainable(_Model([("layers.0.q_proj.weight", frozen)]))
+    assert loader.quantized_parameters(_Model([("a", frozen)]))[0][0] == "a"
+
+    offender = _Q(8)
+    offender.requires_grad = True
+    try:
+        loader.assert_no_quantized_trainable(_Model([("layers.3.v_proj.weight", offender)]))
+    except LifeMateError as exc:
+        assert "layers.3.v_proj.weight" in str(exc), str(exc)
+        assert "requires_grad=True" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("a trainable quantized parameter must raise")
+    print("  quantized guard -> refuses layers.3.v_proj.weight, accepts the frozen base")
+
+def test_adapter_parameter_name_detection():
+    assert loader.is_adapter_parameter_name("base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight")
+    assert loader.is_adapter_parameter_name("base_model.modules_to_save.default.weight")
+    assert not loader.is_adapter_parameter_name("base_model.model.layers.0.self_attn.q_proj.base_layer.weight")
+
 def test_resolve_dtype_maps_strings():
     if not HAVE_TORCH:
         print("SKIP: torch not installed - torch.dtype mapping unavailable")
@@ -343,6 +456,140 @@ def test_incomplete_checkpoint_raises_instead_of_random_init():
         )
         assert bundle.meta["n_parameters"]["total"] > 0
         print("  tied lm_head -> still loads (not reported as missing)")
+
+def test_loader_decisions_and_meta_keys():
+    """The three decisions are visible in ``meta`` and match ``requires_grad``.
+
+    The QLoRA-training case that used to hit the unfreeze branch: ``checkpoint``
+    is None, so ``resolve_model_mode`` returns ``"base"`` — the tuning mode, not
+    the resolved mode, is what must decide.
+    """
+    if not HAVE_TORCH or not _have("transformers"):
+        print("SKIP: torch/transformers absent - loader decisions not exercised")
+        NEEDS_GPU.append("load_model_and_tokenizer")
+        return
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    tiny = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=32,
+        )
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = pathlib.Path(tmp) / "tiny"
+        tiny.save_pretrained(model_dir)
+        from tests.test_tiny_e2e import make_tiny_model_and_tokenizer
+
+        make_tiny_model_and_tokenizer(model_dir)  # adds tokenizer artifacts
+
+        def load(**kwargs):
+            return loader.load_model_and_tokenizer(
+                str(model_dir), device="cpu", torch_dtype="float32", **kwargs
+            )
+
+        trained = load(tuning_mode="full", for_training=True)
+        assert trained.meta["base_trainable"] is True
+        assert trained.meta["adapter_trainable"] is False
+        assert trained.meta["n_quantized_parameters"] == 0
+        assert trained.meta["n_parameters"]["frozen"] == 0, trained.meta["n_parameters"]
+        assert trained.model.training is True
+
+        # lora *training* with no checkpoint: resolved mode "base", and the base
+        # must stay frozen because the adapter is what trains.
+        lora = load(tuning_mode="lora", trainable=True, for_training=True)
+        assert lora.model_mode == "base", lora.model_mode
+        assert lora.meta["base_trainable"] is False
+        assert lora.meta["adapter_trainable"] is False, "no adapter was attached"
+        assert lora.meta["n_parameters"]["trainable"] == 0, lora.meta["n_parameters"]
+
+        inference = load(tuning_mode="full", for_training=False)
+        assert inference.meta["base_trainable"] is False
+        assert inference.meta["n_parameters"]["trainable"] == 0
+        assert inference.model.training is False
+        assert all(not p.requires_grad for p in inference.model.parameters())
+    print("  loader decisions -> full/base=True, lora-base=False, inference all frozen; "
+          "meta keys base_trainable/adapter_trainable/n_quantized_parameters present")
+
+
+def test_qwen3_5_loads_through_the_plain_auto_path():
+    """Phase 10: the released multimodal ``qwen3_5`` layout needs no override.
+
+    Pins the introspection this repository relies on: transformers maps
+    ``qwen3_5`` → ``Qwen3_5ForCausalLM`` for causal LM, so the loader keeps ONE
+    interface. The fixture is a real saved model whose shard is rewritten into
+    the released layout (``model.language_model.*`` keys, an extra
+    ``model.visual.*`` tensor, no ``lm_head.weight``).
+    """
+    if not HAVE_TORCH or not _have("transformers"):
+        print("SKIP: torch/transformers absent - qwen3_5 layout not exercised")
+        return
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+    if "qwen3_5" not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        print(f"BLOCKED: this transformers build has no qwen3_5 causal-LM mapping "
+              f"({_transformers_version()}); Qwen3.5-4B loading stays BLOCKED")
+        return
+    assert MODEL_FOR_CAUSAL_LM_MAPPING_NAMES["qwen3_5"] == "Qwen3_5ForCausalLM"
+    assert CONFIG_MAPPING_NAMES["qwen3_5"] == "Qwen3_5Config"
+
+    import torch
+    from safetensors.torch import load_file, save_file
+    from transformers import AutoModelForCausalLM, Qwen3_5Config, Qwen3_5TextConfig
+
+    text = dict(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_attention_heads=2,
+        num_key_value_heads=2, num_hidden_layers=1, max_position_embeddings=64,
+        layer_types=["full_attention"], linear_num_key_heads=2, linear_num_value_heads=4,
+        linear_key_head_dim=8, linear_value_head_dim=8, linear_conv_kernel_dim=4,
+        tie_word_embeddings=True,
+    )
+    torch.manual_seed(0)
+    top = Qwen3_5Config(
+        text_config=Qwen3_5TextConfig(**text), architectures=["Qwen3_5ForConditionalGeneration"]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp) / "released"
+        target.mkdir()
+        reference = pathlib.Path(tmp) / "reference"
+        AutoModelForCausalLM.from_config(top).save_pretrained(reference)
+        top.save_pretrained(target)
+        shard = load_file(reference / "model.safetensors")
+        released = {
+            key.replace("model.", "model.language_model.", 1): value
+            for key, value in shard.items()
+            if not key.startswith("lm_head")
+        }
+        released["model.visual.blocks.0.weight"] = torch.zeros(4, 4)
+        save_file(released, target / "model.safetensors")
+        from tests.test_tiny_e2e import make_tiny_model_and_tokenizer
+
+        tokenizer_dir = make_tiny_model_and_tokenizer(pathlib.Path(tmp) / "tok")
+        for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+            source = tokenizer_dir / name
+            if source.exists():
+                (target / name).write_text(source.read_text(encoding="utf-8"))
+
+        bundle = loader.load_model_and_tokenizer(
+            str(target), device="cpu", torch_dtype="float32", tuning_mode="full", for_training=True
+        )
+    assert type(bundle.model).__name__ == "Qwen3_5ForCausalLM", type(bundle.model).__name__
+    assert bundle.meta["base_trainable"] is True
+    assert bundle.meta["n_quantized_parameters"] == 0
+    logits = bundle.model(input_ids=torch.randint(0, 64, (1, 4))).logits
+    assert tuple(logits.shape) == (1, 4, 64), logits.shape
+    print("  qwen3_5 -> MODEL_FOR_CAUSAL_LM_MAPPING_NAMES['qwen3_5'] == Qwen3_5ForCausalLM; "
+          "released layout (model.language_model.*, model.visual.*) loads on the plain Auto path")
+
+
+def _transformers_version():
+    import transformers
+
+    return transformers.__version__
+
 
 def test_generation_module_imports_and_truncates():
     from lifemate.models import generation

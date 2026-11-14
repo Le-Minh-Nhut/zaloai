@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -66,7 +67,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="resume from this step-<n> checkpoint dir (alias: --resume-from)",
     )
-    parser.add_argument("--max-steps", type=int, default=None, help="stop after N optimizer steps")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="stop after N optimizer steps (early stop; it does NOT define the LR schedule)",
+    )
+    parser.add_argument(
+        "--planned-steps",
+        type=int,
+        default=None,
+        help="LR schedule horizon in optimizer steps (default: derived from num_train_epochs). "
+        "Persisted in every checkpoint so a resume continues the same trajectory",
+    )
+    parser.add_argument(
+        "--extend-horizon",
+        action="store_true",
+        help="authorise resuming into a DIFFERENT horizon than the checkpoint recorded "
+        "(without this a horizon mismatch is refused: the run would be a different schedule)",
+    )
+    parser.add_argument(
+        "--best-effort-resume",
+        action="store_true",
+        help="accept a schema-1 checkpoint (no sampler position). The continuation uses a "
+        "DIFFERENT sample order and is NOT equivalent to the uninterrupted run",
+    )
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=None,
+        help="checkpoint every N optimizer steps for save_strategy=steps "
+        "(default: 0 = fall back to logging_steps)",
+    )
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=None,
+        help="validate every N optimizer steps for eval_strategy=steps "
+        "(default: 0 = fall back to logging_steps)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the plan and preflight only")
     parser.add_argument(
         "--param-count",
@@ -90,7 +129,74 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="override training.max_seq_length (alias: --max-seq-length)",
     )
     parser.add_argument("--device", default=None, help="override model.device (e.g. 'cpu' or 'cuda')")
+    # --enable-feature / --disable-feature (optional slice; absent = no flags).
+    try:
+        from lifemate.features.overrides import add_feature_arguments  # noqa: PLC0415
+
+        add_feature_arguments(parser)
+    except ImportError:  # pragma: no cover - features slice absent
+        pass
     return parser.parse_args(argv)
+
+def _print_feature_report(cfg: Any) -> dict[str, Any]:
+    """Print the effective feature configuration once; return its JSON half.
+
+    ``{}`` when the optional features slice is absent, so the summary/schema stay
+    stable on a checkout without it.
+    """
+    try:  # noqa: PLC0415
+        from lifemate.features.report import (  # noqa: PLC0415
+            feature_report_dict,
+            format_feature_report,
+        )
+    except ImportError:  # pragma: no cover - features slice absent
+        return {}
+    if getattr(cfg, "features", None) is None:  # pragma: no cover - slice present but off
+        return {}
+    report = feature_report_dict(
+        cfg.features, model_id=cfg.model.name, asr_id=cfg.asr.model_id
+    )
+    print(
+        format_feature_report(
+            cfg.features, model_id=cfg.model.name, asr_id=cfg.asr.model_id
+        )
+    )
+    return report
+
+def _refuse_non_training_features(args: argparse.Namespace, cfg: Any) -> str | None:
+    """Message when the CLI names a feature that cannot affect a TRAINING run.
+
+    An inference-only technique changes no supervised token, so accepting
+    ``--enable-feature asr.multi_asr`` here would silently promise an experiment
+    the run does not perform. Names the flag, the id and its scope.
+    """
+    requested: list[tuple[str, str]] = []
+    for flag, values in (
+        ("--enable-feature", getattr(args, "enable_feature", None) or []),
+        ("--disable-feature", getattr(args, "disable_feature", None) or []),
+    ):
+        for value in values:
+            requested.append((flag, str(value).split("=", 1)[0]))
+    if not requested:
+        return None
+    try:  # noqa: PLC0415
+        from lifemate.features.registry import FEATURES  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - features slice absent
+        return None
+    by_id = {spec.id: spec for spec in FEATURES}
+    problems: list[str] = []
+    for flag, feature_id in requested:
+        spec = by_id.get(feature_id)
+        if spec is None:
+            problems.append(f"{flag} {feature_id}: unknown feature id")
+            continue
+        if spec.scope == "inference":
+            problems.append(
+                f"{flag} {feature_id}: this flag is inference-only (scope=inference) and cannot "
+                "change a training run; drop it from the training command and pass it to "
+                "scripts/infer.py / scripts/evaluate.py instead"
+            )
+    return "; ".join(problems) if problems else None
 
 # --------------------------------------------------------------------------- #
 # Data
@@ -384,6 +490,33 @@ def main(argv: list[str] | None = None) -> int:
         cfg.training.resume_from_checkpoint = args.resume
     if args.device:
         cfg.model.device = args.device
+    if args.save_steps is not None:
+        cfg.training.save_steps = int(args.save_steps)
+        # Without this the cadence is inert: the trainer only honours
+        # save_steps when save_strategy == "steps".
+        if int(args.save_steps) > 0:
+            cfg.training.save_strategy = "steps"
+    if args.eval_steps is not None:
+        cfg.training.eval_steps = int(args.eval_steps)
+        if int(args.eval_steps) > 0:
+            cfg.training.eval_strategy = "steps"
+
+    # Features: CLI beats env beats YAML beats defaults. Training-scope ids change
+    # this run; inference-only ids are refused here because silently accepting them
+    # would imply they changed the supervised data.
+    try:
+        from lifemate.features.overrides import build_feature_config  # noqa: PLC0415
+
+        cfg.features, _feature_provenance = build_feature_config(cfg, args)
+        refused = _refuse_non_training_features(args, cfg)
+        if refused:
+            print(f"configuration error: {refused}")
+            return EXIT_FAIL
+    except LifeMateError as exc:
+        print(f"configuration error: {exc}")
+        return EXIT_FAIL
+    except ImportError:  # pragma: no cover - features slice absent
+        _feature_provenance = {}
     if args.smoke:
         cfg.model.device = "cpu"
         cfg.training.precision = "float32"
@@ -398,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"tuning mode : {cfg.training.tuning_mode}  (default: lora)")
     print(f"model       : {cfg.model.name}  device={cfg.model.device} precision={cfg.training.precision}")
     print(f"output dir  : {cfg.training.output_dir}")
+    feature_report = _print_feature_report(cfg)
 
     # ------------------------------------------------------------------ data
     train_records: list[dict] = []
@@ -455,6 +589,10 @@ def main(argv: list[str] | None = None) -> int:
             "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
             "n_train_records": len(train_records),
             "n_val_records": len(val_records),
+            "planned_total_steps": args.planned_steps,
+            "stop_after_steps": args.max_steps,
+            "save_steps": cfg.training.save_steps,
+            "eval_steps": cfg.training.eval_steps,
             "dataset_manifest": {
                 key: manifest.get(key) for key in ("n_train", "n_val", "seed", "ratio", "group_hash")
             },
@@ -572,7 +710,12 @@ def main(argv: list[str] | None = None) -> int:
         tracker=tracker,
         device=cfg.model.device if not args.smoke else "cpu",
         run_name=args.run_name or cfg.training.tuning_mode,
-        max_steps=args.max_steps or (2 if args.smoke else None),
+        # ``--max-steps`` is an early stop, never the LR horizon: a 2-step probe
+        # must not define a 2-step cosine schedule for the real run.
+        stop_after_steps=args.max_steps or (2 if args.smoke else None),
+        planned_total_steps=args.planned_steps,
+        extend_horizon=bool(args.extend_horizon),
+        best_effort=bool(args.best_effort_resume),
         is_lora=is_lora,
         dataset_manifest_hash=manifest_hash,
         stop=stop,
@@ -581,10 +724,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.resume:
         try:
             step = trainer.resume(args.resume)
-            print(f"resumed     : {args.resume} at step {step}")
         except LifeMateError as exc:
+            # Never silently start from zero when --resume was requested.
             print(f"resume failed: {exc}")
             return EXIT_FAIL
+        mode = "exact" if trainer.exact_resume else "best-effort"
+        print(f"resumed     : {args.resume} at step {step}")
+        print(f"resume mode : {mode}")
+        print(
+            f"epoch       : {trainer._epoch_index}/{int(math.ceil(trainer.epochs))}  "
+            f"next micro-batch: {trainer._cursor}"
+        )
+        horizon = int(trainer.planned_total_steps or 0)
+        print(
+            f"scheduler   : {'rebuilt' if trainer.schedule_modified else 'restored'} "
+            f"(horizon {horizon})"
+        )
+        print("rng         : python+cpu+cuda restored")
 
     try:
         result = trainer.run()
@@ -618,6 +774,16 @@ def main(argv: list[str] | None = None) -> int:
                     "tuning_mode": cfg.training.tuning_mode,
                     "model": cfg.model.name,
                     "dataset_manifest": manifest,
+                    # Resume provenance: a modified schedule / approximate
+                    # continuation must never be mistaken for a clean run.
+                    "schedule_modified": bool(result.schedule_modified),
+                    "exact_resume": bool(result.exact_resume),
+                    "planned_total_steps": result.planned_total_steps,
+                    "stop_after_steps": result.stop_after_steps,
+                    "skipped_steps": result.skipped_steps,
+                    # Human-readable half of the feature identity; the fingerprint
+                    # itself is in training_state.json / lifemate_meta.json.
+                    "features": feature_report,
                 },
                 indent=2,
                 ensure_ascii=False,

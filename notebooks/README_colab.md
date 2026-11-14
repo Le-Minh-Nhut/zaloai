@@ -50,6 +50,43 @@ Mục 1 của notebook in ra tên GPU, VRAM, phiên bản CUDA/torch và kết q
 nhân ma trận thật trên device. Nếu GPU < 14 GB VRAM hoặc compute capability < 7.0,
 notebook **dừng** với thông báo cụ thể thay vì OOM giữa chừng.
 
+## 2a. Cờ feature (cell 2a): mặc định TẤT CẢ TẮT
+
+Cell **2a** là bảng điều khiển feature, lấy từ `lifemate.features` — **không** có bản sao
+logic trong notebook. Mọi `#@param` đều mặc định `False`/`0`; một feature tắt **không tốn
+GPU** và **không rebuild dataset** (lệnh prepare/train khi tắt hết giống từng byte với bản
+không có feature).
+
+| `#@param` | feature id | thay đổi gì |
+| --- | --- | --- |
+| `NOISY_ASR_TRAINING` + `NOISY_ASR_RATIO` + `NOISY_ASR_TRANSCRIPTS` | `training.noisy_asr` | thay một phần transcript gold bằng output ASR trong lúc build dataset (cần file transcript JSONL) |
+| `SLOT_MASKING` | `training.slot_masking` | che giá trị slot trong prompt để model phải copy từ context |
+| `TOOL_DROPOUT` | `training.tool_dropout` | ẩn ngẫu nhiên một số tool definition khỏi prompt |
+| `ASR_NBEST` | `asr.nbest` | beam decoding giữ N-best (điều kiện của `NBEST_TRAINING_FORMAT`) |
+| `NBEST_TRAINING_FORMAT` + `NBEST_TRANSCRIPTS` | `prompt.nbest_format` | render request dạng danh sách k số hypothesis tốt nhất (cần `ASR_NBEST`) |
+| `PROMPT_ITN` | `prompt.itn` | inverse text normalization trước khi prompt |
+| `AUDIO_VAD` | `audio.vad` | VAD cắt im lặng trước ASR |
+| `AUDIO_RMS_NORMALIZATION` | `audio.rms_normalization` | chuẩn hoá mức RMS về dBFS đích |
+| `AUGMENTATION_SEED` | — (`training.augmentation_seed`) | seed chọn augmentation; chỉ có hiệu lực khi một augmentation bật |
+
+Quy tắc được ép trong code:
+
+* `FeatureConfig` được dựng từ **dataclass thật** trong `src/lifemate/features/config.py`, rồi
+  `REGISTRY.validate_or_raise` kiểm tra dependency/conflict/availability/param; sai là **dừng
+  cell**, không bao giờ chạy GPU với cấu hình không hợp lệ;
+* `NOISY_ASR_RATIO` ngoài `(0, 1]` khi cờ **đang bật** → raise, nêu tên cờ. Khi cờ **tắt** mà
+  ratio khác 0.25 → chấp nhận, in `INERT`, và **không** đổi fingerprint nào;
+* `NBEST_TRAINING_FORMAT` bật mà `ASR_NBEST` tắt → raise (dependency `prompt.nbest_format -> asr.nbest`);
+* chỉ id có `scope` là `training`/`both` mới được truyền `--enable-feature`; id inference-only
+  (`asr.multi_asr`, `decoding.constrained`, …) bị `scripts/train.py` từ chối nên notebook không gửi;
+* `--enable-feature` được **feature-detect** từ `--help`: nếu bản pin không có, cell 6c raise
+  nêu tên flag thay vì train với mọi cờ TẮT trong khi report nói khác;
+* fingerprint training (`training_feature_fingerprint`) đi cùng config và run report; resume mà
+  fingerprint khác thì báo cáo in `EXACT RESUME REFUSED` và nêu tên cờ lệch — trainer cũng từ
+  chối đúng như vậy, notebook không che.
+
+Xem thêm: `docs/COLAB_RESUME.md` mục 2.4, và `docs/FEATURES.md` cho toàn bộ id.
+
 ## 3. Kết nối Google Drive
 
 Đặt `USE_GOOGLE_DRIVE = True` ở mục 2. Notebook mount Drive và dùng:
@@ -63,16 +100,31 @@ notebook **dừng** với thông báo cụ thể thay vì OOM giữa chừng.
 └── logs/          # stdout của train
 ```
 
-Checkpoint được ghi **nguyên tử và có thể rollback**:
+Checkpoint được ghi **nguyên tử, có version, và có thể rollback**:
 
 ```text
 copy -> <dst>.incomplete-<ts>            # bản copy đang chạy, không bao giờ là checkpoint
      -> fsync cả cây
-     -> SYNC_COMPLETE.json (size + sha256 của TỪNG file, tổng, source, schema=2)
-     -> nếu <dst> đã tồn tại: rename <dst> -> <dst>.prev-<n>   (KHÔNG xoá)
-     -> rename staging -> <dst>
+     -> SYNC_COMPLETE.json viết CUỐI CÙNG (size + sha256 của TỪNG file, rename_mode, schema=2)
+     -> nếu <dst> đã tồn tại: <dst> -> <dst>.prev-<n>   (rename, KHÔNG xoá)
+     -> cài bản mới: os.replace (atomic) HOẶC copy-then-mark (copy_only)
      -> verify lại <dst>, rồi mới prune các .prev-* cũ (giữ KEEP_PREVIOUS=1)
 ```
+
+**Thư mục là immutable theo tên.** Một generation là `checkpoints/<run>/step-000100/`;
+số step nằm trong tên nên một generation đã publish không bao giờ bị ghi đè tại chỗ —
+chỉ lần sync LẠI của đúng step đó mới thay thế nó. Marker thiếu hoặc không parse được
+thì thư mục **không thể chọn để resume**; marker được ghi **sau** khi mọi file đã fsync,
+nên sự tồn tại của nó nghĩa là "cả cây này đã bền".
+
+**Rename thư mục được PROBE, không giả định.** `os.replace` một thư mục chỉ atomic trên
+filesystem POSIX local; mount FUSE của Google Drive có thể cài rename thành copy+delete
+hoặc từ chối. Ô 4b test khả năng đó bằng hai thư mục sibling tạm, cache kết quả, và
+marker ghi lại `rename_mode: "atomic"` hay `"copy_only"`. Ở chế độ `copy_only`, sync
+degrade thành copy-then-mark và **giữ cả hai** generation: `dst.prev-<n>` còn nguyên
+trong suốt thời gian copy, nên crash giữa đường để lại `dst` **không có marker** (mọi
+reader từ chối) cộng một rollback copy nguyên vẹn.
+**Chưa verify trên Drive thật** — máy này chỉ chạy được nhánh filesystem local.
 
 Không có bước nào `rmtree` bản duy nhất còn sống: crash ở bất kỳ điểm nào cũng để lại
 một thư mục **đầy đủ** dưới `<dst>` hoặc `<dst>.prev-<n>` (test giả lập crash giữa hai
@@ -199,11 +251,45 @@ bị tính tiền — xong việc thì `Runtime → Disconnect and delete runtim
 
 ## 7. Resume sau khi mất kết nối
 
-1. Mở lại notebook, chạy lại mục 1 → 7 (mục 7 có thể bỏ qua nếu đã biết cấu hình
-   vừa khớp VRAM).
-2. Ở mục 2, đặt:
-   `RESUME_FROM_CHECKPOINT = "/content/drive/MyDrive/lifemate_colab/checkpoints/<RUN_NAME>/step-<N>"`
-3. Chạy mục 8.
+Quy trình đầy đủ, độc lập (dùng được khi resume bằng tay): [`docs/COLAB_RESUME.md`](../docs/COLAB_RESUME.md).
+
+Mở lại notebook, chạy lại mục 1 → 7, rồi chọn `RESUME_MODE` ở mục 2. **Không cần tự
+tìm đường dẫn** — mục 6d tự dò và verify.
+
+| `RESUME_MODE` | hành vi, được ép trong code |
+| --- | --- |
+| `"auto"` (mặc định) | dò Drive trước rồi local, chọn generation **cao nhất verify được**, in ra từng candidate bị loại kèm lý do. Nếu **có** candidate mà **không cái nào** verify: **dừng** và liệt kê lý do, không tự train lại từ đầu. Nếu run chưa có `step-*` nào: đây là lần chạy đầu, in rõ đã dò những root nào và tiếp tục. |
+| `"fresh"` | experiment MỚI. Nếu `checkpoints/<RUN_NAME>/step-*` đã tồn tại, tên run được thêm timestamp UTC (`<run>-2026-11-14T101500Z`) và in ra rõ ràng; checkpoint cũ **không bị chạm**. |
+| `"explicit"` | dùng `RESUME_FROM_CHECKPOINT` và từ chối nếu verify thất bại. |
+
+Thứ tự kiểm tra của mục 6d (mỗi bước trả về lý do riêng):
+
+1. đúng run được yêu cầu; 2. liệt kê `step-*`; 3. loại `.incomplete-*` và `.prev-*`;
+4. sha256 từng file trong marker; 5. model identity (`lifemate_meta.json` + marker);
+6. `config_hash` (in cả hai giá trị); 7. `dataset_manifest_hash`;
+8. `optimizer_state.pt` tồn tại **và load được** (có key `optimizer`/`scheduler`/`grad_scaler`);
+9. metadata exact-resume (`progress`/`permutation`/`rng_states`) — **thiếu thì `exact=False`
+kèm lý do, không phải corruption** (checkpoint schema 1 hợp lệ); 10. chọn step cao nhất pass.
+
+Báo cáo resume in đúng chín dòng, và bốn dòng boolean là **boolean thật** suy ra từ nội dung
+artifact (`optimizer_state.pt` load được, key `scheduler` khác null, có `permutation`, có RNG
+state) — không phải từ một biến tình cờ tồn tại trong notebook:
+
+```text
+Resume checkpoint:
+Previous global step:
+Previous epoch:
+Next batch:
+Optimizer restored:
+Scheduler restored:
+Sampler restored:
+RNG restored:
+Expected total steps:
+```
+
+Exact vs best-effort lấy từ chính dòng `resume mode : exact|best-effort` mà `scripts/train.py`
+in ra khi resume; nếu CLI không in (bản cũ) thì notebook tự suy từ `progress` và ghi rõ
+nguồn — hai kết luận độc lập có thể mâu thuẫn còn tệ hơn một.
 
 Notebook kiểm tra trước khi resume:
 
@@ -212,9 +298,10 @@ Notebook kiểm tra trước khi resume:
   sha256, hay marker `legacy` (không có sha256) đều bị **từ chối** kèm tên file;
 * marker (nếu có ghi) phải mang đúng `run_name` của session này;
 * có `training_state.json` với `step > 0`,
-* có weights **và** `optimizer_state.pt`,
+* có weights **và** `optimizer_state.pt` (rỗng, cắt cụt hoặc không load được là từ chối),
 * `config_hash` của checkpoint khớp `config_hash` hiện tại (lr, seed, seq len,
-  batch, epoch, precision, tuning mode) — lệch là dừng, vì trainer cũng sẽ từ chối.
+  batch, epoch, precision, tuning mode) — lệch là dừng, vì trainer cũng sẽ từ chối;
+* `dataset_manifest_hash` khớp, nếu cả hai bên đều ghi.
 
 ### 7.1 Mục 9: đọc (luôn luôn) và chứng minh resume (tuỳ chọn)
 
@@ -232,6 +319,38 @@ Mục 9 có hai nửa:
 
 **Chỉ load `adapter_model.safetensors` là "adapter-only loading"**, không phải resume
 optimizer — notebook không bao giờ gọi đó là resume.
+
+## 7.2 Dọn checkpoint local: chỉ khi verify từng cặp
+
+Mục 13 xoá checkpoint local **chỉ khi**, với TỪNG thư mục: có bản Drive tương ứng, marker
+của bản đó verify được (sha256 mọi file), run/step/model khớp, và bản Drive resumable.
+Tập local khác rỗng mà tập Drive rỗng ⇒ **từ chối** (đây là bug thật đã sửa: `all([])` là
+`True` nên trước đây nó xoá sạch). Generation mới nhất không bao giờ bị xoá, và
+`DELETE_LOCAL_AFTER_VERIFIED_SYNC` mặc định `False`, nên kết quả bình thường là một dòng
+dry-run nói rõ **sẽ** xoá gì.
+
+## 7.3 Probe VRAM worst-case (mục 7c)
+
+Probe 2-step ở mục 7b chỉ đo độ dài **của batch đầu tiên** — không nói gì về step 8192 token
+mà run sẽ gặp sau đó. Mục 7c ép đúng trần cấu hình:
+
+```text
+forward -> chunked CE -> backward -> tích luỹ GRADIENT_ACCUMULATION_STEPS micro-batch
+        -> clip gradient -> optimizer.step -> một eval batch -> một checkpoint save
+```
+
+`reset_peak_memory_stats()` chạy ngay trước, nên `max_memory_allocated()` /
+`max_memory_reserved()` mô tả đúng chuỗi đó. Hai batch được đo và **in riêng**, không bao giờ
+lấy trung bình: `MAX_SEQ_LENGTH` đã cấu hình (`source="configured_max"`) và mẫu thật dài nhất
+(`source="longest_sample"`). Báo cáo in 15 nhãn: `GPU`, `CUDA`, `PyTorch`, `Model`, `Precision`,
+`Quantization`, `LoRA rank`, `Sequence length`, `Microbatch size`, `Gradient accumulation`,
+`Peak allocated VRAM`, `Peak reserved VRAM`, `Free VRAM`, `Estimated VRAM`, `Observed VRAM` —
+trong đó `Estimated VRAM` (heuristic) và `Observed VRAM` (đo được) là hai đại lượng khác nhau.
+
+Probe không vừa thì **dừng** kèm các lựa chọn; notebook **không** tự hạ `MAX_SEQ_LENGTH`.
+
+**BLOCKED trên máy này**: không có CUDA, nên probe là no-op có in lý do và mọi số VRAM còn lại
+vẫn là ESTIMATE. Lệnh cho operator: chạy mục 7c trên runtime GPU.
 
 ## 8. Export adapter
 
@@ -303,7 +422,22 @@ không phải là đánh giá tool-calling thành công** — đó chỉ là ki�
   **cả hai** hạng tử logits của đường CE chunked (`logits_compute` bf16 `[seq, vocab]` +
   `logits_chunked` fp32 ở `loss_chunk_tokens=1024`), không phải số chép tay; bảng đầy đủ
   (kèm `lg_compute` / `lg_fp32_chunk` / `lg_unchunked`) do chính ô 2b in ra khi chạy.
-* **Chưa kiểm chứng được**: load `Qwen/Qwen3.5-4B` trên GPU (không có weights ở máy
-  này), hiệu quả của QLoRA (không có `bitsandbytes` ở đây), đường fp16 +
-  `torch.amp.GradScaler` trên T4, chấm điểm closed-loop với `zaic_tools`, độ chính
-  xác tool-calling sau train, và mọi lần chạy Colab (không truy cập được runtime).
+* **TESTED ở mức code (mới)**: `chunk_equivalence` giờ tìm *cửa sổ có supervision* thay vì
+  256 vị trí đầu — test dựng batch 4096 token với 256 vị trí đầu toàn `-100` và kiểm tra
+  nó tìm ra cửa sổ ở offset > 256 với đúng 8 target; batch all-masked bị báo `INVALID`;
+  NaN/Inf ở single-shot **và** chunked đều raise; một target duy nhất vẫn so được; và một
+  loss cố tình sai (`×1.01`, `+0.5`) raise `disagrees` trên cùng fixture đã pass.
+  Discovery/selection được test bằng fault injection thật: file `optimizer_state.pt` 0 byte,
+  một byte adapter bị lật (sha256 lệch), marker bị xoá/bị làm hỏng, một thư mục Drive bị
+  xoá — mỗi case đều kiểm tra cả nhánh **chấp nhận** trên cùng fixture. Cleanup được test
+  với Drive rỗng (từ chối), thiếu 1/3 (từ chối, không xoá gì), và đủ 3 (xoá 2 cũ, giữ mới
+  nhất). Resume modes: `fresh` đổi tên run, `auto` raise khi mọi candidate hỏng và resume
+  khi có một cái tốt, `explicit` từ chối path không verify.
+* **Chưa kiểm chứng được (BLOCKED)**: load `Qwen/Qwen3.5-4B` trên GPU (không có weights ở
+  máy này), hiệu quả của QLoRA (không có `bitsandbytes` ở đây), đường fp16 +
+  `torch.amp.GradScaler` trên T4, chấm điểm closed-loop với `zaic_tools`, độ chính xác
+  tool-calling sau train, **probe VRAM worst-case trên GPU thật** (máy này không có CUDA —
+  probe là no-op có in lý do, mọi số VRAM vẫn là ESTIMATE), **rename thư mục trên Drive
+  thật** (chỉ probe trên filesystem local), và mọi lần chạy Colab (không truy cập được
+  runtime). Lệnh operator cần chạy: mở notebook trên runtime GPU và chạy mục 1 → 7c; nhánh
+  `copy_only` chỉ xuất hiện khi `rename_mode_for()` thật sự thất bại trên mount Drive.

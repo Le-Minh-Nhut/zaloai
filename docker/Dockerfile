@@ -51,6 +51,25 @@ COPY pyproject.toml /build/pyproject.toml
 COPY src /build/src
 
 WORKDIR /build
+# Optional extras: EMPTY by default, so the default image is the baseline and
+# `pip install -e .` pulls in nothing an optional feature would need.
+#   * A disabled feature must not be installed. Every optional backend is imported
+#     lazily (src/lifemate/features/registry.py probes only enabled features), so
+#     omitting a group breaks nothing until the operator turns the flag on -- and
+#     turning it on without the group fails validation with a named reason instead
+#     of importing something half-installed.
+#   * No weights are downloaded at build time. `pip install` fetches wheels, never
+#     model artifacts, and HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE are runtime ENV here;
+#     the model, ASR and feature artifacts are mounted at run time (docker/README.md).
+#   * Groups are comma-separated pip extras from pyproject.toml, e.g.
+#     --build-arg LIFEMATE_EXTRAS=asr-whisper or LIFEMATE_EXTRAS="asr,onnx".
+#     Empty (the default) installs the baseline. Note: no feature flag needs an
+#     extra of its own -- the 12 flags are satisfied by the baseline stack, the
+#     `asr`/`asr-whisper` groups, or mounted artifacts (see pyproject.toml).
+#   * Non-editable on purpose, like the baseline line: only /opt/venv is copied
+#     into the runtime stage, so an editable install would point at /build/src,
+#     which does not exist there (the runtime sets PYTHONPATH=/app/src instead).
+ARG LIFEMATE_EXTRAS=""
 # Coupling: base image tag nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04 <-> torch cu128 index.
 # For CPU-only image builds, pass: --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cpu
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
@@ -79,7 +98,11 @@ RUN python3 -m venv /opt/venv \
         "huggingface-hub>=0.20" \
         "pyyaml>=6" \
         "numpy>=1.26" \
-    && /opt/venv/bin/pip install --no-deps .
+    && if [ -n "${LIFEMATE_EXTRAS}" ]; then \
+        /opt/venv/bin/pip install ".[${LIFEMATE_EXTRAS}]"; \
+    else \
+        /opt/venv/bin/pip install --no-deps .; \
+    fi
 # --------------------------------------------------------------------------- #
 # Stage 2: runtime image
 # --------------------------------------------------------------------------- #

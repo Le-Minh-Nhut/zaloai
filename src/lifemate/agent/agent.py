@@ -17,6 +17,8 @@ from lifemate.agent.prompt_builder import (
     build_decision_prompt,
     to_messages,
 )
+from lifemate.agent.guardrail import check_action
+from lifemate.agent.protocol import Action
 from lifemate.agent.state_tracker import StateTracker
 from lifemate.agent.stopping_policy import (
     REASON_FINISH,
@@ -57,6 +59,8 @@ class AgentResult:
     errors: list[str] = field(default_factory=list)
     finish_reason: str = ""
     sample_id: str = ""
+    #: Layer-2 guardrail events (rejected/normalized), empty when it is off.
+    guardrail: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -65,7 +69,7 @@ class AgentResult:
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe dump for logs and evaluation rows."""
-        return {
+        payload = {
             "sample_id": self.sample_id,
             "status": self.status,
             "finish_reason": self.finish_reason,
@@ -77,6 +81,9 @@ class AgentResult:
             "errors": self.errors,
             "steps": [s.to_dict() for s in self.steps],
         }
+        if self.guardrail:  # key absent when the layer never spoke: baseline dump unchanged
+            payload["guardrail"] = self.guardrail
+        return payload
 
 
 def _installed_apps(context: Any, fields: dict[str, Any]) -> list[str]:
@@ -106,6 +113,48 @@ def _sample_fields(sample_or_fields: Any) -> dict[str, Any]:
     }
 
 
+def _guardrail_from(config: Any) -> bool:
+    """``postprocessing.enhanced_schema_guardrail`` off a config, else ``False``."""
+    features = getattr(config, "features", None)
+    section = getattr(features, "postprocessing", None)
+    return bool(getattr(section, "enhanced_schema_guardrail_enabled", False))
+
+def _guardrail_apply(action: Action, registry: Any, env: Any, enabled: bool) -> tuple[Action, dict[str, Any] | None]:
+    """Run layer 2 after the parser; never weaken, never rewrite an accepted call.
+
+    ``rejected`` becomes the same first-class ``Action(type="invalid", ...)`` the
+    parser produces, carrying the guardrail's reasons; the model's original action
+    rides along for the step record. ``normalized`` swaps in the coerced arguments.
+    """
+    if not enabled:
+        return action, None
+    if action.type == "invalid":
+        # The parser already rejected it. Its message stays authoritative; this
+        # layer may only ADD rejections, never rewrite one.
+        return action, None
+    outcome = check_action(action, registry, enabled=True, env=env)
+    record: dict[str, Any] = {"verdict": outcome.verdict}
+    if outcome.reasons:
+        record["reasons"] = list(outcome.reasons)
+    if outcome.env_said_ok:
+        record["env_said_ok"] = True
+    if outcome.verdict == "rejected":
+        record["original_action"] = outcome.original_action
+        return (
+            Action(
+                type="invalid",
+                name=action.name,
+                arguments=action.arguments,
+                raw=action.raw,
+                error="guardrail rejected: " + "; ".join(outcome.reasons),
+            ),
+            record,
+        )
+    if outcome.verdict == "normalized":
+        record["original_action"] = outcome.original_action
+        return outcome.action if isinstance(outcome.action, Action) else action, record
+    return action, record
+
 class ToolAgent:
     """One-step-at-a-time tool-calling loop over a real ``ToolEnvironment``."""
 
@@ -120,6 +169,7 @@ class ToolAgent:
         history_limit: int = DEFAULT_HISTORY_LIMIT,
         max_steps: int | None = None,
         time_budget_seconds: float | None = None,
+        guardrail: bool | None = None,
         **extra: Any,
     ) -> None:
         if callable(generator) and not hasattr(generator, "generate"):
@@ -143,6 +193,10 @@ class ToolAgent:
         if time_budget_seconds is not None:
             self.policy.time_budget_seconds = float(time_budget_seconds)
         self.executor = ToolExecutor(env, registry, self.policy.max_consecutive_failures)
+        # Layer 2 (features.postprocessing.enhanced_schema_guardrail). An explicit
+        # argument wins; otherwise the flag is read from ``config`` when it carries
+        # a feature object. It may only ADD rejections on top of the parser.
+        self.guardrail = bool(guardrail) if guardrail is not None else _guardrail_from(config)
     # ------------------------------------------------------------------- run
     def run(
         self,
@@ -198,6 +252,7 @@ class ToolAgent:
         step_index = 0
         repeat_count = 0
         last_sig = ""
+        guardrail_events: list[dict[str, Any]] = []
         result = AgentResult(status="error", transcript=transcript, sample_id=str(fields.get("id") or ""))
 
         while True:
@@ -235,6 +290,11 @@ class ToolAgent:
                 break
 
             action = parse_model_output(str(raw_output or ""), registry, self.env)
+            action, guard = _guardrail_apply(action, registry, self.env, self.guardrail)
+            if guard is not None and guard.get("verdict") in {"rejected", "normalized"}:
+                guard["step"] = step_index
+                guard["action"] = action.to_dict()
+                guardrail_events.append(guard)
             step_sig = signature(action)
             repeat_count = repeat_count + 1 if step_sig == last_sig else 1
             last_sig = step_sig
@@ -282,6 +342,7 @@ class ToolAgent:
         result.n_llm_calls = n_llm_calls
         result.elapsed_seconds = self.clock() - started
         result.errors = errors
+        result.guardrail = guardrail_events
         return result
 
     def _registry_for(self, fields: dict[str, Any]) -> ToolRegistry:

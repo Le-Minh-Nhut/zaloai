@@ -22,6 +22,26 @@ from .normalization import (
     tokenize_words,
     wer,
 )
+from .model_specs import (
+    GIPFORMER_SPECS,
+    GipformerSpec,
+    KNOWN_MODEL_IDS,
+    require_spec_artifacts,
+    resolve_gipformer_spec,
+    validate_artifacts,
+)
+from .multi_backend import MultiAsrBackend
+from .nbest import (
+    NBEST_MAX,
+    NBEST_MIN,
+    NBestResult,
+    NBestUnsupportedError,
+    AsrHypothesis,
+    require_nbest_support,
+    rescore_configurations,
+    runtime_nbest_capability,
+    validate_nbest_size,
+)
 from .oracle_backend import OracleTranscriptBackend
 
 __all__ = [
@@ -31,6 +51,22 @@ __all__ = [
     "GipformerBackend",
     "OracleTranscriptBackend",
     "WhisperBackend",
+    "MultiAsrBackend",
+    "AsrHypothesis",
+    "NBestResult",
+    "NBestUnsupportedError",
+    "require_nbest_support",
+    "rescore_configurations",
+    "runtime_nbest_capability",
+    "validate_nbest_size",
+    "NBEST_MIN",
+    "NBEST_MAX",
+    "GipformerSpec",
+    "GIPFORMER_SPECS",
+    "KNOWN_MODEL_IDS",
+    "resolve_gipformer_spec",
+    "validate_artifacts",
+    "require_spec_artifacts",
     "load_audio_16k_mono",
     "resample_linear",
     "wav_info",
@@ -57,6 +93,8 @@ def __getattr__(name: str) -> Any:
         from .gipformer_backend import GipformerBackend  # noqa: PLC0415
 
         return GipformerBackend
+    if name == "create_asr_backend":
+        return create_asr_backend
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -97,9 +135,29 @@ def create_asr_backend(
             "decoding_method": _get("decoding_method", "modified_beam_search"),
             "offline": _get("offline", True),
             "max_audio_seconds": _get("max_audio_seconds", 60.0),
+            "nbest_size": _get("nbest_size", 0),
         }
         opts.update(kwargs)
         return GipformerBackend(**opts)
+
+    if name == "multi":
+        # Composed backend: the caller supplies the real components, so nothing is
+        # silently substituted here (no "secondary" that is secretly the primary).
+        opts = {
+            "enabled": _get("multi_asr_enabled", False),
+            "policy": _get("multi_asr_policy", "primary_topk_secondary_top1"),
+            "max_hypotheses": _get("multi_asr_max_hypotheses", 3),
+            "failure_policy": _get("multi_asr_failure_policy", "primary_only"),
+            "primary_topk": _get("multi_asr_primary_topk", 3),
+            "budget_seconds": _get("multi_asr_budget_seconds", None),
+        }
+        opts.update(kwargs)
+        if "primary" not in opts:
+            raise AsrError(
+                "backend='multi' requires primary=<ASRBackend> (and optionally secondary=<ASRBackend>); "
+                "the factory will not invent either one"
+            )
+        return MultiAsrBackend(**opts)
 
     if name == "oracle":
         if transcripts is None:
@@ -130,5 +188,6 @@ def create_asr_backend(
 
     raise AsrError(
         f"ASR backend {name!r} is not usable. Choose 'gipformer' (default), "
-        "'whisper' for comparison, or 'oracle' for transcript-based evaluation."
+        "'whisper' for comparison, 'multi' for a composed primary+secondary run, "
+        "or 'oracle' for transcript-based evaluation."
     )

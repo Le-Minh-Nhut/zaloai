@@ -1,0 +1,22 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Load with: python3 scripts/train.py --config configs/experiments/baseline.yaml
+# Every flag false, written out explicitly so this file is the reference baseline.
+features:
+  audio:
+    vad_enabled: false
+    rms_normalization_enabled: false
+  asr:
+    gipformer_v15_enabled: false
+    nbest_enabled: false
+    multi_asr_enabled: false
+  prompt:
+    itn_enabled: false
+    nbest_prompt_enabled: false
+  training:
+    noisy_asr_training_enabled: false
+    slot_masking_enabled: false
+    tool_dropout_enabled: false
+  decoding:
+    constrained_decoding_enabled: false
+  postprocessing:
+    enhanced_schema_guardrail_enabled: false

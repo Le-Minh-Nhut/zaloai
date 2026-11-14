@@ -39,6 +39,8 @@ training:
   logging_steps: 10
   save_strategy: epoch
   eval_strategy: epoch
+  save_steps: 0           # for save_strategy: steps; 0 = fall back to logging_steps
+  eval_steps: 0           # for eval_strategy: steps; 0 = fall back to logging_steps
   seed: 42
   # MiniCPM5-2B tokenizer, MEASURED: 4298 kept / 488 truncated (11.17%) /
   # 70 dropped target_value_truncated (1.60%); val 477 / 41 / 5 (1.04%).
@@ -112,3 +114,27 @@ cloud:
   gpu_type: null
   checkpoint_remote: null
   artifact_name: lifemate-full
+
+# Feature switchboard (see docs/FEATURES.md). Every flag is OFF: this block is
+# the explicit baseline, not a set of tuned defaults.
+features:
+  audio:
+    vad_enabled: false
+    rms_normalization_enabled: false
+  asr:
+    gipformer_v15_enabled: false
+    nbest_enabled: false
+    multi_asr_enabled: false
+    nbest_size: 3
+  prompt:
+    itn_enabled: false
+    nbest_prompt_enabled: false
+  training:
+    noisy_asr_training_enabled: false
+    noisy_asr_ratio: 0.25
+    slot_masking_enabled: false
+    tool_dropout_enabled: false
+  decoding:
+    constrained_decoding_enabled: false
+  postprocessing:
+    enhanced_schema_guardrail_enabled: false

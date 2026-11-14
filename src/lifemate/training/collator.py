@@ -239,6 +239,11 @@ def _eos_id(tokenizer: Any) -> int | None:
 #: the one part of a prompt that can never be recovered from context, so
 #: truncation protects it even at the cost of older history.
 REQUEST_MARKER = "# Yêu cầu"
+#: Headers that can open the request section. ``# Các giả thuyết ASR`` is the
+#: N-best block (``lifemate.data.augmentation.NBEST_HEADER``); it sits inside the
+#: request section, so it must be pinned by the same split or a middle cut could
+#: delete the hypotheses while keeping the rest of the prompt.
+REQUEST_MARKERS = (REQUEST_MARKER, "# Các giả thuyết ASR")
 #: Section header that opens the tool catalog. A target ``tool_call`` names a
 #: tool whose ``### <tool> (kind=...)`` block must be readable, and the block can
 #: sit anywhere inside the catalog, so the catalog is pinned to the tail instead
@@ -261,10 +266,16 @@ def _split_at_request(text: str) -> tuple[str, str] | None:
     string costs at most a couple of boundary merges, while guaranteeing the
     request survives truncation.
     """
-    start = text.find(REQUEST_MARKER)
-    if start < 0:
+    start = -1
+    marker = None
+    for m in REQUEST_MARKERS:
+        idx = text.find(m)
+        if idx >= 0 and (start < 0 or idx < start):
+            start = idx
+            marker = m
+    if start < 0 or marker is None:
         return None
-    body_start = start + len(REQUEST_MARKER)
+    body_start = start + len(marker)
     nxt = text.find(_SECTION_SEP + "# ", body_start)
     end = len(text) if nxt < 0 else nxt
     return text[:end], text[end:]

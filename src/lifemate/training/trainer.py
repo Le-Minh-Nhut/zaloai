@@ -29,6 +29,7 @@ import json
 import math
 import os
 import random
+import struct
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -43,9 +44,12 @@ from .collator import SupervisedCollator, build_supervised_example, to_torch_bat
 __all__ = [
     "CheckpointManager",
     "SFTTrainer",
+    "TRAINING_STATE_SCHEMA",
     "TrainResult",
     "TrainingInterrupted",
+    "TrainingProgress",
     "chunked_causal_lm_loss",
+    "dataset_order_hash",
     "forward_loss",
     "optimizer_steps_per_epoch",
     "read_training_state",
@@ -53,6 +57,14 @@ __all__ = [
 ]
 
 STATE_FILENAME = "training_state.json"
+
+#: Version of the ``progress`` block in ``training_state.json``. Schema 2 is the
+#: first version that records THE NEXT WORK ITEM (epoch permutation + cursor +
+#: every RNG stream), i.e. the first one an EXACT resume can be reconstructed
+#: from. A schema-1 checkpoint only knows the step counter, so its sampler
+#: position is unknowable; :meth:`SFTTrainer.resume` refuses it unless the caller
+#: explicitly opts into ``best_effort``.
+TRAINING_STATE_SCHEMA = 2
 
 #: Fallback when a config carries no sequence budget. Matches
 #: ``lifemate.config.TrainingConfig.max_seq_length`` so a hand-built TrainingConfig
@@ -70,6 +82,8 @@ CONFIG_HASH_IGNORED = (
     "logging_steps",
     "save_strategy",
     "eval_strategy",
+    "save_steps",
+    "eval_steps",
     "save_total_limit",
     "report_to",
     "dataloader_num_workers",
@@ -110,6 +124,17 @@ class TrainResult:
     runtime_s: float = 0.0
     checkpoint_dir: str | None = None
     metrics_history: list[dict[str, Any]] = field(default_factory=list)
+    #: Optimizer steps the GradScaler SKIPPED because a gradient was not finite.
+    #: They are not counted in ``steps`` (no parameter moved, no LR consumed).
+    skipped_steps: int = 0
+    #: The LR schedule horizon (independent of any early stop).
+    planned_total_steps: int | None = None
+    #: Early-stop limit, ``None`` when the run was not cut short by one.
+    stop_after_steps: int | None = None
+    #: ``False`` only after a best-effort (schema-1) resume.
+    exact_resume: bool = True
+    #: ``True`` when the horizon was deliberately changed on resume.
+    schedule_modified: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,7 +145,111 @@ class TrainResult:
             "runtime_s": self.runtime_s,
             "checkpoint_dir": self.checkpoint_dir,
             "metrics_history": list(self.metrics_history),
+            "skipped_steps": self.skipped_steps,
+            "planned_total_steps": self.planned_total_steps,
+            "stop_after_steps": self.stop_after_steps,
+            "exact_resume": self.exact_resume,
+            "schedule_modified": self.schedule_modified,
         }
+
+@dataclass
+class TrainingProgress:
+    """Resumable position: THE NEXT WORK ITEM, plus every stream needed to replay it.
+
+    ``global_step`` counts COMPLETED optimizer steps that actually updated the
+    parameters (a GradScaler-skipped step does not count). ``epoch_index`` is
+    1-based and names the epoch *in progress*; ``next_micro_index`` counts the
+    micro-batches already consumed in that epoch, so the next batch is
+    ``permutation[next_micro_index * micro_batch : ...]``. ``permutation`` is the
+    literal example order of that epoch and ``sampler_rng_state`` is the sampler
+    RNG *after* the shuffle that produced it, so epoch N+1.. match the
+    uninterrupted run.
+    """
+
+    schema_version: int = TRAINING_STATE_SCHEMA
+    global_step: int = 0
+    epoch_index: int = 0
+    next_micro_index: int = 0
+    permutation: list[int] = field(default_factory=list)
+    sampler_rng_state: list[int] = field(default_factory=list)
+    sampler_rng_gauss_next: float | None = None
+    planned_total_steps: int = 0
+    stop_after_steps: int | None = None
+    optimizer_steps_in_epoch: int = 0
+    epochs: float = 1.0
+    dataset_size: int = 0
+    dataset_order_hash: str | None = None
+    torch_rng_state: list[int] | None = None
+    cuda_rng_state: list[list[int]] | None = None
+    numpy_rng_state: dict[str, Any] | None = None
+    python_rng_state: list[int] | None = None
+    python_rng_gauss_next: float | None = None
+    pending_microbatches: int = 0
+    last_evaluated_step: int | None = None
+    last_saved_step: int | None = None
+    exact_resume: bool = True
+    schedule_modified: bool = False
+    #: Digest of the TRAINING-affecting feature switches (``None`` when the features
+    #: slice is absent). A resume across a change must be refused: the supervised
+    #: data distribution is not the one the optimizer was stepping on.
+    training_feature_fingerprint: str | None = None
+    #: Enabled feature ids, so a refusal can name what differs.
+    training_features: list[str] = field(default_factory=list)
+    world: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TrainingProgress":
+        """Build from a persisted ``progress`` block (unknown keys ignored)."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        values = {key: value for key, value in dict(payload or {}).items() if key in known}
+        progress = cls(**values)
+        progress.permutation = [int(i) for i in (progress.permutation or [])]
+        return progress
+
+def dataset_order_hash(examples: Sequence[Mapping[str, Any]]) -> str:
+    """16-hex digest of the training EXAMPLES in order (ids + labels).
+
+    Two runs whose hash differs see different tokens in a different order, so
+    their sampler positions are not interchangeable and a resume must refuse.
+    """
+    digest = hashlib.sha256()
+    for example in examples:
+        for key in ("input_ids", "labels"):
+            values = [int(v) for v in (example.get(key) or [])]
+            digest.update(len(values).to_bytes(4, "little"))
+            digest.update(struct.pack(f"<{len(values)}i", *values))
+    return digest.hexdigest()[:16]
+
+def _numpy_rng_state() -> dict[str, Any] | None:
+    """``numpy.random`` legacy MT19937 state as JSON-safe primitives (``None`` if absent)."""
+    try:  # pragma: no cover - optional dependency
+        import numpy as np  # noqa: PLC0415
+    except Exception:
+        return None
+    kind, keys, pos, has_gauss, cached = np.random.get_state()
+    return {
+        "kind": str(kind),
+        "keys": [int(k) for k in keys],
+        "pos": int(pos),
+        "has_gauss": int(has_gauss),
+        "cached": float(cached),
+    }
+
+def _restore_numpy_rng(payload: Mapping[str, Any]) -> None:
+    import numpy as np  # noqa: PLC0415 - only reached when a state was saved
+
+    np.random.set_state(
+        (
+            str(payload.get("kind") or "MT19937"),
+            np.array([int(k) for k in payload["keys"]], dtype=np.uint32),
+            int(payload["pos"]),
+            int(payload.get("has_gauss") or 0),
+            float(payload.get("cached") or 0.0),
+        )
+    )
 
 def set_seed(seed: int, deterministic: bool = False) -> dict[str, Any]:
     """Seed ``random``, ``numpy`` (if present) and ``torch`` (if present)."""
@@ -156,6 +285,18 @@ class CheckpointManager:
     policy can be tested without torch. ``payload`` carries ``model``,
     ``tokenizer``, ``state`` and ``meta``; the default writer delegates to
     :func:`lifemate.models.checkpoint.save_checkpoint`.
+
+    WRITE ORDER (a resumable checkpoint must never look complete while a piece is
+    missing). Inside one checkpoint directory the sequence is:
+
+    1. weights + tokenizer + ``lifemate_meta.json`` (``save_fn``),
+    2. ``finalize(target)`` — the optimizer/scheduler/GradScaler tensors,
+    3. ``training_state.json``, LAST.
+
+    ``training_state.json`` is the marker: schema 2 makes it claim
+    ``exact_resume: true``, so everything it vouches for must already be durable.
+    ``finalize`` is optional and defaults to ``None`` (weight-only checkpoints,
+    which is what the stdlib/test-double path uses); its return value is ignored.
     """
 
     def __init__(
@@ -174,8 +315,19 @@ class CheckpointManager:
     def step_dir(self, step: int, tag: str = "step") -> Path:
         return self.root / f"{tag}-{int(step)}"
 
-    def save(self, step: int, payload: Mapping[str, Any], tag: str = "step") -> Path:
-        """Write one checkpoint; refuses to reuse a populated directory."""
+    def save(
+        self,
+        step: int,
+        payload: Mapping[str, Any],
+        tag: str = "step",
+        finalize: Callable[[Path], Any] | None = None,
+    ) -> Path:
+        """Write one checkpoint; refuses to reuse a populated directory.
+
+        ``finalize`` runs AFTER the weights and BEFORE ``training_state.json``, so
+        the file that advertises resumability is written last (see the class
+        docstring for the full order). It may return anything; it is ignored.
+        """
         target = self.step_dir(step, tag)
         if target.exists() and any(target.iterdir()):
             raise LifeMateError(
@@ -184,20 +336,28 @@ class CheckpointManager:
             )
         target.mkdir(parents=True, exist_ok=True)
         written = Path(self.save_fn(target, payload))
+        if finalize is not None:
+            finalize(target)
         _atomic_write_json(target / STATE_FILENAME, dict(payload.get("state") or {}))
         if tag == "step":
             self._prune()
         return written
 
     def _prune(self) -> None:
-        """Keep the newest ``save_total_limit`` step dirs (0 = keep everything)."""
+        """Keep the newest ``save_total_limit`` step dirs (0 = keep everything).
+
+        The NEWEST step dir is never pruned, even with ``save_total_limit=1`` and
+        a resume about to read it: a checkpoint that a resume needs must survive
+        the write that follows it.
+        """
         if self.save_total_limit <= 0:
             return
         dirs = sorted(
             (path for path in self.root.glob("step-*") if path.is_dir()),
             key=lambda path: int(path.name.split("-")[-1]),
         )
-        for stale in dirs[: max(0, len(dirs) - self.save_total_limit)]:
+        keep = max(1, self.save_total_limit)
+        for stale in dirs[: max(0, len(dirs) - keep)]:
             _remove_tree(stale)
 
     def latest(self) -> Path | None:
@@ -377,6 +537,10 @@ class SFTTrainer:
         device: Any = "cpu",
         run_name: str = "sft",
         max_steps: int | None = None,
+        stop_after_steps: int | None = None,
+        planned_total_steps: int | None = None,
+        extend_horizon: bool = False,
+        best_effort: bool = False,
         stop: StopController | None = None,
         checkpoint_manager: CheckpointManager | None = None,
         is_lora: bool = False,
@@ -409,7 +573,24 @@ class SFTTrainer:
         self.grad_clip = float(getattr(training, "gradient_clip_norm", 1.0) or 0.0)
         self.log_every = int(log_every if log_every is not None else getattr(training, "logging_steps", 10) or 10)
         self.seed = int(getattr(training, "seed", 42) or 42)
+        # ``max_steps`` is the historical spelling of the early stop. It NEVER
+        # defines the LR schedule any more: a 2-step probe would otherwise define
+        # a 2-step cosine schedule for the real run.
+        self.stop_after_steps = (
+            int(stop_after_steps) if stop_after_steps is not None
+            else (int(max_steps) if max_steps is not None else None)
+        )
+        if self.stop_after_steps is not None and self.stop_after_steps <= 0:
+            self.stop_after_steps = None
+        # Schedule horizon, resolved in ``run()`` when ``None``.
+        self.planned_total_steps = int(planned_total_steps) if planned_total_steps else None
+        self.extend_horizon = bool(extend_horizon)
+        self.best_effort = bool(best_effort)
+        # Legacy attribute kept: some callers/tests read ``trainer.max_steps``.
         self.max_steps = max_steps
+        # Cadence: 0 falls back to logging_steps (documented in TrainingConfig).
+        self.save_every = int(getattr(training, "save_steps", 0) or 0) or None
+        self.eval_every = int(getattr(training, "eval_steps", 0) or 0) or None
         self.run_name = run_name
         self.checkpoint_manager = checkpoint_manager or CheckpointManager(
             getattr(training, "output_dir", "outputs/checkpoints"),
@@ -440,6 +621,32 @@ class SFTTrainer:
         self._last_saved_step: int | None = None
         self._last_evaluated_step: int | None = None
         self.metrics_history: list[dict[str, Any]] = []
+        # Exact-resume bookkeeping (see TrainingProgress).
+        self.progress = TrainingProgress(epochs=float(self.epochs))
+        self.exact_resume = True
+        self.schedule_modified = False
+        self.stop_after_requested = self.stop_after_steps
+        # Sampler RNG: seeded once for a fresh run, restored from the checkpoint
+        # for a resume so epoch N+1.. reproduce the uninterrupted permutations.
+        self._sampler_rng = random.Random(self.seed)
+        # Recorder proving whether the scaler actually applied an update.
+        self._update_recorder: dict[str, int] = {"applied": 0, "skipped": 0}
+        self.skipped_steps = 0
+        self.horizon: int = 0
+        self.scheduler_rebuilt = False
+        self._epoch_index = 0
+        self._current_step = 0
+        self._permutation: list[int] = []
+        self._cursor = 0
+        self._steps_in_epoch = 0
+        self._pending = 0
+        self._resumed_optimizer_steps: int | None = None
+        self._resumed_scheduler_state = False
+        self._scheduler_state_loaded = False
+        # Set by resume(): does the checkpoint carry the optimizer tensors it claims?
+        self._optimizer_state_present = True
+        # Set by resume(): did a guard accept this continuation only approximately?
+        self._exact_downgraded = False
 
     # ------------------------------------------------------------------ setup
     def _prepare_examples(self, records: Sequence[Mapping[str, Any]], split: str) -> list[dict[str, Any]]:
@@ -471,15 +678,23 @@ class SFTTrainer:
         return examples
 
     def _ensure_optimizer(self, num_training_steps: int) -> None:
-        if self.optimizer is not None and self.scheduler is not None:
-            return
-        from .full_finetuning import build_optimizer_and_scheduler  # noqa: PLC0415 - lazy
+        """Build the optimizer and scheduler, instrumenting the step BEFORE the schedule.
 
-        optimizer, scheduler = build_optimizer_and_scheduler(
-            self.model, self.cfg, num_training_steps
-        )
-        self.optimizer = self.optimizer or optimizer
-        self.scheduler = self.scheduler or scheduler
+        Order matters twice: the update recorder must be installed on the optimizer
+        before ``LambdaLR`` wraps ``optimizer.step`` (otherwise torch warns on every
+        ``scheduler.step()`` that the optimizer was overridden afterwards), and the
+        scheduler must be built over the instrumented optimizer for the same reason.
+        """
+        from .full_finetuning import build_optimizer_and_scheduler, build_scheduler  # noqa: PLC0415
+
+        if self.optimizer is None:
+            optimizer, _scheduler = build_optimizer_and_scheduler(
+                self.model, self.cfg, num_training_steps
+            )
+            self.optimizer = optimizer
+        self._install_update_recorder()
+        if self.scheduler is None:
+            self.scheduler = build_scheduler(self.optimizer, self.cfg, num_training_steps)
 
     def _make_grad_scaler(self):
         """A ``torch.amp.GradScaler`` for fp16-on-CUDA runs, else ``None``.
@@ -516,61 +731,91 @@ class SFTTrainer:
 
     # ------------------------------------------------------------------- loop
     def run(self) -> TrainResult:
-        """Train, evaluate per ``eval_strategy``, checkpoint per ``save_strategy``."""
+        """Train, evaluate per ``eval_strategy``, checkpoint per ``save_strategy``.
+
+        Two independent numbers drive the loop:
+
+        * ``self.horizon`` (``planned_total_steps``) — the LR schedule length,
+          derived from ``num_train_epochs`` and PERSISTED in every checkpoint so a
+          resume continues the original cosine trajectory;
+        * ``self.stop_after_steps`` — an early stop that ends the run without
+          redefining the schedule.
+        """
         started = time.time()
-        # A resumed run already restored torch/random state from the checkpoint;
-        # re-seeding here would silently restart the stream from scratch, so the
-        # RNG is only seeded for a fresh run (start_step == 0).
-        if self.start_step <= 0:
+        fresh = self.start_step <= 0
+        # A resumed run restored torch/random state from the checkpoint; re-seeding
+        # here would silently restart the stream from scratch.
+        if fresh:
             set_seed(self.seed)
+            self._sampler_rng = random.Random(self.seed)
         train_examples = self._prepare_examples(self.train_records, "train")
         val_examples = self._prepare_examples(self.val_records, "val") if self.val_records else []
+        self._train_examples = train_examples
+        self._val_examples = val_examples
+        self._ensure_dataset_order_hash(train_examples)
+
+        persisted = None if fresh else self.progress
+        if persisted is not None and persisted.dataset_order_hash and persisted.dataset_order_hash != self._dataset_order_hash:
+            raise LifeMateError(
+                "cannot resume: dataset order hash differs from the checkpoint "
+                f"(checkpoint {persisted.dataset_order_hash} != this run {self._dataset_order_hash}). "
+                "The training examples are not the same tokens in the same order (the dataset was "
+                "rebuilt, max_seq_length changed, or the records were reordered), so the sampler "
+                "position would replay different data. Re-run from scratch, or point --dataset-dir "
+                "at the dataset this checkpoint was trained on."
+            )
 
         steps_per_epoch = optimizer_steps_per_epoch(len(train_examples), self.micro_batch, self.accum)
-        total_steps = self.max_steps if self.max_steps is not None else int(math.ceil(steps_per_epoch * self.epochs))
-        total_steps = max(1, total_steps)
-        self._ensure_optimizer(total_steps)
-        if self.start_step > 0:
-            # A resumed run restored the checkpoint's scheduler, which was built for
-            # the *interrupted* run's step count. Left alone, every remaining step's
-            # LR comes from a schedule that already reached its horizon: the run
-            # silently trains at LR 0.0 (no learning, full compute cost). Rebuild the
-            # schedule on the restored optimizer for this run's real horizon, keeping
-            # the AdamW moments untouched.
+        derived = max(1, int(math.ceil(steps_per_epoch * self.epochs)))
+        horizon = self._resolve_horizon(persisted, derived)
+        self.horizon = horizon
+        self._ensure_optimizer(horizon)
+        if not fresh and (self.schedule_modified or not self._resumed_scheduler_state):
+            # Rebuild ONLY when the checkpoint carries no scheduler state, or when
+            # the horizon was deliberately changed. A restored scheduler already
+            # sits at ``last_epoch == start_step`` on the ORIGINAL horizon, which is
+            # exactly the trajectory an uninterrupted run would have taken.
             from .full_finetuning import build_scheduler  # noqa: PLC0415 - lazy
 
             self.scheduler = build_scheduler(
-                self.optimizer, self.cfg, total_steps, last_epoch=self.start_step
+                self.optimizer, self.cfg, horizon, last_epoch=self.start_step
             )
+            self.scheduler_rebuilt = True
 
         self.model.train()
-        step = self.start_step
-        epoch_index = 0
+        step = int(self.start_step)
         last_loss: float | None = None
         val_loss: float | None = None
         epochs_done = 0.0
-        order_source = list(range(len(train_examples)))
-        rng = random.Random(self.seed + self.start_step)
         checkpoint_dir = str(self.checkpoint_manager.root)
+        micro_count = max(1, math.ceil(len(train_examples) / self.micro_batch))
+        if fresh:
+            self._epoch_index, self._permutation, self._cursor, self._steps_in_epoch = 0, [], 0, 0
+        self._pending = 0
 
-        pending = 0  # micro-batches accumulated since the last optimizer step
-        def optimizer_step() -> None:
-            """One optimizer step; shared by the accumulate path and the flush."""
-            nonlocal step, pending, val_loss, checkpoint_dir
+        def optimizer_step() -> bool:
+            """One optimizer step; shared by the accumulate path and the flush.
+
+            Returns ``True`` when the parameters actually moved. A GradScaler
+            SKIPS the update on an inf/NaN gradient; that must not consume a step
+            number nor a scheduler tick.
+            """
+            nonlocal step, checkpoint_dir
             if self.scaler is not None:
                 # fp16: gradients are still multiplied by the loss scale here, and
                 # both the partial-group rescale and clip_grad_norm_ must see TRUE
                 # magnitudes, so unscale first and never scale twice.
                 self.scaler.unscale_(self.optimizer)
-            if 0 < pending < self.accum:
+            if 0 < self._pending < self.accum:
                 # Partial trailing group: gradients were scaled by 1/accum but only
                 # ``pending`` micro-batches contributed, so rescale by accum/pending
                 # to keep the effective loss scale identical to a full group.
-                factor = self.accum / pending
+                factor = self.accum / self._pending
                 for param in self.model.parameters():
                     if param.grad is not None:
                         param.grad.mul_(factor)
             self._clip_gradients()
+            before = self._update_recorder["applied"]
             if self.scaler is not None:
                 # Inf/NaN guard: ``step`` skips the update when a grad is not
                 # finite; ``update`` then backs the scale off.
@@ -578,37 +823,65 @@ class SFTTrainer:
                 self.scaler.update()
             else:
                 self.optimizer.step()
+            updated = self._update_recorder["applied"] > before
+            self.optimizer.zero_grad(set_to_none=True)
+            self._pending = 0
+            if not updated:
+                self.skipped_steps += 1
+                self.metrics_history.append({"step": step, "skipped_step": True})
+                self.tracker.log({"step": step, "skipped_step": 1})
+                return False
             if self.scheduler is not None:
                 self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            pending = 0
             step += 1
+            self._current_step = step
+            self._steps_in_epoch += 1
             self._maybe_log(step, last_loss)
-            # Step-based evaluation & saving
-            if val_examples and self.eval_strategy == "steps" and self._due("steps", step, total_steps):
+            if val_examples and self.eval_strategy == "steps" and self._due(self.eval_strategy, step, self.eval_every):
                 metrics = self.evaluate(val_examples)
                 val_loss = metrics["val_loss"]
-                self.metrics_history.append({"step": step, "epoch": epoch_index, **metrics})
+                self.metrics_history.append({"step": step, "epoch": self._epoch_index, **metrics})
                 self.tracker.log({"step": step, **metrics})
                 self._last_evaluated_step = step
-            if self.save_strategy == "steps" and self._due("steps", step, total_steps):
-                checkpoint_dir = str(self._save(step, epoch_index))
+            if self.save_strategy == "steps" and self._due(self.save_strategy, step, self.save_every):
+                checkpoint_dir = str(self._save(step, self._epoch_index))
+            return True
+
+        def finish_interrupt() -> None:
+            """Finish a partial group, then write the interrupt checkpoint."""
+            nonlocal checkpoint_dir
+            if self._pending:
+                optimizer_step()  # C: never checkpoint on a half-accumulated group
+            if self._last_saved_step == step:
+                # This step already has a durable checkpoint (steps cadence or the
+                # final save); reuse it instead of failing on a populated dir.
+                checkpoint_dir = str(self.checkpoint_manager.step_dir(step))
+            else:
+                checkpoint_dir = str(self._save(step, self._epoch_index, tag="interrupt"))
+            raise TrainingInterrupted(
+                f"stop requested; interrupt checkpoint written at step {step}",
+                step=step,
+                checkpoint_dir=checkpoint_dir,
+            )
 
         try:
-            while step < total_steps:
-                rng.shuffle(order_source)
-                epoch_index += 1
-                self.optimizer.zero_grad(set_to_none=True)
-
-                for micro in range(0, len(order_source), self.micro_batch):
-                    if step >= total_steps:
-                        break
-                    chunk = order_source[micro : micro + self.micro_batch]
+            epoch_start_step = step
+            while not self._limit_reached(step):
+                if not self._permutation or self._cursor >= micro_count:
+                    self._advance_epoch(len(train_examples))
+                    epoch_start_step = step
+                # Consume the epoch's micro-batches from the stored cursor. On a
+                # resume this skips exactly the ones the interrupted run already
+                # consumed: the permutation is replayed, never regenerated.
+                while self._cursor < micro_count and not self._limit_reached(step):
+                    start = self._cursor * self.micro_batch
+                    chunk = self._permutation[start : start + self.micro_batch]
                     batch = self.collator([train_examples[i] for i in chunk])
                     tensors = to_torch_batch(batch, self.device)
                     with self._autocast():
                         loss = _forward_loss(self.model, tensors, self.loss_chunk_tokens)
-                    pending += 1
+                    self._pending += 1
+                    self._cursor += 1
                     # Scale by the accumulation count; a short trailing group is
                     # rescaled by accum/pending before its optimizer step. Under
                     # fp16 the scaler multiplies that by its dynamic loss scale.
@@ -618,53 +891,65 @@ class SFTTrainer:
                     else:
                         scaled_loss.backward()
                     last_loss = float(loss.detach().item())
-
-                    if pending >= self.accum:
+                    if self._pending >= self.accum:
                         optimizer_step()
                         if self.stop.requested:
-                            checkpoint_dir = str(self._save(step, epoch_index, tag="interrupt"))
-                            raise TrainingInterrupted(
-                                f"stop requested; interrupt checkpoint written at step {step}",
-                                step=step,
-                                checkpoint_dir=checkpoint_dir,
-                            )
-                        if step >= total_steps:
-                            break
+                            finish_interrupt()
 
                 # Flush a partial accumulation group so no grad is silently dropped
                 # and the loop always makes progress (a dataset smaller than one
-                # effective batch would otherwise never step).
-                if pending and step < total_steps:
+                # effective batch would otherwise never step). Skipped at the run's
+                # limit so the run never overshoots its horizon / stop step.
+                if self._cursor >= micro_count and self._pending and not self._limit_reached(step):
                     optimizer_step()
                     if self.stop.requested:
-                        checkpoint_dir = str(self._save(step, epoch_index, tag="interrupt"))
-                        raise TrainingInterrupted(
-                            f"stop requested; interrupt checkpoint written at step {step}",
-                            step=step,
-                            checkpoint_dir=checkpoint_dir,
-                        )
-                epochs_done = epoch_index
+                        finish_interrupt()
 
-                # Epoch-based evaluation & saving (or final step if not yet evaluated/saved)
-                if val_examples and (self.eval_strategy == "epoch" or (step >= total_steps and self.eval_strategy != "no")):
-                    if self._last_evaluated_step != step:
-                        metrics = self.evaluate(val_examples)
-                        val_loss = metrics["val_loss"]
-                        self.metrics_history.append({"step": step, "epoch": epoch_index, **metrics})
-                        self.tracker.log({"step": step, **metrics})
-                        self._last_evaluated_step = step
-                if (self.save_strategy == "epoch" or (step >= total_steps and self.save_strategy != "no")) and self._due(self.save_strategy, step, total_steps):
-                    if self._last_saved_step != step:
-                        checkpoint_dir = str(self._save(step, epoch_index))
+                boundary = self._cursor >= micro_count
+                if boundary:
+                    epochs_done = float(self._epoch_index)
+                    if step == epoch_start_step:
+                        raise LifeMateError(
+                            f"epoch {self._epoch_index} produced no optimizer update: every gradient "
+                            "was non-finite and the scaler skipped all of them. The run cannot make "
+                            "progress; check the data (inf/NaN targets) or reduce the learning rate."
+                        )
+                final = self._limit_reached(step)
+                # Epoch-based evaluation & saving (always also at the run's final
+                # step, so an early stop leaves a resumable checkpoint). Both are
+                # deduplicated against the PERSISTED step numbers, so a resume never
+                # re-runs a step that was already evaluated/saved.
+                want_eval = self.eval_strategy not in {"no", "none"} and (
+                    final or self._due(self.eval_strategy, step, self.eval_every)
+                )
+                if val_examples and want_eval and self._last_evaluated_step != step:
+                    metrics = self.evaluate(val_examples)
+                    val_loss = metrics["val_loss"]
+                    self.metrics_history.append({"step": step, "epoch": self._epoch_index, **metrics})
+                    self.tracker.log({"step": step, **metrics})
+                    self._last_evaluated_step = step
+                want_save = self.save_strategy not in {"no", "none"} and (
+                    final or self._due(self.save_strategy, step, self.save_every)
+                )
+                if want_save and self._last_saved_step != step:
+                    checkpoint_dir = str(self._save(step, self._epoch_index))
+                if boundary and self.stop.requested:
+                    finish_interrupt()
         except TrainingInterrupted:
             raise
         except BaseException:
-            self._save_crash_safe(step, epoch_index)
+            self._save_crash_safe(step, self._epoch_index)
             raise
         finally:
             self.tracker.finish()
 
-        result = TrainResult(
+        if self._pending:  # pragma: no cover - every exit path commits or flushes
+            raise LifeMateError(
+                f"internal: run() finished with {self._pending} uncommitted micro-batch(es) of "
+                "gradient accumulation; the checkpoint boundary invariant was violated"
+            )
+
+        return TrainResult(
             steps=step,
             epochs=float(epochs_done),
             final_loss=last_loss,
@@ -672,16 +957,96 @@ class SFTTrainer:
             runtime_s=round(time.time() - started, 3),
             checkpoint_dir=checkpoint_dir,
             metrics_history=list(self.metrics_history),
+            skipped_steps=self.skipped_steps,
+            planned_total_steps=self.horizon,
+            stop_after_steps=self.stop_after_steps,
+            exact_resume=self.exact_resume,
+            schedule_modified=self.schedule_modified,
         )
-        return result
 
-    def _due(self, strategy: str, step: int, total_steps: int) -> bool:
-        """``epoch`` (here: end of each epoch) / ``steps`` / ``no``."""
+    def _limit_reached(self, step: int) -> bool:
+        """``True`` when the schedule horizon or the early stop is reached."""
+        if step >= int(self.horizon or 0):
+            return True
+        return self.stop_after_steps is not None and step >= self.stop_after_steps
+
+    def _resolve_horizon(self, persisted: TrainingProgress | None, derived: int) -> int:
+        """The LR schedule length, refusing an unannounced change on resume."""
+        stored = int(persisted.planned_total_steps) if persisted is not None and persisted.planned_total_steps else None
+        requested = self.planned_total_steps
+        if stored is None:
+            return max(1, int(requested or derived))
+        if requested is None or int(requested) == stored:
+            return max(1, stored)
+        if not self.extend_horizon:
+            raise LifeMateError(
+                "cannot resume: the schedule horizon differs from the checkpoint's "
+                f"(checkpoint planned_total_steps={stored}, this run requests {requested}). "
+                "Continuing would silently train a different LR trajectory, not a continuation. "
+                "Pass --extend-horizon (SFTTrainer(extend_horizon=True)) to authorise the change, "
+                "or drop --planned-steps to continue the recorded schedule."
+            )
+        self.schedule_modified = True
+        self._announce_horizon_change(stored, int(requested))
+        return max(1, int(requested))
+
+    def _announce_horizon_change(self, old: int, new: int) -> None:
+        """One loud line per run, however many times the change is observed."""
+        if getattr(self, "_horizon_change_announced", None) == (old, new):
+            return
+        self._horizon_change_announced = (old, new)
+        print(
+            f"schedule: HORIZON EXTENDED {old} -> {new} "
+            "(this run is a modified training schedule, not a continuation)"
+        )
+
+    def _ensure_dataset_order_hash(self, examples: Sequence[Mapping[str, Any]] | None = None) -> str | None:
+        """Digest of the tokenised examples in order (cached after the first call).
+
+        Shared by ``run()`` and ``resume()``: a checkpoint whose recorded order hash
+        differs must be refused BEFORE its weights are loaded.
+        """
+        if getattr(self, "_dataset_order_hash", None):
+            return self._dataset_order_hash
+        if examples is None:
+            if not self.train_records:
+                return None
+            # ``_prepare_examples`` records a diagnostic entry; a resume must not
+            # add a second one for the same split, so restore the list afterwards.
+            before = len(self.metrics_history)
+            try:
+                examples = self._prepare_examples(self.train_records, "train")
+            except LifeMateError:  # pragma: no cover - unusable records
+                del self.metrics_history[before:]
+                return None
+            del self.metrics_history[before:]
+            self._train_examples = examples
+        self._dataset_order_hash = dataset_order_hash(examples)
+        return self._dataset_order_hash
+
+    def _advance_epoch(self, n_examples: int) -> None:
+        """Start the next epoch: one shuffle from the persisted sampler stream."""
+        self._epoch_index += 1
+        order = list(range(int(n_examples)))
+        self._sampler_rng.shuffle(order)
+        self._permutation = order
+        self._cursor = 0
+        self._steps_in_epoch = 0
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _due(self, strategy: str, step: int, every: int | None = None) -> bool:
+        """``epoch`` (end of each epoch) / ``steps`` (every ``every``) / ``no``.
+
+        ``every`` is ``save_steps`` for ``save_strategy`` and ``eval_steps`` for
+        ``eval_strategy`` (0 in the config falls back to ``logging_steps``), so the
+        two cadences are independent. It was previously ``logging_steps`` for both.
+        """
         key = str(strategy or "epoch").lower()
-        if key in {"no", "none"}:
+        if key in {"no", "none"} or step <= 0:
             return False
         if key == "steps":
-            return step > 0 and step % max(1, self.log_every) == 0
+            cadence = int(every or self.log_every or 1)
+            return step % max(1, cadence) == 0
         return True
 
     def _clip_gradients(self) -> None:
@@ -804,31 +1169,220 @@ class SFTTrainer:
         }
 
     # ------------------------------------------------------------- checkpoint
-    def _state(self, step: int, epoch: int) -> dict[str, Any]:
-        config_hash = config_fingerprint(self.cfg)
-        state = {
-            "step": step,
-            "epoch": epoch,
-            "seed": self.seed,
-            "config_hash": config_hash,
-            "dataset_manifest_hash": self.dataset_manifest_hash,
-            "is_lora": self.is_lora,
-            "precision": self.precision,
+    def _install_update_recorder(self) -> None:
+        """Wrap the optimizer's bound ``step`` so a skipped update is detectable.
+
+        ``GradScaler.step(optimizer)`` calls ``optimizer.step()`` only when no
+        inf/NaN was found, so an invocation count IS the ground truth for "did the
+        parameters move". The recorder is a monkeypatched bound method kept on the
+        trainer (not an optimizer PROXY): ``build_scheduler``/``torch.save`` require
+        a real ``torch.optim.Optimizer``, and a proxy fails ``isinstance`` checks.
+        Idempotent per optimizer object.
+        """
+        import types  # noqa: PLC0415 - one local import, keeps the top clean
+
+        target = self.optimizer
+        if target is None or getattr(target, "_omp_step_recorded", False):
+            return
+        recorder = self._update_recorder
+        original = target.step
+
+        def recorded_step(_opt: Any, *args: Any, **kwargs: Any) -> Any:
+            recorder["applied"] = int(recorder.get("applied", 0)) + 1
+            return original(*args, **kwargs)
+
+        try:
+            # ``MethodType``, not a bare function: torch's LR scheduler re-wraps
+            # ``opt.step`` and reads ``step_fn.__func__``, which a plain function
+            # assigned to the instance does not have.
+            target.step = types.MethodType(recorded_step, target)  # type: ignore[method-assign]
+            target._omp_step_recorded = True  # type: ignore[attr-defined]
+        except (AttributeError, TypeError):  # pragma: no cover - exotic optimizer
+            return
+
+    def _feature_identity(self) -> dict[str, Any]:
+        """Training-affecting feature identity: ``{fingerprint, enabled}`` or empty.
+
+        Training features change the supervised DATA distribution, so a resume across
+        a change is not a continuation. Inference-only ids never move the
+        fingerprint (that is the registry's own split), and the enabled-id list is
+        stored alongside so the refusal can name exactly which flags differ.
+        """
+        features = getattr(self.cfg, "features", None)
+        if features is None:
+            return {}
+        try:  # pragma: no cover - depends on which slice the checkout carries
+            from lifemate.features.config import (  # noqa: PLC0415
+                enabled_features,
+                training_feature_fingerprint,
+            )
+        except ImportError:  # pragma: no cover - features slice absent
+            return {}
+        return {
+            "training_feature_fingerprint": training_feature_fingerprint(features),
+            "training_features": list(enabled_features(features)),
         }
+
+    def _world(self) -> dict[str, Any]:
+        """Identity of the training world; a mismatch means "not the same model"."""
+        from lifemate.models.profiles import resolve_profile  # noqa: PLC0415 - lazy
+
+        model_name = getattr(getattr(self.cfg, "model", None), "name", None)
+        tuning_mode = str(getattr(self.training, "tuning_mode", "lora" if self.is_lora else "full"))
+        return {
+            "model_id": model_name,
+            "model_profile": (self.profile.name if self.profile else resolve_profile(model_name or "").name),
+            "tuning_mode": tuning_mode,
+            "quantization": str(getattr(self.training, "quantization", "none") or "none"),
+            "precision": self.precision,
+            # A full fine-tune has no adapter, so ``lora.r`` is inert there (it is
+            # excluded from the config hash for the same reason): record ``None``
+            # rather than a rank that would refuse a legitimate resume.
+            "adapter_rank": (
+                int(getattr(getattr(self.cfg, "lora", None), "r", 0) or 0)
+                if tuning_mode in {"lora", "qlora"} else None
+            ),
+        }
+
+    def _cuda_rng_state(self) -> list[list[int]] | None:
+        try:  # pragma: no cover - GPU only
+            import torch  # noqa: PLC0415
+
+            if torch.cuda.is_available():
+                return [s.tolist() for s in torch.cuda.get_rng_state_all()]
+        except Exception:  # pragma: no cover - torch absent
+            return None
+        return None
+
+    def _optimizer_state_expected(self) -> bool:
+        """``True`` when this trainer can actually persist optimizer/scheduler tensors.
+
+        Drives ``exact_resume``: a run with no torch optimizer (or no torch at all)
+        writes a weight-only checkpoint, which is NOT an exact resume target
+        because AdamW moments and the GradScaler state cannot come back. That is
+        legitimate (the stdlib runner and test doubles) but must never be labelled
+        exact.
+        """
+        if self.optimizer is None:
+            return False
+        try:
+            import torch  # noqa: F401,PLC0415 - probe only
+
+            return True
+        except Exception:  # pragma: no cover - torch absent
+            return False
+
+    def _torch_rng_state(self) -> list[int] | None:
         try:
             import torch  # noqa: PLC0415
 
-            state["torch_rng_state"] = torch.get_rng_state().tolist()
-            if torch.cuda.is_available():  # pragma: no cover - GPU only
-                state["cuda_rng_state"] = [s.tolist() for s in torch.cuda.get_rng_state_all()]
+            return torch.get_rng_state().tolist()
         except Exception:  # pragma: no cover - torch absent
-            state["torch_rng_state"] = None
-        state["python_rng_state"] = list(random.getstate()[1])
+            return None
+
+    def progress_state(self) -> dict[str, Any]:
+        """The next-work-item snapshot this trainer would checkpoint right now.
+
+        Safe to call between runs and at the end of one (used by
+        ``scripts/verify_training_resume.py`` and the CLI's resume banner).
+        """
+        return self._progress_state(
+            int(self._current_step), int(self._epoch_index), allow_pending=True
+        ).to_dict()
+
+    def _progress_state(self, step: int, epoch: int, *, allow_pending: bool = False) -> TrainingProgress:
+        """Snapshot describing the NEXT work item at the current boundary."""
+        py_state = random.getstate()
+        sampler_state = self._sampler_rng.getstate()
+        if int(self._pending or 0) != 0 and not allow_pending:
+            raise LifeMateError(
+                f"internal: refusing to write a resumable checkpoint with {self._pending} "
+                "micro-batch(es) of uncommitted gradients; checkpoint only at an optimizer-step "
+                "or epoch boundary"
+            )
+        identity = self._feature_identity()
+        progress = TrainingProgress(
+            schema_version=TRAINING_STATE_SCHEMA,
+            global_step=int(step),
+            epoch_index=int(epoch),
+            next_micro_index=int(self._cursor if self._permutation else 0),
+            permutation=list(self._permutation),
+            # Compact JSON-safe form: the internal 625-word tuple + gauss cache.
+            sampler_rng_state=[int(v) for v in sampler_state[1]],
+            sampler_rng_gauss_next=(
+                float(sampler_state[2]) if sampler_state[2] is not None else None
+            ),
+            planned_total_steps=int(getattr(self, "horizon", 0) or 0),
+            stop_after_steps=self.stop_after_steps,
+            optimizer_steps_in_epoch=int(self._steps_in_epoch),
+            epochs=float(self.epochs),
+            dataset_size=len(getattr(self, "_train_examples", []) or []),
+            dataset_order_hash=getattr(self, "_dataset_order_hash", None),
+            torch_rng_state=self._torch_rng_state(),
+            cuda_rng_state=self._cuda_rng_state(),
+            numpy_rng_state=_numpy_rng_state(),
+            python_rng_state=[int(v) for v in py_state[1]],
+            python_rng_gauss_next=(
+                float(py_state[2]) if py_state[2] is not None else None
+            ),
+            pending_microbatches=int(self._pending or 0),
+            last_evaluated_step=self._last_evaluated_step,
+            last_saved_step=self._last_saved_step,
+            exact_resume=bool(self.exact_resume) and self._optimizer_state_expected(),
+            schedule_modified=bool(self.schedule_modified),
+            training_feature_fingerprint=identity.get("training_feature_fingerprint"),
+            training_features=list(identity.get("training_features") or []),
+            world={**self._world(), **identity},
+        )
+        return progress
+
+    def _state(self, step: int, epoch: int, *, allow_pending: bool = False) -> dict[str, Any]:
+        """``training_state.json`` payload: legacy keys + the schema-2 ``progress`` block."""
+        progress = self._progress_state(step, epoch, allow_pending=allow_pending)
+        world = progress.world
+        state = {
+            # --- legacy keys: read by existing notebooks/tests, keep every one ---
+            "step": step,
+            "epoch": epoch,
+            "seed": self.seed,
+            "config_hash": config_fingerprint(self.cfg),
+            "dataset_manifest_hash": self.dataset_manifest_hash,
+            "is_lora": self.is_lora,
+            "precision": self.precision,
+            "torch_rng_state": progress.torch_rng_state,
+            "cuda_rng_state": progress.cuda_rng_state,
+            "python_rng_state": progress.python_rng_state,
+            # --- schema 2 ---
+            "schema_version": TRAINING_STATE_SCHEMA,
+            "exact_resume": progress.exact_resume,
+            "schedule_modified": progress.schedule_modified,
+            "progress": progress.to_dict(),
+            "world": world,
+            "training_feature_fingerprint": progress.training_feature_fingerprint,
+            "training_features": list(progress.training_features),
+        }
+        # One step counter, asserted: the legacy ``step`` and the progress block
+        # cannot disagree (a second counter is how resume bugs are born).
+        assert state["step"] == state["progress"]["global_step"], (
+            state["step"],
+            state["progress"]["global_step"],
+        )
         return state
 
     def _save(self, step: int, epoch: int, tag: str = "step") -> Path:
+        """Write one checkpoint: weights -> optimizer_state.pt -> training_state.json.
+
+        The order is the guarantee. ``training_state.json`` claims
+        ``exact_resume: true`` and carries the sampler cursor, so it must not exist
+        until the optimizer/scheduler/scaler tensors it vouches for are durable —
+        otherwise a crash in between leaves a directory that ``resume()`` would
+        accept as exact while AdamW silently restarts from zero moments. The
+        tensors are therefore written through ``CheckpointManager.save``'s
+        ``finalize`` hook, which runs before the last (state) write.
+        """
         if tag == "step" and self._last_saved_step == step:
             return self.checkpoint_manager.step_dir(step, tag)
+        world = self._world()
         payload = {
             "model": self.model,
             "tokenizer": self.tokenizer,
@@ -842,25 +1396,45 @@ class SFTTrainer:
                 "seed": self.seed,
                 "config": _cfg_dict(self.cfg),
                 "dataset_manifest_hash": self.dataset_manifest_hash,
-                "tuning_mode": str(
-                    getattr(self.training, "tuning_mode", "lora" if self.is_lora else "full")
-                ),
+                "dataset_order_hash": getattr(self, "_dataset_order_hash", None),
+                "config_hash": config_fingerprint(self.cfg),
+                "tuning_mode": world["tuning_mode"],
+                "quantization": world["quantization"],
+                "precision": self.precision,
+                "adapter_rank": world["adapter_rank"],
+                "planned_total_steps": int(getattr(self, "horizon", 0) or 0),
+                "global_step": int(step),
+                "schema_version": TRAINING_STATE_SCHEMA,
+                "exact_resume": bool(self.exact_resume) and self._optimizer_state_expected(),
+                "schedule_modified": bool(self.schedule_modified),
+                **self._feature_identity(),
             },
         }
-        written = self.checkpoint_manager.save(step, payload, tag=tag)
-        self._save_optimizer_state(written, step, epoch)
+        written = self.checkpoint_manager.save(
+            step,
+            payload,
+            tag=tag,
+            finalize=lambda target: self._save_optimizer_state(target, step, epoch),
+        )
         if tag == "step":
             self._last_saved_step = step
         return written
 
-    def _save_optimizer_state(self, checkpoint_dir: Path, step: int, epoch: int) -> None:
-        """Optimizer/scheduler tensors via ``torch.save`` (skipped without torch)."""
+    def _save_optimizer_state(self, checkpoint_dir: Path, step: int, epoch: int) -> bool:
+        """Optimizer/scheduler tensors via ``torch.save``; ``True`` when written.
+
+        Runs as ``CheckpointManager.save(finalize=...)``, i.e. BEFORE
+        ``training_state.json``. Returns ``False`` when there is nothing to write
+        (no torch, or no optimizer) so the caller can refuse to claim exactness;
+        a genuine write failure with a live optimizer raises instead, because that
+        must never be published as a resumable step.
+        """
         try:
             import torch  # noqa: PLC0415
-        except Exception:
-            return
+        except Exception:  # pragma: no cover - torch absent (stdlib runner)
+            return False
         if self.optimizer is None:
-            return
+            return False
         payload = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict() if self.scheduler is not None else None,
@@ -868,31 +1442,52 @@ class SFTTrainer:
             "grad_scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "step": step,
             "epoch": epoch,
+            # The horizon the scheduler state belongs to; a resume compares it
+            # against the persisted ``planned_total_steps`` before trusting it.
+            "planned_total_steps": int(getattr(self, "horizon", 0) or 0),
+            "scheduler_class": type(self.scheduler).__name__ if self.scheduler is not None else None,
         }
         tmp = checkpoint_dir / "optimizer_state.pt.tmp"
         try:
             torch.save(payload, tmp)
             os.replace(tmp, checkpoint_dir / "optimizer_state.pt")
-        except Exception:  # pragma: no cover - fake optimizers
+        except Exception as exc:  # pragma: no cover - unserialisable state
             tmp.unlink(missing_ok=True)
+            raise LifeMateError(
+                f"failed to write optimizer state to {checkpoint_dir}: {exc}. The checkpoint "
+                "would resume with AdamW moments reset to zero, so it was not published."
+            ) from exc
+        return True
 
     def _save_crash_safe(self, step: int, epoch: int) -> None:
-        """Best-effort ``crash-<step>`` state; never masks the original error."""
+        """Best-effort ``crash-<step>`` state; never masks the original error.
+
+        A crash can land mid-accumulation, so this checkpoint deliberately records
+        a nonzero ``pending_microbatches``: it exists to be diagnosed, and
+        :meth:`resume` refuses it for an EXACT resume.
+        """
         try:
             target = self.checkpoint_manager.step_dir(step, "crash")
             target.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(target / STATE_FILENAME, self._state(step, epoch))
+            _atomic_write_json(target / STATE_FILENAME, self._state(step, epoch, allow_pending=True))
         except Exception:  # pragma: no cover - disk full etc.
             return
 
-    def resume(self, checkpoint_dir: str | Path) -> int:
-        """Load weights + optimizer state from ``checkpoint_dir``; return its step.
+    def resume(self, checkpoint_dir: str | Path, *, best_effort: bool | None = None) -> int:
+        """Restore weights + optimizer + sampler position from ``checkpoint_dir``.
 
-        Fails loudly when the checkpoint is unreadable, when its step is not
-        monotonic with respect to ``start_step``, or when a LoRA checkpoint is
-        resumed into a full fine-tuning run (or vice versa).
+        Returns the completed optimizer step. Fails loudly when the checkpoint is
+        unreadable/stateless, when its tuning mode, dataset or config differ, when
+        the world (model profile, quantization, adapter rank) differs, when it has
+        no ``optimizer_state.pt`` (see :meth:`_require_optimizer_state`), when the
+        schedule horizon differs without ``extend_horizon``, when it was written
+        mid-accumulation, or when it predates schema 2.
+        ``best_effort`` defaults to the trainer's own flag (CLI:
+        ``--best-effort-resume``); it downgrades every one of those to an
+        approximate continuation and sets ``exact_resume = False``.
         """
         path = Path(str(checkpoint_dir))
+        effort = self.best_effort if best_effort is None else bool(best_effort)
         state = read_training_state(path)
         if not state:
             raise LifeMateError(
@@ -926,6 +1521,35 @@ class SFTTrainer:
                     "max_seq_length, batch settings, epochs, scheduler, tuning_mode)"
                 )
 
+        progress = self._read_progress(path, state, effort)
+        if progress.dataset_order_hash:
+            current = self._ensure_dataset_order_hash()
+            if current and current != progress.dataset_order_hash:
+                raise LifeMateError(
+                    "cannot resume: dataset order hash differs from the checkpoint "
+                    f"(checkpoint {progress.dataset_order_hash} != this run {current}). "
+                    "The training examples are not the same tokens in the same order (the dataset "
+                    "was rebuilt, max_seq_length changed, or the records were reordered), so the "
+                    "sampler position would replay different data. Point --dataset-dir at the "
+                    "dataset this checkpoint was trained on, or re-run from scratch."
+                )
+        self._check_world(path, state, progress)
+        self._check_manifest_compat(path)
+        stored_horizon = int(progress.planned_total_steps or 0)
+        if stored_horizon and self.planned_total_steps and stored_horizon != int(self.planned_total_steps):
+            if not self.extend_horizon:
+                raise LifeMateError(
+                    "cannot resume: the schedule horizon differs from the checkpoint's "
+                    f"(checkpoint planned_total_steps={stored_horizon}, this run requests "
+                    f"{int(self.planned_total_steps)}). Continuing would silently train a "
+                    "different LR trajectory. Pass --extend-horizon / SFTTrainer(extend_horizon=True) "
+                    "to authorise it, or drop --planned-steps to keep the recorded schedule."
+                )
+            self.schedule_modified = True
+            self._announce_horizon_change(stored_horizon, int(self.planned_total_steps))
+
+        self._check_feature_identity(path, progress, effort)
+        self._require_optimizer_state(path, step, effort)
         self._load_weights(path)
         # The optimizer does not exist yet on a fresh trainer, so build it before
         # restoring; otherwise ``_load_optimizer_state`` returns early and the AdamW
@@ -933,23 +1557,266 @@ class SFTTrainer:
         # Only do it when the checkpoint actually carries optimizer state, so models
         # without parameters (test doubles) keep working.
         if self.optimizer is None and (path / "optimizer_state.pt").is_file():
-            self._ensure_optimizer(self.max_steps or max(1, step))
+            self._ensure_optimizer(stored_horizon or int(self.planned_total_steps or 0) or max(1, step))
+        self._install_update_recorder()
         self._load_optimizer_state(path)
-        torch_rng = state.get("torch_rng_state")
-        if torch_rng is not None:
+        self._resumed_scheduler_state = bool(self._scheduler_state_loaded) and not self.schedule_modified
+        if self.scheduler is not None and not self.schedule_modified:
+            # Guard the restored schedule: a scheduler state built for a different
+            # horizon would put every remaining step at the wrong LR.
+            last_epoch = int(getattr(self.scheduler, "last_epoch", step) or 0)
+            if last_epoch > 0 and last_epoch != step:
+                raise LifeMateError(
+                    f"cannot resume: the checkpoint's scheduler sits at last_epoch={last_epoch} "
+                    f"but the checkpoint records step {step}. The saved schedule does not belong "
+                    "to this step; re-run from scratch or resume an older checkpoint."
+                )
+
+        self._restore_rng(state, progress, exact=not effort)
+        self.progress = progress
+        self.progress.global_step = step  # the single counter, asserted below
+        self.start_step = step
+        self._current_step = step
+        self._epoch_index = int(progress.epoch_index)
+        self._permutation = list(progress.permutation)
+        self._cursor = int(progress.next_micro_index)
+        self._steps_in_epoch = int(progress.optimizer_steps_in_epoch)
+        self._last_evaluated_step = progress.last_evaluated_step
+        self._last_saved_step = progress.last_saved_step
+        # Exactness needs ALL of: the checkpoint says so, no effort downgrade was
+        # requested, and the optimizer state it vouches for is actually here.
+        self.exact_resume = (
+            bool(progress.exact_resume)
+            and not effort
+            and self._optimizer_state_present
+            and not self._exact_downgraded
+        )
+        if progress.sampler_rng_state:
+            self._sampler_rng.setstate(
+                (3, tuple(int(v) for v in progress.sampler_rng_state), progress.sampler_rng_gauss_next)
+            )
+        if stored_horizon:
+            self.planned_total_steps = (
+                int(self.planned_total_steps) if self.schedule_modified else stored_horizon
+            )
+        assert self.progress.global_step == int(state.get("step") or 0)
+        return step
+
+    def _read_progress(self, path: Path, state: Mapping[str, Any], effort: bool) -> TrainingProgress:
+        """The schema-2 progress block, or a best-effort/refused reconstruction."""
+        schema = int(state.get("schema_version") or 1)
+        raw = state.get("progress")
+        block = dict(raw) if isinstance(raw, Mapping) else {}
+        if schema >= TRAINING_STATE_SCHEMA and block.get("permutation"):
+            progress = TrainingProgress.from_dict(block)
+            if int(progress.pending_microbatches or 0) != 0:
+                if not effort:
+                    raise LifeMateError(
+                        f"cannot resume exactly: {path} was written with "
+                        f"{progress.pending_microbatches} uncommitted micro-batch(es) of gradient "
+                        "accumulation, so its optimization boundary is not consistent. That "
+                        "checkpoint comes from a crash, not an optimizer step. Re-run from scratch "
+                        "or pass best_effort=True / --best-effort-resume to continue approximately."
+                    )
+                progress.exact_resume = False
+            if effort:
+                # Loud, and never labelable as exact (requirement J).
+                print("resume: BEST EFFORT (not exact)")
+            return progress
+        if not effort:
+            raise LifeMateError(
+                f"cannot resume exactly: this checkpoint predates exact-resume state "
+                f"(schema {schema}); its sampler position cannot be reconstructed. Re-run from "
+                "scratch, or pass best_effort=True/--best-effort-resume to continue approximately "
+                "(a DIFFERENT sample order; not equivalent to the uninterrupted run)"
+            )
+        print("resume: BEST EFFORT (not exact)")
+        # Approximate continuation: start epoch 1 and let the sampler RNG produce
+        # a fresh order. Never labelled exact.
+        return TrainingProgress(
+            schema_version=TRAINING_STATE_SCHEMA,
+            global_step=int(state.get("step") or 0),
+            epoch_index=int(state.get("epoch") or 0),
+            next_micro_index=0,
+            permutation=[],
+            planned_total_steps=int(state.get("planned_total_steps") or 0),
+            epochs=float(self.epochs),
+            dataset_order_hash=None,
+            exact_resume=False,
+        )
+
+    def _check_feature_identity(
+        self, path: Path, progress: TrainingProgress, effort: bool
+    ) -> None:
+        """Refuse a resume across a change in TRAINING-affecting feature flags.
+
+        Training features change what the model is supervised on, so the AdamW
+        trajectory of the checkpoint is not reproducible under new flags — that is a
+        different experiment, not a continuation. Inference-only ids are excluded by
+        the registry's own ``training_feature_fingerprint`` split.
+        """
+        stored = progress.training_feature_fingerprint
+        if not stored:
+            return
+        current_identity = self._feature_identity()
+        current = current_identity.get("training_feature_fingerprint")
+        if not current or str(current) == str(stored):
+            return
+        stored_ids = list(progress.training_features or [])
+        current_ids = list(current_identity.get("training_features") or [])
+        changed = sorted(set(stored_ids) ^ set(current_ids))
+        detail = f"; differing flags: {changed}" if changed else ""
+        message = (
+            "cannot resume: the training-feature fingerprint differs from the checkpoint's "
+            f"(checkpoint {stored}, this run {current}){detail}. Training features change the "
+            "supervised data distribution, so this is a different experiment, not a continuation "
+            "of the checkpointed one. Resume with the config the checkpoint was trained under, or "
+            "re-run from scratch."
+        )
+        if not effort:
+            raise LifeMateError(message)
+        # Lasting downgrade: the exactness assignment at the end of resume() composes
+        # this with the other requirements (a bare ``exact_resume = False`` here
+        # would be overwritten).
+        print("resume: BEST EFFORT (not exact)")
+        self._exact_downgraded = True
+
+    def _require_optimizer_state(self, path: Path, step: int, effort: bool) -> None:
+        """Refuse a step dir whose ``optimizer_state.pt`` is missing (weight-only).
+
+        ``training_state.json`` is written LAST, but a crash (or OOM/disconnect)
+        between an older writer's two writes — or a hand-copied directory, or the
+        notebook's adapter-only export — can leave a state file that claims
+        ``exact_resume: true`` beside no optimizer tensors. Accepting it would
+        rebuild AdamW from zero moments while the report still said "exact", which
+        is exactly the disagreement this schema exists to prevent.
+
+        GATED on ``self.optimizer is not None or any weight files exist``: a
+        ``save_fn``-injected test double has neither, and its checkpoints carry no
+        optimizer file by construction. Those keep resuming as before.
+        """
+        if (path / "optimizer_state.pt").is_file():
+            if self._optimizer_state_expected():
+                self._optimizer_state_present = True
+            return
+        has_weights = bool(
+            list(path.glob("*.safetensors")) + list(path.glob("pytorch_model*.bin"))
+        )
+        if self.optimizer is None and not has_weights:
+            # Test-double / stdlib checkpoint: no optimizer was ever persisted, so
+            # there is nothing to restore and nothing to lose. Not exact, though:
+            # a real continuation would still need those moments.
+            self._optimizer_state_present = False
+            return
+        if effort:
+            print("resume: BEST EFFORT (not exact)")
+            self._optimizer_state_present = False
+            return
+        raise LifeMateError(
+            f"cannot resume exactly: {path} has no optimizer_state.pt (step {step}), so the "
+            "AdamW moments, the LR-scheduler position and any GradScaler state cannot be "
+            "restored. Resuming would restart the optimizer from zero moments — loading the "
+            "weights alone is adapter-only loading, NOT a resume. Fix: pass best_effort=True / "
+            "--best-effort-resume to continue approximately (that run prints 'resume: BEST "
+            "EFFORT (not exact)'), resume an older checkpoint of this run that carries "
+            "optimizer_state.pt, or re-run from scratch."
+        )
+
+    def _check_manifest_compat(self, path: Path) -> None:
+        """Cross-check ``lifemate_meta.json`` (Phase 3.9 manifest provenance).
+
+        The trainer's own ``_check_world`` reads ``training_state.json``; the
+        manifest is the surface a loader/export tool reads, so both are verified.
+        Only fields the checkpoint actually recorded are compared.
+        """
+        try:
+            from lifemate.models.checkpoint import check_checkpoint_compat  # noqa: PLC0415 - lazy
+        except ImportError:  # pragma: no cover - models slice absent
+            return
+        world = self._world()
+        # ``config_hash`` / ``dataset_manifest_hash`` are checked by ``resume()``
+        # itself with richer messages, and ``dataset_order_hash`` needs the
+        # tokenised examples, which only ``run()`` builds; do not double-report.
+        check_checkpoint_compat(
+            path,
+            model_profile=world["model_profile"],
+            tuning_mode=world["tuning_mode"],
+            quantization=world["quantization"],
+            precision=world["precision"],
+            adapter_rank=world["adapter_rank"],
+            allow_horizon_change=self.extend_horizon,
+        )
+
+    def _check_world(self, path: Path, state: Mapping[str, Any], progress: TrainingProgress) -> None:
+        """Refuse a checkpoint from a different model world (profile/mode/quant/dtype)."""
+        recorded = dict(progress.world or state.get("world") or {})
+        if not recorded:
+            return
+        current = self._world()
+        for key, label, fix in (
+            ("model_profile", "model profile",
+             "pass the --model this checkpoint was trained with"),
+            ("tuning_mode", "tuning mode",
+             "pass --tuning to match the checkpoint (lora into qlora is not a continuation)"),
+            ("quantization", "quantization",
+             "match training.quantization from the checkpoint (lora and qlora are different maths)"),
+            ("precision", "precision", "match training.precision from the checkpoint"),
+            ("adapter_rank", "adapter rank",
+             "match lora.r from the checkpoint (the adapter shapes differ)"),
+        ):
+            old, new = recorded.get(key), current.get(key)
+            if old in (None, "") or new in (None, "") or str(old) == str(new):
+                continue
+            raise LifeMateError(
+                f"cannot resume: checkpoint {label} differs from this run's "
+                f"(checkpoint {key}={old!r} != this run {new!r}) at {path}. "
+                f"The optimizer state and weights would not describe the same model; {fix}."
+            )
+
+    def _restore_rng(
+        self, state: Mapping[str, Any], progress: TrainingProgress, *, exact: bool
+    ) -> None:
+        """Restore python/torch/cuda/numpy RNG exactly, or raise on request.
+
+        Never ``except: pass``: a silently unrestored stream is precisely the
+        non-reproducibility this schema exists to remove.
+        """
+        def fail(what: str, exc: Exception) -> None:
+            if exact:
+                raise LifeMateError(
+                    f"cannot resume exactly: restoring the {what} RNG state failed ({exc}). "
+                    "The continuation would not replay the interrupted run. Pass best_effort=True "
+                    "to accept an approximate continuation, or fix the environment."
+                ) from exc
+
+        py_state = progress.python_rng_state or state.get("python_rng_state")
+        if py_state:
+            try:
+                random.setstate(
+                    (3, tuple(int(v) for v in py_state), progress.python_rng_gauss_next)
+                )
+            except Exception as exc:  # pragma: no cover - corrupt state
+                fail("python", exc)
+        torch_rng = progress.torch_rng_state or state.get("torch_rng_state")
+        cuda_rng = progress.cuda_rng_state or state.get("cuda_rng_state")
+        if torch_rng is not None or cuda_rng is not None:
             try:
                 import torch  # noqa: PLC0415
-                torch.set_rng_state(torch.tensor(torch_rng, dtype=torch.uint8))
-            except Exception:  # pragma: no cover
-                pass
-        py_rng = state.get("python_rng_state")
-        if py_rng is not None:
+
+                if torch_rng is not None:
+                    torch.set_rng_state(torch.tensor(list(torch_rng), dtype=torch.uint8))
+                if cuda_rng and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(
+                        [torch.tensor(list(s), dtype=torch.uint8) for s in cuda_rng]
+                    )
+            except Exception as exc:  # pragma: no cover - torch absent
+                fail("torch/cuda", exc)
+        numpy_state = progress.numpy_rng_state
+        if numpy_state:
             try:
-                random.setstate((3, tuple(py_rng), None))
-            except Exception:  # pragma: no cover
-                pass
-        self.start_step = step
-        return step
+                _restore_numpy_rng(numpy_state)
+            except Exception as exc:  # pragma: no cover - numpy absent
+                fail("numpy", exc)
 
     def _load_weights(self, path: Path) -> None:
         """Restore weights: peft adapter, a test hook, or a plain state dict."""
@@ -1025,6 +1892,7 @@ class SFTTrainer:
             self.optimizer.load_state_dict(payload["optimizer"])
             if self.scheduler is not None and payload.get("scheduler") is not None:
                 self.scheduler.load_state_dict(payload["scheduler"])
+                self._scheduler_state_loaded = True
             if self.scaler is not None and payload.get("grad_scaler"):
                 self.scaler.load_state_dict(payload["grad_scaler"])
         except Exception as exc:

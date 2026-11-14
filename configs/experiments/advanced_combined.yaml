@@ -1,0 +1,10 @@
+# EXPERIMENT OVERLAY — changes ONLY the `features:` section.
+# Combined ablation: Gipformer-1.5 + N-best ASR + ITN + schema guardrail.
+features:
+  asr:
+    gipformer_v15_enabled: true
+    nbest_enabled: true
+  prompt:
+    itn_enabled: true
+  postprocessing:
+    enhanced_schema_guardrail_enabled: true

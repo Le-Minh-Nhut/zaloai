@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from lifemate.errors import LifeMateError
 from lifemate.models.profiles import ModelProfile, profile_for_model, profile_for_tokenizer, resolve_profile
@@ -134,6 +134,8 @@ class HFGenerator:
         top_p: float | None = None,
         profile: ModelProfile | None = None,
         model_name: str | None = None,
+        constrained: bool = False,
+        allowed_tools: Iterable[str] | None = None,
     ) -> None:
         if model is None or tokenizer is None:
             raise LifeMateError("HFGenerator requires both a model and a tokenizer")
@@ -164,6 +166,13 @@ class HFGenerator:
         )
         self.device = device
         self.stop_on_action = bool(stop_on_action)
+        # Action-grammar masking (features.decoding.constrained_decoding_enabled).
+        # ``allowed_tools`` is PER SAMPLE — each sample has its own installed apps
+        # and registry view, while the generator is built once — hence the setter
+        # below. An EMPTY allow-list is legitimate for a finish-only sample: the
+        # grammar then permits only ``{"type": "finish"}``. It is not an error.
+        self.constrained = bool(constrained)
+        self.allowed_tools: tuple[str, ...] = tuple(allowed_tools or ())
         self.stop_ids = resolve_stop_ids(tokenizer, model, self.profile)
         self.stats = GenerationStats()
         try:
@@ -173,6 +182,10 @@ class HFGenerator:
         except Exception:
             pass
         self._last_stopping: Any = None  # keeps the criterion alive during decode
+
+    def set_allowed_tools(self, tools: Iterable[str] | None) -> None:
+        """Set the tool names the constrained grammar may emit (per sample)."""
+        self.allowed_tools = tuple(str(name) for name in (tools or ()) if str(name).strip())
 
     # ------------------------------------------------------------------ chat
     def build_prompt(self, messages: Sequence[dict[str, str]]) -> str:
@@ -235,7 +248,22 @@ class HFGenerator:
             kwargs["stopping_criteria"] = stopping
 
         with torch.no_grad():
-            output = self.model.generate(**inputs, **kwargs)
+            if self.constrained:
+                # Exactly the same kwargs as the unconstrained call below; the
+                # grammar only adds a logits processor. An empty allow-list is
+                # passed through: the grammar then permits finish only.
+                from lifemate.models.constrained import constrained_generate  # noqa: PLC0415
+
+                output = constrained_generate(
+                    self.model,
+                    self.tokenizer,
+                    inputs,
+                    enabled=True,
+                    allowed_tools=self.allowed_tools,
+                    **kwargs,
+                )
+            else:
+                output = self.model.generate(**inputs, **kwargs)
 
         new_tokens = output[0][prompt_len:]
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)

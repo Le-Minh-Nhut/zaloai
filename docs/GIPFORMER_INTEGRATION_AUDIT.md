@@ -77,7 +77,7 @@ Worker W4 owns Vietnamese normalization (`to_llm_text` / `for_wer` in `src/lifem
 - **Repository**: `g-group-ai-lab/gipformer-68M-rnnt`
 - **Revision**: `318322b009200f8e77a3751fa64638e5cc85a7dc`
 - **Architecture**: `ZipformerRnntModel` (`zipformer-transducer`)
-- **Version 1.5 Restriction**: Upstream default `DEFAULT_VERSION = "1.5"` resolves `g-group-ai-lab/gipformer1.5-68M-rnnt`, a different model. The codebase hard-pins `g-group-ai-lab/gipformer-68M-rnnt` at the exact commit above and explicitly rejects any model ID referencing `1.5`.
+- **Version 1.5**: Upstream default `DEFAULT_VERSION = "1.5"` resolves `g-group-ai-lab/gipformer1.5-68M-rnnt`, a different model, and this machine has **no weights** for it (no local directory, no HF cache entry). Support is spec-driven rather than a substring rejection: `src/lifemate/asr/model_specs.py` holds one `GipformerSpec` per known checkpoint. The 1.5 entry is marked `[UNVERIFIED]` (file set, revision, token count and decoder config were never observed) and declares no artifact set, so `AppConfig.validate()` accepts the *id* while `GipformerBackend` refuses to build a recognizer from it. An **unknown** gipformer id is a `ConfigError` listing the known ids — never a silent fallback to the 68M checkpoint. The default checkpoint stays `g-group-ai-lab/gipformer-68M-rnnt` at the exact commit above.
 
 ### File Sizes & Quantization Flavour Mapping
 
@@ -185,7 +185,7 @@ Counts measured 2026-11-08 on this host; re-run the four commands to refresh.
 ### Test Items Verified (tests/test_gipformer.py)
 1. Default backend is `gipformer` in `AppConfig`, `base.yaml`, `inference.yaml`, and factory.
 2. Exact model ID (`g-group-ai-lab/gipformer-68M-rnnt`) and revision (`318322b...`) pinned.
-3. Version 1.5 rejected by config validation and backend constructor.
+3. 1.5 is a known-but-`[UNVERIFIED]` spec: config accepts the id, the backend refuses it, unknown ids are config errors.
 4. Recognizer constructed with exact INT8 and FP32 filenames via mocked `sherpa_onnx`.
 5. INT8 configuration propagation verified.
 6. Missing precision files raise explicit `AsrError` without silent fallback.

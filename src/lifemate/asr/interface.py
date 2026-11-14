@@ -46,6 +46,12 @@ class TranscriptResult:
     backend: str = "unknown"
     model_name: str | None = None
     error: str | None = None
+    #: Sum of the recognizer's per-token log probabilities (``ys_log_probs``).
+    #: Only comparable between decodes of the SAME model; ``None`` when the
+    #: backend exposes no such field. Never a confidence for another model.
+    acoustic_logprob: float | None = None
+    #: Emitted token count backing ``acoustic_logprob`` (``None`` when unknown).
+    n_tokens: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -61,6 +67,8 @@ class TranscriptResult:
             "backend": self.backend,
             "model_name": self.model_name,
             "error": self.error,
+            "acoustic_logprob": self.acoustic_logprob,
+            "n_tokens": self.n_tokens,
         }
 
     def __post_init__(self) -> None:

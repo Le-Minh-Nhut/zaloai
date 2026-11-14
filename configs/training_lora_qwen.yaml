@@ -26,6 +26,8 @@ training:
   logging_steps: 10
   save_strategy: epoch
   eval_strategy: epoch
+  save_steps: 0           # for save_strategy: steps; 0 = fall back to logging_steps
+  eval_steps: 0           # for eval_strategy: steps; 0 = fall back to logging_steps
   seed: 42
   max_seq_length: 8192
   validation_ratio: 0.1

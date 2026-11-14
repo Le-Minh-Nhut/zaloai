@@ -25,8 +25,10 @@ from lifemate.errors import LifeMateError
 
 __all__ = [
     "CheckpointInfo",
+    "COMPAT_KEYS",
     "META_FILENAME",
     "assert_adapter_base_matches",
+    "check_checkpoint_compat",
     "load_checkpoint_meta",
     "merge_lora_adapter",
     "resolve_checkpoint",
@@ -48,6 +50,49 @@ _META_KEYS = (
     "seed",
     "dataset_manifest_hash",
 )
+
+#: Identity/provenance fields the Phase-3.9 compatibility check compares. Every
+#: checkpoint records them (``None`` when unknown) so a loader can refuse a
+#: mismatch instead of discovering it after the weights are attached.
+COMPAT_KEYS = (
+    "schema_version",
+    "model_id",
+    "model_profile",
+    "tuning_mode",
+    "quantization",
+    "precision",
+    "dataset_manifest_hash",
+    "dataset_order_hash",
+    "config_hash",
+    "adapter_rank",
+    "planned_total_steps",
+    "global_step",
+)
+
+#: Human label + the fix for each compat field, used by the refusal messages.
+_COMPAT_HINTS = {
+    "model_id": ("model id", "pass the --model this checkpoint was trained with"),
+    "model_profile": (
+        "model profile family",
+        "use the matching base model: a MiniCPM adapter cannot continue a Qwen run (or vice versa)",
+    ),
+    "tuning_mode": (
+        "tuning mode",
+        "pass --tuning to match (lora and qlora are different maths; full FT is a different model)",
+    ),
+    "quantization": ("quantization", "match training.quantization from the checkpoint (nf4 vs none)"),
+    "precision": ("precision", "match training.precision from the checkpoint"),
+    "adapter_rank": ("adapter rank (lora.r)", "match lora.r from the checkpoint (the adapter shapes differ)"),
+    "dataset_manifest_hash": ("dataset manifest hash", "point --dataset-dir at the checkpoint's dataset split"),
+    "dataset_order_hash": (
+        "dataset order hash",
+        "rebuild the dataset exactly as the checkpoint saw it (same max_seq_length and record order)",
+    ),
+    "config_hash": (
+        "training config fingerprint",
+        "match the optimisation knobs (lr, seed, epochs, batch/accum, scheduler, precision, tuning mode)",
+    ),
+}
 
 
 @dataclass
@@ -122,6 +167,14 @@ def _build_meta(output_dir: Path, meta: dict[str, Any], is_lora: bool, step: int
     """
     payload: dict[str, Any] = {key: meta.get(key) for key in _META_KEYS}
     payload["model_mode"] = meta.get("model_mode") or ("lora" if is_lora else "full")
+    # Provenance/compatibility block (Phase 3.9). Recorded even when unknown so a
+    # reader never has to guess whether a key is absent because it was unset.
+    for key in COMPAT_KEYS:
+        payload.setdefault(key, meta.get(key))
+    if payload.get("model_id") is None:
+        payload["model_id"] = meta.get("model_name")
+    if payload.get("global_step") is None and step is not None:
+        payload["global_step"] = step
     if step is not None:
         payload["step"] = step
     if payload["timestamp"] is None:
@@ -260,6 +313,101 @@ def resolve_checkpoint(path: str | Path) -> CheckpointInfo:
         "config.json / *.safetensors / pytorch_model*.bin (full fine-tune)"
     )
 
+
+def check_checkpoint_compat(
+    checkpoint_dir: str | Path,
+    *,
+    model_id: str | None = None,
+    model_profile: str | None = None,
+    tuning_mode: str | None = None,
+    quantization: str | None = None,
+    precision: str | None = None,
+    adapter_rank: int | str | None = None,
+    dataset_manifest_hash: str | None = None,
+    dataset_order_hash: str | None = None,
+    config_hash: str | None = None,
+    planned_total_steps: int | str | None = None,
+    allow_horizon_change: bool = False,
+) -> dict[str, Any]:
+    """Refuse a checkpoint whose recorded world differs from the requested one.
+
+    Compares only what the CALLER supplies (``None`` = "don't check"), so every
+    existing caller keeps its old behaviour and each guard is opt-in. Reads
+    ``lifemate_meta.json``, falling back to ``training_state.json``'s ``world``
+    block for checkpoints written before the manifest carried it.
+
+    Values still ``None``/absent in the checkpoint are not compared: an unknown
+    provenance cannot be proven wrong, and refusing would break legacy artefacts.
+
+    Raises :class:`LifeMateError` naming the field, both values and the fix.
+    Returns ``{"checked": [...], "recorded": {...}}`` on success.
+    """
+    path = Path(str(checkpoint_dir))
+    meta = load_checkpoint_meta(path) if path.is_dir() else {}
+    recorded: dict[str, Any] = {key: meta.get(key) for key in COMPAT_KEYS}
+    if not meta:
+        try:
+            state = json.loads((path / "training_state.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        world = dict((state or {}).get("world") or {})
+        for key in ("model_profile", "tuning_mode", "quantization", "precision", "adapter_rank"):
+            if recorded.get(key) is None:
+                recorded[key] = world.get(key)
+        for key in ("dataset_order_hash", "config_hash", "planned_total_steps", "schema_version"):
+            if recorded.get(key) is None:
+                recorded[key] = (state or {}).get(key)
+        if recorded.get("global_step") is None:
+            recorded["global_step"] = (state or {}).get("step")
+
+    requested = {
+        "model_id": model_id,
+        "model_profile": model_profile,
+        "tuning_mode": tuning_mode,
+        "quantization": quantization,
+        "precision": precision,
+        "adapter_rank": adapter_rank,
+        "dataset_manifest_hash": dataset_manifest_hash,
+        "dataset_order_hash": dataset_order_hash,
+        "config_hash": config_hash,
+    }
+    if model_profile is None and model_id:
+        from lifemate.models.profiles import resolve_profile  # noqa: PLC0415 - lazy
+
+        requested["model_profile"] = resolve_profile(model_id).name
+    checked: list[str] = []
+    for key, wanted in requested.items():
+        if wanted is None:
+            continue
+        have = recorded.get(key)
+        if have is None:
+            continue
+        if key == "adapter_rank":
+            if int(have) != int(wanted):
+                _raise_compat(path, key, have, wanted)
+        elif str(have) != str(wanted):
+            _raise_compat(path, key, have, wanted)
+        checked.append(key)
+
+    if planned_total_steps is not None and recorded.get("planned_total_steps") is not None:
+        have, wanted = int(recorded["planned_total_steps"]), int(planned_total_steps)
+        if have != wanted and not allow_horizon_change:
+            raise LifeMateError(
+                f"checkpoint {path} was saved for a different LR schedule horizon "
+                f"(checkpoint planned_total_steps={have} != requested {wanted}). "
+                "Continuing would silently train a different trajectory, not a continuation. "
+                "Pass extend_horizon=True / --extend-horizon to authorise the change."
+            )
+        checked.append("planned_total_steps")
+    return {"checked": checked, "recorded": recorded}
+
+def _raise_compat(path: Path, key: str, have: Any, wanted: Any) -> None:
+    label, fix = _COMPAT_HINTS.get(key, (key, "match the checkpoint's value"))
+    raise LifeMateError(
+        f"cannot resume: checkpoint {label} differs from the requested run "
+        f"(checkpoint {key}={have!r} != requested {wanted!r}) at {path}. "
+        f"The weights, optimizer state and schedule would not describe the same run; {fix}."
+    )
 
 def assert_adapter_base_matches(adapter_dir: str | Path, base_model_name: str | None) -> dict[str, Any]:
     """Refuse an adapter recorded for a different model family.

@@ -172,20 +172,28 @@ def test_02_exact_model_id_and_revision_string():
     assert cfg.asr.runtime == "onnx"
 
 
-def test_03_version_1_5_is_not_resolvable():
-    """Item 3: version 1.5 is NOT resolvable; gipformer1.5-68M-rnnt is rejected."""
+def test_03_version_1_5_is_spec_known_but_cannot_load_here():
+    """Item 3: 1.5 is a KNOWN spec, yet unusable here (no weights were ever observed).
+
+    Config accepts any known spec id (whether the artifacts exist is a load-time
+    question, so an optional checkpoint needs no config edit); the backend then
+    refuses the [UNVERIFIED] spec and an unknown id is a config error.
+    """
     cfg = load_config()
     assert "1.5" not in cfg.asr.model_id
 
-    # Config validation rejects 1.5
-    with pytest.raises(ConfigError) as excinfo:
-        AppConfig(asr=AsrConfig(model_id="g-group-ai-lab/gipformer1.5-68M-rnnt"))
-    assert "1.5 is rejected" in str(excinfo.value)
+    AppConfig(asr=AsrConfig(model_id="g-group-ai-lab/gipformer1.5-68M-rnnt"))
 
-    # Backend constructor rejects 1.5
+    # Unknown gipformer ids stay config errors, listing the known ones.
+    with pytest.raises(ConfigError) as excinfo:
+        AppConfig(asr=AsrConfig(model_id="g-group-ai-lab/gipformer9-68M-rnnt"))
+    assert "unknown gipformer model_id" in str(excinfo.value)
+    assert DEFAULT_MODEL_ID in str(excinfo.value)
+
+    # Backend constructor refuses the [UNVERIFIED] 1.5 spec (never a silent 68M load).
     with pytest.raises(AsrError) as excinfo2:
         GipformerBackend(model_id="g-group-ai-lab/gipformer1.5-68M-rnnt")
-    assert "rejected" in str(excinfo2.value) and "1.5" in str(excinfo2.value)
+    assert "rejected" in str(excinfo2.value) and "UNVERIFIED" in str(excinfo2.value)
 
 
 def test_04_recognizer_built_with_right_filenames_int8_and_fp32():

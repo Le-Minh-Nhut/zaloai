@@ -16,8 +16,43 @@ What it writes (``<output>/<split>/``):
 * ``manifest.json`` — split fingerprint (counts, seed, ratio, id/group hashes);
 * ``stats.json`` — decision-point accounting, drop reasons, token-size summary.
 
-Exit codes: 0 ok, 2 dataset not found, 3 optional tokenizer requested but
-unavailable (records are still written with char/4 token estimates).
+Optional training-data augmentations (all OFF by default; with every flag absent
+the output is byte-identical to a build without them, and ``val.jsonl`` is never
+touched):
+
+* ``--noisy-asr-transcripts/--noisy-asr-ratio/--noisy-asr-enabled`` — add a
+  variant per sampled record whose request section carries the recogniser's own
+  best hypothesis instead of the gold transcript (target kept verbatim);
+* ``--nbest-transcripts/--nbest-training-format`` — add a variant whose request
+  section lists up to 3 hypotheses as a numbered list;
+* ``--slot-masking-enabled`` — add a variant with one required gold argument
+  removed from the request and ``sys.ask_missing_info`` as the target;
+* ``--tool-dropout-enabled/--tool-dropout-max-tools`` — add a variant whose
+  rendered catalog section omits up to N tools the gold trajectory never calls.
+
+The CANONICAL switch is ``--enable-feature <id>`` / ``--disable-feature <id>``
+(or a ``features:`` block in ``--config``), resolved by
+``lifemate.features.overrides`` as CLI > env > YAML > defaults:
+
+* ``training.noisy_asr`` — ``--noisy-asr-enabled`` is a documented alias;
+* ``prompt.nbest_format`` — ``--nbest-training-format`` is an alias (needs
+  ``asr.nbest``; the run refuses the combination otherwise, naming both ids);
+* ``training.slot_masking`` — ``--slot-masking-enabled`` is an alias;
+* ``training.tool_dropout`` — ``--tool-dropout-enabled`` is an alias, and
+  ``--tool-dropout-max-tools`` / ``--noisy-asr-ratio`` / ``--augmentation-seed``
+  override the matching ``features.training.*`` value.
+
+Features are validated and reported BEFORE any data is read, so an impossible
+configuration fails fast and the effective set is always printed. When at least
+one augmentation is active the manifest gains ``augmentation`` (flags, numbers,
+seed, transcript paths + sha256, variant counts, per-rule skip counts) plus
+``features`` (:func:`lifemate.features.report.feature_report_dict`) and
+``training_feature_fingerprint``, so ``scripts/train.py`` can compare the run it
+launched with the distribution this dataset actually has.
+
+Exit codes: 0 ok, 2 dataset not found (or augmentation input unusable), 3 optional
+tokenizer requested but unavailable (records are still written with char/4 token
+estimates).
 """
 
 from __future__ import annotations
@@ -37,9 +72,10 @@ from lifemate.data.split_builder import split_samples  # noqa: E402
 from lifemate.data.trajectory_builder import (  # noqa: E402
     build_sft_dataset,
     to_hf_dataset_records,
-    to_jsonl,
 )
 from lifemate.errors import DatasetNotFoundError, LifeMateError  # noqa: E402
+from lifemate.features.config import training_feature_fingerprint  # noqa: E402
+from lifemate.features.report import feature_report_dict  # noqa: E402
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Command line interface."""
@@ -61,6 +97,74 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="max samples to load")
     parser.add_argument("--max-seq-length", type=int, default=None, help="budget for the fit check")
     parser.add_argument("--history-limit", type=int, default=None, help="conversation turns kept in prompts")
+    # -- optional training-data augmentations (all OFF by default) ----------- #
+    # The CANONICAL switch is ``--enable-feature <id>`` (or a ``features:`` block
+    # in --config). The per-feature flags below are documented aliases kept so
+    # older command lines keep working; each maps 1:1 onto one feature id.
+    parser.add_argument(
+        "--nbest-transcripts",
+        default=None,
+        help="transcript JSONL from scripts/transcribe_split.py --transcript-records (N-best source)",
+    )
+    parser.add_argument(
+        "--nbest-training-format",
+        action="store_true",
+        help=(
+            "render the request section as a numbered hypothesis list "
+            "(alias of --enable-feature prompt.nbest_format; also needs asr.nbest)"
+        ),
+    )
+    parser.add_argument(
+        "--noisy-asr-transcripts",
+        default=None,
+        help="transcript JSONL whose non-best hypothesis replaces the gold transcript in a variant",
+    )
+    parser.add_argument(
+        "--noisy-asr-ratio",
+        type=float,
+        default=None,
+        help=(
+            "fraction of samples that get a noisy-ASR variant, in (0, 1] "
+            "(alias of features.training.noisy_asr_ratio; overrides the config value)"
+        ),
+    )
+    parser.add_argument(
+        "--noisy-asr-enabled",
+        action="store_true",
+        help="enable noisy-ASR variants (alias of --enable-feature training.noisy_asr)",
+    )
+    parser.add_argument(
+        "--slot-masking-enabled",
+        action="store_true",
+        help="enable slot-masking variants (alias of --enable-feature training.slot_masking)",
+    )
+    parser.add_argument(
+        "--tool-dropout-enabled",
+        action="store_true",
+        help="enable tool-dropout variants (alias of --enable-feature training.tool_dropout)",
+    )
+    parser.add_argument(
+        "--tool-dropout-max-tools",
+        type=int,
+        default=None,
+        help=(
+            "tools removed per record by tool dropout "
+            "(alias of features.training.tool_dropout_max_tools; overrides the config value)"
+        ),
+    )
+    parser.add_argument(
+        "--augmentation-seed",
+        type=int,
+        default=None,
+        help=(
+            "selection seed for augmentations "
+            "(alias of features.training.augmentation_seed; overrides the config value)"
+        ),
+    )
+    # --enable-feature / --disable-feature (the canonical feature switch).
+    from lifemate.features.overrides import add_feature_arguments  # noqa: PLC0415
+
+    add_feature_arguments(parser)
     return parser.parse_args(argv)
 
 def _load_tokenizer(spec: str) -> tuple[object | None, str]:
@@ -171,6 +275,287 @@ def _print_table(stats: dict, n_read: int, n_val: int, n_val_points: int) -> Non
     print(f"  prompt tokens (est) : min {prompt.get('min')} mean {prompt.get('mean')} max {prompt.get('max')}")
     print(f"  target tokens (est) : min {target.get('min')} mean {target.get('mean')} max {target.get('max')}")
 
+def _sha256_file(path: str | Path) -> str:
+    """sha256 of a transcript file (provenance kept in the manifest)."""
+    import hashlib  # noqa: PLC0415 - only needed when an augmentation is on
+
+    from lifemate.compliance import safe_open  # noqa: PLC0415 - prohibited paths refused
+
+    digest = hashlib.sha256()
+    with safe_open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+#: Bespoke boolean flags and the feature id each one aliases.
+AUGMENTATION_ALIASES: tuple[tuple[str, str], ...] = (
+    ("noisy_asr_enabled", "training.noisy_asr"),
+    ("nbest_training_format", "prompt.nbest_format"),
+    ("slot_masking_enabled", "training.slot_masking"),
+    ("tool_dropout_enabled", "training.tool_dropout"),
+)
+
+#: ``kind -> feature id`` for the transforms ``_augment`` runs.
+_AUGMENTATION_FEATURES: dict[str, str] = {
+    "noisy_asr": "training.noisy_asr",
+    "nbest_format": "prompt.nbest_format",
+    "slot_masking": "training.slot_masking",
+    "tool_dropout": "training.tool_dropout",
+}
+
+def _resolve_augmentation_config(
+    cfg: object, args: argparse.Namespace
+) -> tuple[object, list[str], dict[str, object]]:
+    """Merge ``cfg.features`` with the deprecated per-feature CLI aliases.
+
+    Precedence, applied in this order:
+
+    1. ``cfg.features`` is authoritative: YAML ``features:`` block, then
+       ``LIFEMATE_FEATURE_*`` env, then ``--enable-feature`` / ``--disable-feature``
+       (all resolved by :func:`lifemate.features.overrides.build_feature_config`);
+    2. a bespoke boolean alias that is *passed* while its feature is off turns the
+       feature ON (old command lines keep working) and is added to the returned
+       deprecation notes;
+    3. an explicit numeric alias (``--noisy-asr-ratio``, ``--tool-dropout-max-tools``,
+       ``--augmentation-seed``) overrides the config value and is noted too;
+    4. a feature forced OFF on the CLI (``--disable-feature``) still wins unless its
+       own alias was passed — in that case the alias wins and note 2 is printed, so
+       the run never silently contradicts a visible flag.
+
+    Returns ``(cfg, notes, effective)`` where ``effective`` holds the resolved
+    booleans and numbers that ``_augment`` actually uses.
+    """
+    from lifemate.features.config import FeatureConfig  # noqa: PLC0415 - optional slice
+    from lifemate.features.overrides import build_feature_config  # noqa: PLC0415
+
+    features = getattr(cfg, "features", None)
+    if not isinstance(features, FeatureConfig):  # pragma: no cover - slice absent
+        features = FeatureConfig()
+    requested_cli = set()
+    for raw in list(getattr(args, "enable_feature", None) or []) + list(
+        getattr(args, "disable_feature", None) or []
+    ):
+        requested_cli.add(str(raw).split("=", 1)[0].strip())
+    resolved, _provenance = build_feature_config(cfg, args)
+    cfg.features = resolved  # type: ignore[attr-defined]
+
+    notes: list[str] = []
+    for flag, feature_id in AUGMENTATION_ALIASES:
+        if not getattr(args, flag, False):
+            continue
+        if not resolved_value(resolved, feature_id):
+            set_feature_value(resolved, feature_id, True)
+            # The alias IS a command-line switch, so provenance reads "cli" for
+            # both spellings: the dataset's fingerprint must not depend on which
+            # spelling enabled the feature. The deprecation note below is the
+            # visible record of which one was used.
+            provenance = dict(getattr(resolved, "provenance", {}) or {})
+            provenance[feature_id] = "cli"
+            resolved.provenance = provenance
+            notes.append(f"note: --{flag.replace('_', '-')} is a deprecated alias for --enable-feature {feature_id}")
+        elif feature_id in requested_cli:
+            notes.append(
+                f"note: --{flag.replace('_', '-')} agrees with --enable-feature {feature_id}"
+            )
+
+    training = resolved.training
+    effective: dict[str, object] = {}
+    for numeric, section, name, cast in (
+        ("noisy_asr_ratio", training, "noisy_asr_ratio", float),
+        ("tool_dropout_max_tools", training, "tool_dropout_max_tools", int),
+        ("augmentation_seed", training, "augmentation_seed", int),
+    ):
+        value = getattr(args, numeric, None)
+        if value is None:
+            effective[numeric] = getattr(section, name)
+            continue
+        setattr(section, name, cast(value))
+        effective[numeric] = getattr(section, name)
+        notes.append(
+            f"note: --{numeric.replace('_', '-')} overrides features.training.{name} "
+            f"(now {effective[numeric]})"
+        )
+    for kind, feature_id in _AUGMENTATION_FEATURES.items():
+        effective[kind] = bool(resolved_value(resolved, feature_id))
+    return cfg, notes, effective
+
+def resolved_value(cfg: object, feature_id: str) -> object:
+    """Value of one feature id without importing the registry's private maps."""
+    from lifemate.features.registry import REGISTRY  # noqa: PLC0415
+
+    return REGISTRY.value(feature_id, cfg)
+
+def set_feature_value(cfg: object, feature_id: str, value: bool) -> object:
+    """Set one feature id in place (the registry owns the config path)."""
+    from lifemate.features.registry import REGISTRY  # noqa: PLC0415
+
+    return REGISTRY.set_enabled(feature_id, cfg, bool(value))
+
+def _validate_features(cfg: object) -> None:
+    """Apply the feature registry's rules (dependencies, conflicts, value ranges)."""
+    from lifemate.features.registry import REGISTRY  # noqa: PLC0415 - optional slice
+
+    REGISTRY.validate_or_raise(cfg.features)
+
+def _print_feature_report(cfg: object) -> None:
+    """Print the effective feature configuration (labels are contractual)."""
+    from lifemate.features.report import format_feature_report  # noqa: PLC0415
+
+    print(
+        format_feature_report(
+            cfg.features, model_id=cfg.model.name, asr_id=cfg.asr.model_id
+        )
+    )
+
+def _effective_augmentation_line(effective: dict[str, object]) -> str:
+    """One line naming the resolved augmentation set (after alias merging)."""
+    active = sorted(kind for kind in _AUGMENTATION_FEATURES if effective[kind])
+    return (
+        "augmentation set    : "
+        + (", ".join(active) if active else "NONE (no augmentation runs)")
+        + f"  ratio={effective['noisy_asr_ratio']} "
+        f"max_tools={effective['tool_dropout_max_tools']} seed={effective['augmentation_seed']}"
+    )
+
+def _augment(
+    train_records: list[dict],
+    val_records: list[dict],
+    *,
+    args: argparse.Namespace,
+    catalog: object,
+    effective: dict[str, object],
+) -> tuple[dict, list[dict]]:
+    """Apply the augmentations the EFFECTIVE feature config enables, train only.
+
+    ``effective`` comes from :func:`_resolve_augmentation_config`: ``cfg.features``
+    (already merged with the deprecated CLI aliases) is the single source of
+    truth, so a ``features:`` YAML block and ``--enable-feature`` change the built
+    dataset exactly like the old bespoke flags do.
+
+    Every transform receives the *original* train records and its variants are
+    appended after them, so each variant carries exactly one provenance label and
+    a variant is never fed into another transform. Val is asserted untouched.
+    """
+    from lifemate.data.asr_variants import (  # noqa: PLC0415 - optional path
+        apply_nbest_format,
+        apply_noisy_asr,
+        load_transcripts,
+    )
+    from lifemate.data.augmentation import (  # noqa: PLC0415 - optional path
+        apply_slot_masking,
+        apply_tool_dropout,
+    )
+
+    seed = int(effective["augmentation_seed"])
+    active = {kind: bool(effective[kind]) for kind in _AUGMENTATION_FEATURES}
+    ratio = float(effective["noisy_asr_ratio"])
+    max_tools = int(effective["tool_dropout_max_tools"])
+    if not any(active.values()):
+        return {}, train_records
+    if not train_records:
+        return {"enabled": active, "n_records_in": 0, "n_records_out": 0}, train_records
+
+    base = list(train_records)
+    variants: list[dict] = []
+    reports: dict[str, object] = {}
+    sources: dict[str, object] = {}
+
+    for name, path in (
+        ("noisy_asr", args.noisy_asr_transcripts),
+        ("nbest_format", args.nbest_transcripts),
+    ):
+        if active[name]:
+            if not path:
+                raise LifeMateError(f"{name} is enabled but no transcript file was given")
+            sources[name] = {"path": str(path), "sha256": _sha256_file(path)}
+
+    if active["noisy_asr"]:
+        transcripts = load_transcripts(args.noisy_asr_transcripts)
+        produced, report = apply_noisy_asr(
+            base, transcripts, enabled=True, ratio=ratio, seed=seed
+        )
+        reports["noisy_asr"] = report
+        variants.extend(_variant_records(produced, base))
+    if active["nbest_format"]:
+        transcripts = load_transcripts(args.nbest_transcripts, require_multi=True)
+        produced, report = apply_nbest_format(base, transcripts, enabled=True, k=3, seed=seed)
+        reports["nbest_format"] = report
+        variants.extend(_variant_records(produced, base))
+    if active["slot_masking"]:
+        produced, report = apply_slot_masking(base, enabled=True, seed=seed, catalog=catalog)
+        reports["slot_masking"] = report
+        variants.extend(_variant_records(produced, base))
+    if active["tool_dropout"]:
+        produced, report = apply_tool_dropout(
+            base,
+            enabled=True,
+            max_tools=max_tools,
+            seed=seed,
+            catalog=catalog,
+        )
+        reports["tool_dropout"] = report
+        variants.extend(_variant_records(produced, base))
+
+    train_ids = {str(record.get("sample_id")) for record in base}
+    val_ids = {str(record.get("sample_id")) for record in val_records}
+    leaked = train_ids & val_ids
+    if leaked:
+        raise LifeMateError(
+            f"augmentation would leak {len(leaked)} sample id(s) into val (e.g. {sorted(leaked)[0]})"
+        )
+    outside = sorted({str(record.get("sample_id")) for record in variants} - train_ids)
+    if outside:
+        raise LifeMateError(
+            f"augmented variant(s) outside the train group (e.g. {outside[0]!r}); "
+            "augment only after the group split"
+        )
+
+    report = {
+        "enabled": active,
+        "seed": seed,
+        "noisy_asr_ratio": ratio,
+        "tool_dropout_max_tools": max_tools,
+        "transcript_sources": sources,
+        "n_records_in": len(base),
+        "n_records_out": len(base) + len(variants),
+        "n_variants": len(variants),
+        "n_variants_by_kind": _count_variants(variants),
+        "reports": reports,
+        "val_augmented": False,
+    }
+    return report, base + variants
+
+def _variant_records(produced: list[dict], base: list[dict]) -> list[dict]:
+    """Variants a transform appended next to its originals.
+
+    Transforms keep the original object and emit the variant right after it, so
+    the variants are the produced records that are neither an original object nor
+    untagged.
+    """
+    original_ids = {id(record) for record in base}
+    return [
+        record
+        for record in produced
+        if id(record) not in original_ids and (record.get("meta") or {}).get("augmentation")
+    ]
+
+def _count_variants(variants: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in variants:
+        kind = str((record.get("meta") or {}).get("augmentation"))
+        counts[kind] = counts.get(kind, 0) + 1
+    return dict(sorted(counts.items()))
+
+def _write_records(records: list[dict], path: Path) -> None:
+    """Write SFT records exactly as ``trajectory_builder.to_jsonl`` serialises them."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+    tmp.replace(path)
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point; returns the process exit code."""
     args = parse_args(argv)
@@ -179,6 +564,25 @@ def main(argv: list[str] | None = None) -> int:
     except LifeMateError as exc:
         print(f"invalid config: {exc}")
         return 1
+
+    # Features are resolved and VALIDATED before any data is read: an impossible
+    # combination (e.g. noisy_asr_ratio out of range) must fail fast, and the
+    # effective set is printed once so a run can never silently build a
+    # distribution the caller did not ask for.
+    try:
+        cfg, alias_notes, effective = _resolve_augmentation_config(cfg, args)
+    except LifeMateError as exc:
+        print(f"configuration error: {exc}")
+        return 1
+    for note in alias_notes:
+        print(note)
+    try:
+        _validate_features(cfg)
+    except LifeMateError as exc:
+        print(f"configuration error: {exc}")
+        return 1
+    _print_feature_report(cfg)
+    print(_effective_augmentation_line(effective))
 
     val_ratio = args.val_ratio if args.val_ratio is not None else float(cfg.training.validation_ratio)
     seed = args.seed if args.seed is not None else int(cfg.training.seed)
@@ -213,14 +617,37 @@ def main(argv: list[str] | None = None) -> int:
     tokenizer, tokenizer_status = _load_tokenizer(args.tokenizer)
     train_records = to_hf_dataset_records(train_points)
     val_records = to_hf_dataset_records(val_points)
+
+    # Augmentation runs AFTER the group split and only on train: a variant keeps
+    # its sample_id, so it stays inside the group split_builder assigned.
+    try:
+        augmentation, train_records = _augment(
+            train_records,
+            val_records,
+            args=args,
+            catalog=catalog,
+            effective=effective,
+        )
+    except LifeMateError as exc:
+        print(f"augmentation failed: {exc}")
+        return 2
+    if augmentation:
+        print(
+            f"  augmentation        : {augmentation['n_records_in']} -> {augmentation['n_records_out']} "
+            f"train record(s), +{augmentation['n_variants']} variant(s) "
+            f"({', '.join(f'{k}={v}' for k, v in augmentation['n_variants_by_kind'].items()) or 'none'})"
+        )
     fit = _fit_stats(train_records, tokenizer, max_seq_length)
     fit_val = _fit_stats(val_records, tokenizer, max_seq_length)
 
     out_dir = Path(args.output) / args.split
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
-        to_jsonl(train_points, out_dir / "train.jsonl")
-        to_jsonl(val_points, out_dir / "val.jsonl")
+        # Same serialisation as ``to_jsonl`` (compact JSON, sorted keys, one
+        # record per line); records are written instead of points so the
+        # augmented train list can carry its variants.
+        _write_records(train_records, out_dir / "train.jsonl")
+        _write_records(val_records, out_dir / "val.jsonl")
     except OSError as exc:
         print(f"failed to write {out_dir}: {exc}")
         return 1
@@ -229,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         **split.manifest(),
         "split": args.split,
         "data_root": str(Path(args.data_root).resolve()),
-        "n_train_decision_points": len(train_points),
+        "n_train_decision_points": len(train_records),
         "n_val_decision_points": len(val_points),
         # Points the builder refused to supervise (a gold argument the prompt
         # cannot show). Without these keys the manifest's point counts silently
@@ -253,6 +680,20 @@ def main(argv: list[str] | None = None) -> int:
         "fit": fit,
         "fit_val": fit_val,
     }
+    if augmentation:
+        # Only present when an augmentation is active: a no-flag run must stay
+        # byte-identical to the pre-augmentation build.
+        manifest["augmentation"] = augmentation
+        stats["augmentation"] = augmentation
+        # The dataset's own record of WHICH feature configuration produced it, so
+        # ``scripts/train.py`` can compare its run fingerprint with this build's
+        # instead of trusting a flag it merely recorded.
+        manifest["features"] = feature_report_dict(
+            cfg.features, model_id=cfg.model.name, asr_id=cfg.asr.model_id
+        )
+        manifest["training_feature_fingerprint"] = training_feature_fingerprint(cfg.features)
+        stats["features"] = manifest["features"]
+
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
     )

@@ -63,6 +63,34 @@ eda = [
 ]
 audio = ["soundfile>=0.12"]
 plot = ["matplotlib>=3.8"]
+# --- optional feature groups (src/lifemate/features/registry.py) ------------- #
+# VERIFIED: none of the 12 feature flags needs a package that the extras above
+# (or `dependencies = []`) do not already provide, so this block adds NO group.
+# `pip install -e .` therefore installs the baseline and not one optional package,
+# and enabling a flag never implies an install. Per flag:
+#
+#   audio.vad                  -> no package. src/lifemate/asr/audio_ops.py is a
+#       pure-python energy VAD (math + dataclasses) and no module imports silero or
+#       webrtcvad. The registry's `requires` names them as ARTIFACTS; a silero-vad
+#       pip group would also fetch its weights from the hub on first use, which is
+#       impossible under the image's `--network none`.
+#   audio.rms_normalization    -> no package (same module).
+#   asr.nbest                  -> `asr`/`onnx` (sherpa-onnx).
+#   asr.gipformer_v15          -> no package; needs the 1.5 checkpoint files on disk.
+#   asr.multi_asr              -> no package. src/lifemate/asr/multi_backend.py
+#       imports only stdlib + .interface/.nbest; a secondary backend brings its own
+#       deps (whisper -> `asr-whisper`).
+#   prompt.itn                 -> no package (src/lifemate/asr/normalization.py: re).
+#   prompt.nbest_format        -> no package.
+#   training.noisy_asr         -> no package. data/asr_variants.py + augmentation.py
+#       import only stdlib + lifemate.*.
+#   training.slot_masking      -> no package (same modules).
+#   training.tool_dropout      -> no package (same modules).
+#   decoding.constrained       -> `train` (torch + transformers). The implementation
+#       is a plain transformers.LogitsProcessor over a Python prefix trie
+#       (models/constrained.py); outlines/llguidance/xgrammar are NOT used.
+#   postprocessing.enhanced_schema_guardrail
+#                              -> no package (agent/guardrail.py: re + dataclasses).
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -57,6 +57,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
     parser.add_argument("--model-mode", choices=("base", "full", "lora"), default=None)
     parser.add_argument("--config", default=None, help="YAML config file")
+    try:  # optional slice: absent -> no feature flags at all
+        from lifemate.features.overrides import add_feature_arguments  # noqa: PLC0415
+
+        add_feature_arguments(parser)
+    except ImportError:  # pragma: no cover - features slice absent
+        pass
     parser.add_argument("--limit", type=int, default=None, help="max samples/records")
     parser.add_argument("--output", default=None, help="report directory (default: config evaluation.output_dir)")
     parser.add_argument("--predictions", default=None, help=f"decision-record JSONL (default: {DEFAULT_VAL_RECORDS})")
@@ -86,6 +92,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _feature_config(cfg: Any, args: argparse.Namespace) -> Any:
+    """Resolve the CLI/env/YAML feature chain onto ``cfg`` (``None`` if absent)."""
+    try:
+        from lifemate.features.config import FeatureConfig  # noqa: PLC0415
+        from lifemate.features.overrides import build_feature_config  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - features slice absent
+        return None
+    if getattr(cfg, "features", None) is None:  # wiring not landed: defaults
+        cfg.features = FeatureConfig()
+    features, _provenance = build_feature_config(cfg, args)
+    cfg.features = features
+    return features
+
+def _flag(features: Any, section: str, name: str) -> bool:
+    """One feature flag; ``False`` when the object (or its section) is absent."""
+    return bool(getattr(getattr(features, section, None), name, False))
+
+def _print_feature_report(cfg: Any) -> dict[str, Any]:
+    """Print the effective configuration once; return its JSON half."""
+    try:  # noqa: PLC0415
+        from lifemate.features.report import (  # noqa: PLC0415
+            feature_report_dict,
+            format_feature_report,
+        )
+    except ImportError:  # pragma: no cover - features slice absent
+        return {}
+    features = getattr(cfg, "features", None)
+    if features is None:  # pragma: no cover - slice present but off
+        return {}
+    print(
+        format_feature_report(features, model_id=cfg.model.name, asr_id=cfg.asr.model_id),
+        file=sys.stderr,
+    )
+    return feature_report_dict(features, model_id=cfg.model.name, asr_id=cfg.asr.model_id)
+
 def _build_config(args: argparse.Namespace) -> Any:
     cfg = load_config(args.config)
     if args.checkpoint:
@@ -105,6 +146,7 @@ def _build_config(args: argparse.Namespace) -> Any:
     if args.use_mock_env:
         cfg.inference.use_mock_env = True
     cfg.inference.split = args.split
+    _feature_config(cfg, args)
     return cfg
 
 
@@ -171,7 +213,31 @@ def _generator(cfg: Any, args: argparse.Namespace | None = None, sample_id: list
         max_new_tokens=cfg.agent.max_new_tokens,
         temperature=0.0,
         device=getattr(bundle, "device", None),
+        **_constrained_kwargs(cfg, HFGenerator),
     )
+
+def _constrained_kwargs(cfg: Any, generator_cls: Any) -> dict[str, Any]:
+    """``constrained=True`` when the flag is on AND the generator has the hook.
+
+    Feature-detected: without the ``constrained`` parameter the flag cannot be
+    honoured, so the run continues UNCONSTRAINED and says so.
+    """
+    if not _flag(getattr(cfg, "features", None), "decoding", "constrained_decoding_enabled"):
+        return {}
+    import inspect
+
+    try:
+        accepted = set(inspect.signature(generator_cls.__init__).parameters)
+    except (TypeError, ValueError):  # pragma: no cover - exotic generator
+        accepted = set()
+    if "constrained" not in accepted:
+        print(
+            "constrained decoding: PENDING (generator has no hook yet) — this run is "
+            "UNCONSTRAINED even though decoding.constrained is enabled",
+            file=sys.stderr,
+        )
+        return {}
+    return {"constrained": True, "allowed_tools": ()}
 
 
 def _teacher_forced(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
@@ -215,6 +281,7 @@ def _teacher_forced(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
 
 def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     """Run full episodes. Fails loudly when the official env cannot be built."""
+    features = getattr(cfg, "features", None)
     from lifemate.agent.agent import ToolAgent
     from lifemate.agent.tool_registry import ToolRegistry
     from lifemate.data.discovery import require_split
@@ -276,7 +343,17 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
             apps=list(getattr(sample.context, "installed_apps", []) or []) if mock else None,
         )
         registry = ToolRegistry(catalog).for_sample(sample) if catalog is not None else ToolRegistry(catalog)
-        return ToolAgent(generator=generator, registry=registry, env=env, config=cfg)
+        if _flag(features, "decoding", "constrained_decoding_enabled"):
+            setter = getattr(generator, "set_allowed_tools", None)
+            if callable(setter):
+                setter(registry.tool_names())
+        return ToolAgent(
+            generator=generator,
+            registry=registry,
+            env=env,
+            config=cfg,
+            guardrail=_flag(features, "postprocessing", "enhanced_schema_guardrail_enabled"),
+        )
 
     summary = evaluate_closed_loop(
         factory,
@@ -386,6 +463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         cfg = _build_config(args)
+        # Printed once, before any weights load; the same dict goes into report.json.
+        feature_report = _print_feature_report(cfg)
     except LifeMateError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_DATA
@@ -438,6 +517,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"WER(norm)={_num((asr_payload.get('normalized') or {}).get('wer_mean'))}"
         )
 
+    extra: dict[str, Any] = {"features": feature_report} if feature_report else {}
+    if asr_payload is not None:
+        extra["asr"] = asr_payload
     payload = evaluate_split(
         cfg=cfg,
         split=args.split,
@@ -449,7 +531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint=cfg.inference.checkpoint,
         model_mode=cfg.inference.model_mode,
         mock_env=bool(args.use_mock_env),
-        extra={"asr": asr_payload} if asr_payload is not None else None,
+        extra=extra or None,
     )
     if asr_payload is not None:
         metrics_md = Path(cfg.evaluation.output_dir) / "metrics.md"

@@ -28,6 +28,8 @@ training:
   logging_steps: 10
   save_strategy: epoch
   eval_strategy: epoch
+  save_steps: 0           # for save_strategy: steps; 0 = fall back to logging_steps
+  eval_steps: 0           # for eval_strategy: steps; 0 = fall back to logging_steps
   seed: 42
   # MiniCPM5-2B, MEASURED at 8192: 4298 kept / 488 truncated (11.17%) / 70 dropped
   # target_value_truncated (1.60%); val 477 / 41 / 5 (1.04%). 5632: 2101 truncated

@@ -143,6 +143,8 @@ Output: `/outputs/submission.jsonl` on the host under `outputs/`.
 | `ASR` | `gipformer` | `gipformer` (default) · `whisper` · `none` · `oracle` (needs `ALLOW_ORACLE=1` + `TRANSCRIPTS`) |
 | `DEVICE` | `cuda` | `cuda` · `cpu` (use `cpu` for CPU image builds) |
 | `CONFIG` | *(unset)* | optional YAML config path |
+| `ASR_MODEL_ID` | `g-group-ai-lab/gipformer-68M-rnnt` | gipformer checkpoint id, forwarded as `--override asr.model_id=<id>` when it differs from the default. A non-default id **requires** `LIFEMATE_FEATURE_ASR_GIPFORMER_V15` enabled, else the entrypoint exits **2**: picking another checkpoint without the flag would silently move the baseline. |
+| `ASR_MODEL_DIR` | `/models/asr` | gipformer ONNX directory, forwarded as `--override asr.model_dir=<dir>` only when it holds `tokens.txt`. The *default* path being absent is normal and just skips the override; an **explicitly set** path without `tokens.txt` exits **2**. |
 | `HISTORY_TRANSCRIPTS` | *(unset)* | history-turn ASR transcripts JSONL. A test split ships history audio only, so **419 of 634 `public_test` samples lose their prior turns** without the file. `scripts/infer.py` now **refuses to run (exit 2)** when history turns would render blank: leave the variable unset or point it at a missing file and the run stops with `ERROR: … would render N history user turn(s) blank`; only `--allow-missing-history` (diagnostic, via `EXTRA_ARGS`) proceeds. A set-but-unreadable path also exits **2**. See the mount below. |
 | `HF_HUB_OFFLINE` | `1` | baked into the image |
 | `TRANSFORMERS_OFFLINE` | `1` | baked into the image |
@@ -162,6 +164,67 @@ container has no network.
 | base model weights **or** Hub cache | `/models/<name>` or `/models/hf-cache` | read-only — required, selected by `MODEL_NAME` |
 | history transcripts file | `/history/history_transcripts.jsonl` | read-only |
 | outputs dir | `/outputs` | read-write |
+
+## Optional features
+
+Every feature flag in `src/lifemate/features/registry.py` is **OFF by default** and
+stays off unless its variable is set. `python` reads the variables straight from
+`os.environ` (`lifemate.features.overrides.parse_env_overrides`); the entrypoint
+never enables, rewrites, unsets or case-folds one — it **validates** them and
+prints a summary.
+
+Accepted values: `1|0|true|false|yes|no|on|off`, case-insensitive (exactly
+`TRUE_TEXT`/`FALSE_TEXT` in `overrides.py`). Any other value, or any other name
+under the `LIFEMATE_FEATURE_` prefix, exits **2** before a weight is touched —
+`parse_env_overrides` raises on both, so the entrypoint fails early instead of
+letting a typo surface as a traceback after model load.
+
+The entrypoint prints one stderr line before `exec`:
+`lifemate: features=NONE` when nothing is enabled, else the sorted names, e.g.
+`lifemate: features=LIFEMATE_FEATURE_ASR_NBEST,LIFEMATE_FEATURE_PROMPT_ITN`.
+
+```bash
+# env — the primary way
+docker run … -e LIFEMATE_FEATURE_ASR_NBEST=1 lifemate-infer
+# equivalent without touching the environment: the same `features:` path via --override
+docker run … -e EXTRA_ARGS="--override features.asr.nbest_enabled=true" lifemate-infer
+# or a features-only experiment overlay (configs/experiments/*.yaml)
+docker run … -v "$PWD/configs/experiments/asr_nbest.yaml:/app/cfg.yaml:ro" \
+    -e EXTRA_ARGS="--config /app/cfg.yaml" lifemate-infer
+```
+
+**Artifacts are mounted, never downloaded.** `--network none` plus
+`HF_HUB_OFFLINE=1` means an enabled feature that needs files must find them on a
+mounted path. No feature needs a package the image does not already install (see
+the comment block in `pyproject.toml`), so enabling one never implies a
+`pip install`; `--build-arg LIFEMATE_EXTRAS=…` exists only for the pre-existing
+`asr`/`asr-whisper`/`onnx` groups.
+
+| Variable | Feature id | What it needs on disk |
+|---|---|---|
+| `LIFEMATE_FEATURE_AUDIO_VAD` | `audio.vad` | nothing — the repo's VAD is the pure-python energy detector in `src/lifemate/asr/audio_ops.py` (no silero, no webrtcvad package). |
+| `LIFEMATE_FEATURE_AUDIO_RMS_NORMALIZATION` | `audio.rms_normalization` | nothing (same module). |
+| `LIFEMATE_FEATURE_ASR_NBEST` | `asr.nbest` | nothing extra — `sherpa-onnx` is already installed; keep `nbest_size` in `2..10` or validation fails. |
+| `LIFEMATE_FEATURE_ASR_GIPFORMER_V15` | `asr.gipformer_v15` | the **Gipformer-1.5 ONNX directory** at `ASR_MODEL_DIR` (`encoder/decoder/joiner .onnx` + `tokens.txt`). Selecting a non-default `ASR_MODEL_ID` *requires* this flag (exit 2 otherwise). The file names are **UNVERIFIED** — `model_specs.py` marks the 1.5 entry `verified=False` and never observed its file set. |
+| `LIFEMATE_FEATURE_ASR_MULTI_ASR` | `asr.multi_asr` | the secondary model's own artifacts **and** `features.asr.secondary_model_id`; an empty id fails validation. The merge layer itself imports only the stdlib. |
+| `LIFEMATE_FEATURE_PROMPT_ITN` | `prompt.itn` | nothing (`src/lifemate/asr/normalization.py` is stdlib-only). |
+| `LIFEMATE_FEATURE_PROMPT_NBEST_FORMAT` | `prompt.nbest_format` | nothing, but it **depends on** `asr.nbest`: enabling it alone fails validation. |
+| `LIFEMATE_FEATURE_DECODING_CONSTRAINED` | `decoding.constrained` | nothing beyond the image's `torch`+`transformers` (a plain `LogitsProcessor` + prefix trie; no outlines/llguidance/xgrammar). |
+| `LIFEMATE_FEATURE_POSTPROCESSING_ENHANCED_SCHEMA_GUARDRAIL` | `postprocessing.enhanced_schema_guardrail` | nothing — `src/lifemate/agent/guardrail.py` is stdlib-only; it validates against the tool catalog that ships with the dataset under `/data`. |
+| `LIFEMATE_FEATURE_TRAINING_NOISY_ASR` | `training.noisy_asr` | training only: the training split under `/data` **plus** ASR transcripts to substitute (the same kind of file `HISTORY_TRANSCRIPTS` points at). |
+| `LIFEMATE_FEATURE_TRAINING_SLOT_MASKING` | `training.slot_masking` | training only: the training split (stdlib-only masking). |
+| `LIFEMATE_FEATURE_TRAINING_TOOL_DROPOUT` | `training.tool_dropout` | training only: the training split (stdlib-only masking). |
+
+**Wiring status (UNVERIFIED for inference output).** `docs/FEATURES.md` records
+every flag's consuming module as `PENDING`, and `scripts/infer.py` has no
+`--enable-feature` / `--disable-feature` argument at all. So today a flag set in
+the container is **validated, summarised and carried in `os.environ`**, but it
+does not yet change what `scripts/infer.py` generates. The `EXTRA_ARGS` forms
+above write the same `features.<section>.<field>` values into the config object
+(verified with `lifemate.config.load_config` + `_set_dotted`); whether any
+generation path honours them is not verified here. The one exception noted in
+`docs/FEATURES.md` is `decoding.constrained`, wired inside
+`HFGenerator(constrained=True)` but still without a call site in `infer.py`.
 
 ## What has been verified here
 
@@ -208,9 +271,38 @@ container has no network.
   Generation itself was NOT RUN here (`sherpa-onnx` absent, exit 2).
 * The inference command itself is exercised in mock mode on the host
   (`scripts/infer.py --use-mock-env --generator … --limit 3`).
-* No network path in the image: no `huggingface-cli download`,
-  `snapshot_download`, `pip install`, `curl`, `wget` or `git clone` in
-  `docker/Dockerfile` or `docker/entrypoint.sh` (grep-verified).
+* No network path at **run** time: `docker/entrypoint.sh` contains no `pip install`,
+  `curl`, `wget`, `git clone`, `snapshot_download` or `huggingface-cli` on any
+  executable line (asserted by `tests/test_docker_entrypoint.py::test_entrypoint_never_installs_or_downloads`).
+  The Dockerfile *does* `pip install` — at **build** time only, which is what
+  produces the image; nothing in it downloads model weights.
+* Optional features, entrypoint side (host, stub `python`, no daemon):
+  `bash -n docker/entrypoint.sh` exits 0; with the `LIFEMATE_FEATURE_` prefix
+  stripped from the environment the stderr summary reads `lifemate: features=NONE`;
+  `LIFEMATE_FEATURE_ASR_NBEST=1 LIFEMATE_FEATURE_PROMPT_ITN=true` prints
+  `features=LIFEMATE_FEATURE_ASR_NBEST,LIFEMATE_FEATURE_PROMPT_ITN` (sorted, values
+  passed through untouched); `LIFEMATE_FEATURE_ASR_NBEST=maybe` and a
+  misspelled name under the prefix each exit **2** naming the variable, with no
+  `python` invocation at all; `ASR_MODEL_ID=g-group-ai-lab/gipformer1.5-68M-rnnt`
+  alone exits **2**, and with `LIFEMATE_FEATURE_ASR_GIPFORMER_V15=1` appends
+  `--override asr.model_id=…`. Asserted by `tests/test_docker_entrypoint.py`
+  (12 tests, including a negative control that injects a truthy default into a
+  copy of the script and requires the default-off check to reject it).
+* Registry ↔ deployment parity: the 12 `LIFEMATE_FEATURE_*` names in
+  `entrypoint.sh` equal `{env_name_for(spec.id) for spec in lifemate.features.registry.FEATURES}`,
+  and the same set appears in this README — so a new flag cannot ship undocumented
+  (`tests/test_docker_entrypoint.py::test_entrypoint_advertises_exactly_the_registry_ids`,
+  `::test_feature_vars_are_the_same_in_entrypoint_and_readme`).
+* Optional-dependency groups: `pip install -e .` resolves to the unchanged
+  `dependencies = []`, and **no** group was added for any feature flag; the
+  per-flag justification is the comment block in `pyproject.toml`. Verified by
+  reading each consumer module's imports (`audio_ops.py`, `multi_backend.py`,
+  `constrained.py`, `asr_variants.py`, `augmentation.py`, `guardrail.py`): all
+  are stdlib + `lifemate.*`, or need only `torch`+`transformers` from `train`.
+* `EXTRA_ARGS` feature equivalents: `--override features.asr.nbest_enabled=true`
+  (and the 11 sibling paths) round-trip through `lifemate.config.load_config` +
+  `_set_dotted` on the host, and `configs/experiments/*.yaml` all load with
+  `load_config`.
 
 ## What has NOT been verified
 
@@ -239,3 +331,21 @@ image, because there is no image.
 `shellcheck` was not available on this machine (`shellcheck` not installed, no
 `pip` to install it), so the entrypoint is checked by `bash -n` plus the dry-run
 scenario matrix only — not by a linter.
+
+**Optional features: validated in the container's shell, NOT executed as features.**
+* No `docker build` was run, so `ARG LIFEMATE_EXTRAS` and the guarded
+  `pip install ".[${LIFEMATE_EXTRAS}]"` line are **UNVERIFIED**: the Dockerfile's
+  `RUN` block was never executed. An operator checks it with
+  `docker build -f docker/Dockerfile -t lifemate-infer .` (baseline) and
+  `docker build -f docker/Dockerfile --build-arg LIFEMATE_EXTRAS=asr-whisper -t lifemate-extra .`.
+* No feature flag was ever observed changing inference output. `docs/FEATURES.md`
+  lists every consumer module as `PENDING`, and `scripts/infer.py` has no
+  `--enable-feature` / `--disable-feature` argument. The entrypoint therefore
+  **validates and reports** the flags; whether `scripts/infer.py` honours them is
+  unverified here and out of this document's scope.
+* The Gipformer-1.5 artifact set is `verified=False` in
+  `src/lifemate/asr/model_specs.py`: no weights exist on this machine, so the file
+  names for `LIFEMATE_FEATURE_ASR_GIPFORMER_V15` / `ASR_MODEL_ID` are the
+  conventional sherpa-onnx role names, never observed.
+* `asr.multi_asr` needs `features.asr.secondary_model_id` (empty fails validation)
+  and a secondary model's artifacts; no such model was mounted or run.

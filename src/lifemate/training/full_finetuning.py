@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from lifemate.errors import ConfigError, LifeMateError
-from lifemate.models.loader import count_parameters
+from lifemate.models.loader import count_parameters, is_quantized_parameter
 from lifemate.training.trainer import DEFAULT_MAX_SEQ_LENGTH
 
 __all__ = [
@@ -105,6 +105,17 @@ def configure_full_finetuning(
     if dtype_before != str(target_dtype) and hasattr(model, "to"):
         model = model.to(dtype=target_dtype)
         cast_applied = True
+
+    # A quantized (nf4/int8) base cannot be fully fine-tuned: its weights are
+    # integer-backed. Refuse by name instead of letting bitsandbytes raise from
+    # inside requires_grad_.
+    quantized = [name for name, param in getattr(model, "named_parameters", lambda: [])()
+                 if is_quantized_parameter(param)]
+    if quantized:
+        raise LifeMateError(
+            f"full fine-tuning refused: {len(quantized)} quantized parameter(s) "
+            f"(e.g. {quantized[0]!r}) cannot be trained. Use tuning_mode='qlora' for a 4-bit base."
+        )
 
     try:
         for param in model.parameters():

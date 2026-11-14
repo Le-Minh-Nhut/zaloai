@@ -28,6 +28,16 @@ from .interface import (
     load_audio_16k_mono,
     resample_linear,
 )
+from .model_specs import (
+    DEFAULT_SPEC_KEY,
+    GIPFORMER_SPECS,
+    download_hint,
+    artifacts_for,
+    resolve_gipformer_spec,
+    spec_key,
+    validate_artifacts,
+)
+from .nbest import NBestResult, NBestUnsupportedError, require_nbest_support, validate_nbest_size
 
 logger = logging.getLogger(__name__)
 
@@ -36,19 +46,10 @@ __all__ = ["GipformerBackend", "DEFAULT_MODEL_ID", "PINNED_REVISION", "lower_if_
 DEFAULT_MODEL_ID = "g-group-ai-lab/gipformer-68M-rnnt"
 PINNED_REVISION = "318322b009200f8e77a3751fa64638e5cc85a7dc"
 
-_INT8_FILENAMES = {
-    "encoder": "encoder.int8.onnx",
-    "decoder": "decoder.int8.onnx",
-    "joiner": "joiner.int8.onnx",
-    "tokens": "tokens.txt",
-}
-
-_FP32_FILENAMES = {
-    "encoder": "encoder.onnx",
-    "decoder": "decoder.onnx",
-    "joiner": "joiner.onnx",
-    "tokens": "tokens.txt",
-}
+#: Filename sets now live in the spec table (``lifemate.asr.model_specs``); the
+#: aliases stay so anything importing them keeps working.
+_INT8_FILENAMES = artifacts_for(GIPFORMER_SPECS[DEFAULT_SPEC_KEY], "int8")
+_FP32_FILENAMES = artifacts_for(GIPFORMER_SPECS[DEFAULT_SPEC_KEY], "fp32")
 
 
 def lower_if_uppercase_only(text: str) -> str:
@@ -86,19 +87,44 @@ class GipformerBackend:
         offline: bool = True,
         max_audio_seconds: float | None = DEFAULT_MAX_AUDIO_SECONDS,
         lenient: bool = False,
+        nbest_size: int = 0,
     ) -> None:
-        if "1.5" in model_id or "gipformer1.5" in model_id:
-            raise AsrError(
-                f"model_id {model_id!r} is rejected: gipformer1.5 is a different model. "
-                f"LifeMate target is {DEFAULT_MODEL_ID}"
-            )
-
         quant = str(quantization).lower()
         if quant not in ("int8", "fp32"):
             raise AsrError(f"unknown quantization {quantization!r}; choose 'int8' or 'fp32'")
 
-        self.model_id = model_id
-        self.revision = revision
+        # Spec-driven identity: the model id (or the model directory's name) must
+        # name a known checkpoint. An unknown id is an error — there is no silent
+        # fallback to the 68M default, and "1.5" is no longer special-cased.
+        self.spec = resolve_gipformer_spec(model_id, kind=model_dir)
+        if self.spec.model_id != model_id and spec_key(model_id) != self.spec.key:
+            raise AsrError(
+                f"model_id {model_id!r} does not match the resolved spec "
+                f"{self.spec.model_id!r}"
+            )
+
+        if not self.spec.verified:
+            # The spec table knows this id, but no artifact set was ever observed
+            # for it, so no recognizer can be built from it honestly. Derived from
+            # the spec, not from a substring of the model id.
+            raise AsrError(
+                f"model_id {model_id!r} is rejected: spec {self.spec.key!r} is [UNVERIFIED] "
+                f"and declares no verified artifact set. {self.spec.notes}"
+            )
+
+        self.model_id = self.spec.model_id
+        # ``nbest_size`` is recorded, never able to change the decode: the pinned
+        # runtime returns one hypothesis (see lifemate.asr.nbest).
+        self.nbest_size = int(nbest_size or 0)
+        # Revision provenance: the spec's own pinned revision when it has one.
+        # An [UNVERIFIED] spec has none, and borrowing the 68M commit would be a
+        # fabricated provenance, so it stays empty unless the caller names one.
+        if self.spec.revision:
+            self.revision = self.spec.revision
+        elif revision and revision != PINNED_REVISION:
+            self.revision = revision
+        else:
+            self.revision = ""
         self.quantization = quant
         self.model_dir = Path(model_dir) if model_dir else None
         self.num_threads = int(num_threads)
@@ -137,31 +163,22 @@ class GipformerBackend:
         raise AsrError(f"unknown device {device!r}; use 'cpu', 'cuda', or 'auto'")
 
     def _load(self) -> None:
-        try:
-            import sherpa_onnx  # noqa: PLC0415
-        except ImportError as exc:
-            missing_pkg = getattr(exc, "name", "sherpa_onnx")
-            raise AsrError(
-                f"GipformerBackend requires 'sherpa-onnx' and 'sherpa-onnx-core' (missing: {missing_pkg}). "
-                "Install with: pip install \"sherpa-onnx>=1.10\" \"sherpa-onnx-core>=1.10\" soundfile "
-                "or pip install -e \".[asr]\"."
-            ) from exc
-
-        target_files = _INT8_FILENAMES if self.quantization == "int8" else _FP32_FILENAMES
-        other_files = _FP32_FILENAMES if self.quantization == "int8" else _INT8_FILENAMES
+        # Artifact resolution runs BEFORE the sherpa import: a missing/unverified
+        # model must produce the actionable "which file is missing" error even on
+        # a box where sherpa-onnx is not installed at all.
+        target_files = artifacts_for(self.spec, self.quantization)
+        other_quant = "fp32" if self.quantization == "int8" else "int8"
+        other_files = (
+            artifacts_for(self.spec, other_quant) if other_quant in self.spec.quantizations else {}
+        )
 
         if self.offline:
             search_dir = self.model_dir if self.model_dir else Path("models/gipformer-68M-rnnt")
-            missing: list[str] = []
-            resolved: dict[str, Path] = {}
-            for role, filename in target_files.items():
-                p = search_dir / filename
-                if not p.is_file():
-                    missing.append(filename)
-                else:
-                    resolved[role] = p
-            if missing:
-                opposite_found = (search_dir / other_files["encoder"]).is_file()
+            problems = validate_artifacts(self.spec, search_dir, quantization=self.quantization)
+            if problems:
+                opposite_found = bool(other_files) and (
+                    search_dir / other_files["encoder"]
+                ).is_file()
                 opposite_hint = (
                     f" (found {'fp32' if self.quantization == 'int8' else 'int8'} files, "
                     f"but quantization={self.quantization!r} was requested; silent fallback is forbidden)"
@@ -169,10 +186,11 @@ class GipformerBackend:
                     else ""
                 )
                 raise AsrError(
-                    f"missing Gipformer ({self.quantization}) model files in {search_dir}: {', '.join(missing)}{opposite_hint}. "
-                    f"Download with: python scripts/download_asr_model.py --output-dir {search_dir} --quantization {self.quantization}"
+                    f"missing Gipformer ({self.quantization}) model files in {search_dir}: "
+                    f"{', '.join(problems)}{opposite_hint}. "
+                    + download_hint(self.spec, search_dir, self.quantization)
                 )
-            self._resolved_paths = resolved
+            self._resolved_paths = {role: search_dir / name for role, name in target_files.items()}
         else:
             try:
                 import huggingface_hub  # noqa: PLC0415
@@ -181,6 +199,11 @@ class GipformerBackend:
                     "online model resolution (offline=False) requires 'huggingface_hub'. "
                     "Install with: pip install \"huggingface-hub>=0.20.0\""
                 ) from exc
+            if not self.revision:
+                raise AsrError(
+                    f"spec {self.spec.key!r} has no pinned revision; pass revision=... "
+                    "explicitly for an online download instead of downloading a moving branch."
+                )
             resolved = {}
             for role, filename in target_files.items():
                 local_path = huggingface_hub.hf_hub_download(
@@ -192,6 +215,17 @@ class GipformerBackend:
             logger.info("Gipformer online resolution: %s", resolved)
             self._resolved_paths = resolved
 
+        try:
+            import sherpa_onnx  # noqa: PLC0415
+        except ImportError as exc:
+            missing_pkg = getattr(exc, "name", "sherpa_onnx")
+            raise AsrError(
+                f"GipformerBackend requires 'sherpa-onnx' and 'sherpa-onnx-core' (missing: {missing_pkg}). "
+                f"Model files resolved fine in {self._resolved_paths['tokens'].parent}. "
+                "Install with: pip install \"sherpa-onnx>=1.10\" \"sherpa-onnx-core>=1.10\" soundfile "
+                "or pip install -e \".[asr]\"."
+            ) from exc
+
         # Build recognizer
         sig = inspect.signature(sherpa_onnx.OfflineRecognizer.from_transducer)
         kwargs: dict[str, Any] = {
@@ -200,8 +234,8 @@ class GipformerBackend:
             "joiner": str(self._resolved_paths["joiner"]),
             "tokens": str(self._resolved_paths["tokens"]),
             "num_threads": self.num_threads,
-            "sample_rate": TARGET_SAMPLE_RATE,
-            "feature_dim": 80,
+            "sample_rate": self.spec.sample_rate,
+            "feature_dim": self.spec.feature_dim,
             "decoding_method": self.decoding_method,
         }
         if self._device == "cuda":
@@ -251,6 +285,11 @@ class GipformerBackend:
             "on_disk_mb": round(total_bytes / (1024 * 1024), 2),
             "files": file_sizes,
             "offline": self.offline,
+            "spec_key": self.spec.key,
+            "spec_verified": self.spec.verified,
+            "sample_rate": self.spec.sample_rate,
+            "feature_dim": self.spec.feature_dim,
+            "nbest_supported": self.nbest_supported,
         }
 
     def _load_audio(self, audio_path: str | Path) -> tuple[list[float], int, float]:
@@ -316,6 +355,67 @@ class GipformerBackend:
             raise AsrError("empty audio")
         return samples, rate, duration_s
 
+    def _decode(
+        self, audio_path: str | Path
+    ) -> tuple[str, float | None, int | None, float, float]:
+        """Decode one file.
+
+        Returns ``(raw_text, acoustic_logprob, n_tokens, duration_s, latency_s)``.
+        ``acoustic_logprob`` is the sum of the result's ``ys_log_probs`` — the
+        only per-token score the pinned runtime exposes. It is comparable only
+        against other decodes of *this* model, never across models.
+        """
+        t0 = time.perf_counter()
+        samples, rate, duration_s = self._load_audio(audio_path)
+
+        try:
+            import numpy as np  # noqa: PLC0415
+
+            wave_input = np.asarray(samples, dtype=np.float32)
+        except ImportError:
+            wave_input = samples
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(rate, wave_input)
+        self._recognizer.decode_streams([stream])
+        result = getattr(stream, "result", None)
+        raw_text = str(getattr(result, "text", "") or "").strip()
+
+        log_probs = getattr(result, "ys_log_probs", None)
+        acoustic_logprob: float | None = None
+        n_tokens: int | None = None
+        try:
+            if log_probs is not None and len(log_probs) > 0:
+                acoustic_logprob = float(sum(float(value) for value in log_probs))
+                n_tokens = int(len(log_probs))
+        except (TypeError, ValueError):
+            # A result that carries something unsummable must not invent a score.
+            acoustic_logprob, n_tokens = None, None
+
+        return raw_text, acoustic_logprob, n_tokens, duration_s, time.perf_counter() - t0
+
+    #: The pinned runtime exposes no N-best, so this is False by contract and
+    #: :meth:`transcribe_nbest` always raises (see ``lifemate.asr.nbest``).
+    nbest_supported = False
+
+    def transcribe_nbest(
+        self,
+        audio_path: str | Path,
+        *,
+        nbest_size: int = 3,
+        sample_id: str | None = None,
+    ) -> NBestResult:
+        """Always raises :class:`NBestUnsupportedError` on this runtime.
+
+        A 1-element "N-best" would be a fabricated result: sherpa-onnx 2.0.1's
+        offline API fills exactly one ``text`` per stream.
+        """
+        validate_nbest_size(nbest_size)
+        require_nbest_support(self, nbest_size=nbest_size)
+        raise NBestUnsupportedError(
+            "unreachable: GipformerBackend.nbest_supported is False by contract"
+        )
+
     def transcribe(
         self,
         audio_path: str | Path,
@@ -323,25 +423,12 @@ class GipformerBackend:
         sample_id: str | None = None,
         lenient: bool = False,
     ) -> TranscriptResult:
-        t0 = time.perf_counter()
         duration_s: float | None = None
+        t0 = time.perf_counter()
         effective_lenient = lenient or self.lenient
 
         try:
-            samples, rate, duration_s = self._load_audio(audio_path)
-
-            try:
-                import numpy as np  # noqa: PLC0415
-
-                wave_input = np.asarray(samples, dtype=np.float32)
-            except ImportError:
-                wave_input = samples
-
-            stream = self._recognizer.create_stream()
-            stream.accept_waveform(rate, wave_input)
-            self._recognizer.decode_streams([stream])
-            raw_text = getattr(getattr(stream, "result", None), "text", "") or ""
-            raw_text = str(raw_text).strip()
+            raw_text, acoustic_logprob, n_tokens, duration_s, latency_s = self._decode(audio_path)
 
             # ``raw_text`` keeps the recognizer string verbatim (this export emits
             # ALL UPPERCASE — its tokens file has 3 lowercase entries out of 2000
@@ -359,9 +446,11 @@ class GipformerBackend:
                 raw_text=raw_text,
                 language="vi",
                 duration_s=duration_s,
-                latency_s=time.perf_counter() - t0,
+                latency_s=latency_s,
                 backend=self.name,
                 model_name=self.model_id,
+                acoustic_logprob=acoustic_logprob,
+                n_tokens=n_tokens,
             )
         except ProhibitedAccessError:
             raise  # compliance violations are never converted to a result
