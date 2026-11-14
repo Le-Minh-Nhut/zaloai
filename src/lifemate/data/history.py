@@ -210,3 +210,36 @@ def apply_history_texts(
         if touched:
             stats["samples_touched"] += 1
     return stats
+
+
+def transcribe_missing_history(sample: Any, *, split: str, data_root: str | Path,
+                               transcribe: Any, deadline: float | None = None) -> list[str]:
+    """Fill missing user turns from their provided audio; return explicit errors."""
+    import time
+    from types import SimpleNamespace
+
+    errors = []
+    index = 0
+    for turn in _turns_of(sample):
+        if _turn_role(turn) != "user":
+            continue
+        index += 1
+        if _turn_text(turn):
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            errors.append(f"history turn {index}: time budget exhausted")
+            break
+        raw = _writeable_turn(turn) or {}
+        try:
+            path = _audio_path(raw, split, data_root)
+            if path is None or not path.is_file():
+                errors.append(f"history turn {index}: audio missing")
+                continue
+            text, info = transcribe(SimpleNamespace(id=f"{_sample_id(sample)}_u{index}", audio_path=path))
+            if not text or info.get("error"):
+                errors.append(f"history turn {index}: {info.get('error') or 'empty transcript'}")
+                continue
+            apply_history_texts([sample], {(split, _sample_id(sample), index): text}, split)
+        except HistoryTranscriptError:
+            raise
+    return errors

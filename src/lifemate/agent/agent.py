@@ -292,9 +292,9 @@ class ToolAgent:
                     or getattr(asr_sec, "multi_asr_enabled", False)
                 )
                 nbest_limit = int(
-                    getattr(asr_sec, "nbest_size", 3)
-                    or getattr(asr_sec, "multi_asr_max_hypotheses", 3)
-                    or 3
+                    getattr(asr_sec, "multi_asr_max_hypotheses", 3)
+                    if getattr(asr_sec, "multi_asr_enabled", False)
+                    else getattr(asr_sec, "nbest_size", 3)
                 )
             kwargs: dict[str, Any] = {
                 "transcript": transcript,
@@ -312,13 +312,21 @@ class ToolAgent:
             prompt = self.prompt_builder(**kwargs)
             messages = to_messages(prompt)
             try:
-                raw_output = self.generator.generate(messages)
+                import inspect
+                generate = self.generator.generate
+                if "deadline" in inspect.signature(generate).parameters:
+                    raw_output = generate(messages, deadline=deadline)
+                else:
+                    raw_output = generate(messages)
                 n_llm_calls += 1
             except Exception as exc:
                 errors.append(f"generator failed at step {step_index}: {type(exc).__name__}: {exc}")
                 status, finish_reason = "error", "generator_error"
                 break
 
+            if deadline is not None and self.clock() >= deadline:
+                status, finish_reason = "time_budget", REASON_TIME_BUDGET
+                break
             action = parse_model_output(str(raw_output or ""), registry, self.env)
             action, guard = _guardrail_apply(action, registry, self.env, self.guardrail)
             if guard is not None and guard.get("verdict") in {"rejected", "normalized"}:

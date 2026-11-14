@@ -401,6 +401,8 @@ def evaluate_closed_loop(
     split_paths: Any = None,
     evaluation_mode: str = "text_to_action",
     transcripts: Mapping[str, str] | None = None,
+    asr_info: Mapping[str, Any] | None = None,
+    prepare_history: Any = None,
 ) -> dict[str, Any]:
     """Run the agent against a REAL environment per sample.
 
@@ -425,6 +427,8 @@ def evaluate_closed_loop(
         sample_id = str(getattr(sample, "id", "") or "")
         budget_deadline = None if deadline_seconds is None else time.monotonic() + deadline_seconds
         try:
+            if prepare_history is not None:
+                prepare_history(sample, budget_deadline)
             agent = agent_factory(sample)
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "agent_factory", "error": f"{type(exc).__name__}: {exc}"[:300]})
@@ -432,7 +436,10 @@ def evaluate_closed_loop(
             continue
         try:
             transcript = transcripts.get(sample_id) if transcripts is not None else None
-            result = agent.run(sample, transcript=transcript, deadline=budget_deadline)
+            kwargs = {}
+            if asr_info is not None:
+                kwargs["asr_hypotheses"] = asr_info.get(sample_id, {}).get("hypotheses")
+            result = agent.run(sample, transcript=transcript, deadline=budget_deadline, **kwargs)
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "run", "error": f"{type(exc).__name__}: {exc}"[:300]})
             rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)]})

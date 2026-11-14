@@ -183,9 +183,14 @@ class MultiAsrBackend:
 
         primary_name = str(getattr(self.primary, "name", "primary"))
         secondary_name = str(getattr(self.secondary, "name", "secondary"))
+        if secondary_name == primary_name:
+            primary_name, secondary_name = "primary", "secondary"
 
         primary_hypotheses = self._primary_hypotheses(audio_path, sample_id=sample_id)
         primary_hypotheses = primary_hypotheses[: self.primary_topk]
+        if primary_name == "primary":
+            from dataclasses import replace
+            primary_hypotheses = [replace(h, source=primary_name) for h in primary_hypotheses]
         if not primary_hypotheses:
             result.reasons.append("primary backend produced no transcript")
 
@@ -224,6 +229,11 @@ class MultiAsrBackend:
             result.reasons.append(f"secondary backend failed: {message}")
             result.degraded = True
 
+        # Reserve room for a secondary candidate when the cap permits it.
+        primary_hypotheses = dedupe_hypotheses(primary_hypotheses)
+        if (secondary_hypotheses and self.max_hypotheses > 1
+                and secondary_hypotheses[0].normalized not in {h.normalized for h in primary_hypotheses}):
+            primary_hypotheses = primary_hypotheses[:self.max_hypotheses - 1]
         ordered = list(primary_hypotheses) + list(secondary_hypotheses)
         result.hypotheses = dedupe_hypotheses(ordered, limit=self.max_hypotheses)
         result.sources = sorted({h.source for h in result.hypotheses})
@@ -287,7 +297,7 @@ class MultiAsrBackend:
                 ]
             return []
         nbest = getattr(backend, "transcribe_nbest", None)
-        if callable(nbest) and getattr(backend, "nbest_supported", False) is True:
+        if callable(nbest) and self.primary_topk > 1 and getattr(backend, "nbest_supported", False) is True:
             produced_nbest = nbest(audio_path, nbest_size=max(2, self.primary_topk), sample_id=sample_id)
             return list(produced_nbest.hypotheses)
         transcript = backend.transcribe(audio_path, sample_id=sample_id, lenient=False)

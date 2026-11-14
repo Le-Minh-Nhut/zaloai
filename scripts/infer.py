@@ -365,7 +365,7 @@ def _build_asr(args: argparse.Namespace, cfg: Any, samples: Sequence[Any]) -> An
                 "oracle ASR requires --allow-oracle and is for training/evaluation only; "
                 "it must never produce a competition submission"
             )
-        transcripts = _load_transcripts(args.transcripts)
+        transcripts = _load_transcripts(getattr(args, "transcripts", None))
         for sample in samples:
             transcripts.setdefault(str(sample.id), str(getattr(sample, "audio_text", "") or ""))
         if not any(transcripts.values()):
@@ -385,7 +385,10 @@ def _build_asr(args: argparse.Namespace, cfg: Any, samples: Sequence[Any]) -> An
         return _compose_multi_asr(cfg, primary)
 
     if backend == "gipformer":
-        primary = create_asr_backend(cfg, backend="gipformer")
+        overrides = {}
+        if _flag(getattr(cfg, "features", cfg), "asr", "gipformer_v15_enabled"):
+            overrides = {"model_id": "g-group-ai-lab/gipformer1.5-68M-rnnt", "model_dir": None, "revision": ""}
+        primary = create_asr_backend(cfg, backend="gipformer", **overrides)
         return _compose_multi_asr(cfg, primary)
 
     if backend == "none":
@@ -441,6 +444,8 @@ def _compose_multi_asr(cfg: Any, primary: Any) -> Any:
                 file=sys.stderr,
             )
     else:
+        if str(_param(features, "asr", "multi_asr_failure_policy", "primary_only")) == "strict":
+            raise AsrError("multi-ASR secondary_model_id is empty in strict mode")
         print(
             "WARNING: asr.multi_asr is ON but features.asr.secondary_model_id is empty; "
             "running PRIMARY ONLY. This run is not a multi-ASR result.",
@@ -452,6 +457,7 @@ def _compose_multi_asr(cfg: Any, primary: Any) -> Any:
         enabled=True,
         policy=str(_param(features, "asr", "multi_asr_policy", "primary_topk_secondary_top1")),
         max_hypotheses=int(_param(features, "asr", "multi_asr_max_hypotheses", 3)),
+        primary_topk=int(_param(features, "asr", "nbest_size", 3)) if _flag(features, "asr", "nbest_enabled") else 1,
         failure_policy=str(_param(features, "asr", "multi_asr_failure_policy", "primary_only")),
     )
 
@@ -577,7 +583,21 @@ def _transcribe(
                 transcription_path, conditioning = _condition_audio(
                     audio_path, features, Path(directory)
                 )
-            if _flag(features, "asr", "nbest_enabled"):
+            if _flag(features, "asr", "multi_asr_enabled") and hasattr(asr, "transcribe_multi"):
+                nbest_requested = _flag(features, "asr", "nbest_enabled")
+                multi_res = asr.transcribe_multi(transcription_path, sample_id=sample_id)
+                if not multi_res.hypotheses:
+                    raise AsrError("multi-ASR produced no hypotheses")
+                result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
+                hypotheses = list(multi_res.hypotheses)
+                conditioning["multi_asr"] = {"executed": bool(multi_res.multi_asr), "degraded": bool(multi_res.degraded), "reasons": list(multi_res.reasons)}
+                if nbest_requested:
+                    if not getattr(asr.primary, "nbest_supported", False):
+                        nbest_reason = "primary backend does not support decoder N-best"
+                    else:
+                        source = hypotheses[0].source
+                        conditioning["nbest"] = {"requested": int(_param(features, "asr", "nbest_size", 3)), "returned": sum(h.source == source for h in hypotheses)}
+            elif _flag(features, "asr", "nbest_enabled"):
                 nbest_requested = True
                 nbest, nbest_reason = _nbest_text(asr, transcription_path, sample_id, features)
                 if nbest is None:
@@ -595,18 +615,13 @@ def _transcribe(
                         "returned": len(hypotheses),
                         "degraded": bool(getattr(nbest, "degraded", False)),
                     }
-            elif _flag(features, "asr", "multi_asr_enabled") and hasattr(asr, "transcribe_multi"):
-                multi_res = asr.transcribe_multi(transcription_path, sample_id=sample_id)
-                if multi_res.hypotheses:
-                    result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
-                    hypotheses = list(multi_res.hypotheses)
-                else:
-                    result = asr.transcribe(transcription_path, sample_id=sample_id)
             else:
                 result = asr.transcribe(transcription_path, sample_id=sample_id)
     except ProhibitedAccessError:
         raise                                    # a backend that reached a banned path must stop the run
     except Exception as exc:
+        if _flag(features, "asr", "multi_asr_enabled") and _param(features, "asr", "multi_asr_failure_policy", "primary_only") == "strict":
+            raise
         info = {
             "backend": backend_label,
             "error": f"{type(exc).__name__}: {exc}"[:300],
@@ -631,7 +646,9 @@ def _transcribe(
     if conditioning:
         info["conditioning"] = conditioning
     if hypotheses is not None:
-        info["hypotheses"] = hypotheses
+        from dataclasses import replace
+        info["raw_hypotheses"] = hypotheses
+        info["hypotheses"] = [replace(h, text=apply_itn_pipeline(h.text, enabled=_flag(features, "prompt", "itn_enabled"))) for h in hypotheses]
     if nbest_requested:
         info["nbest_requested"] = True
     if nbest_reason is not None:
@@ -889,16 +906,10 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         reason = "no --history-transcripts file was configured"
-    # Blank history is silent prompt degradation: the model sees an empty prior
-    # turn instead of the user's words and nothing in the submission says so.
-    # Refuse before any weights are loaded; a diagnostic run opts out explicitly.
-    if blank and not getattr(args, "allow_missing_history", False):
-        print(
-            f"ERROR: {reason}; split={split} would render {blank} history user turn(s) blank. "
-            "Pass --history-transcripts FILE, or --allow-missing-history for a diagnostic run.",
-            file=sys.stderr,
-        )
+    if blank and (args.asr or cfg.asr.backend or "none").lower() in {"none", "oracle"} and not getattr(args, "allow_missing_history", False):
+        print(f"ERROR: {reason}; no audio ASR backend is available for history", file=sys.stderr)
         return EXIT_DATASET
+    # Remaining turns are transcribed per sample after the backend is loaded.
 
     # -- environment preflight --------------------------------------------- #
     # Import the split's SDK before loading weights: a missing simulator must fail
@@ -986,7 +997,16 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         if sample_id in skip_ids:
             continue
         current_id["value"] = sample_id
+        deadline = time.monotonic() + float(cfg.agent.time_budget_seconds)
 
+        from lifemate.data.history import transcribe_missing_history
+        history_errors = transcribe_missing_history(
+            sample, split=split, data_root=data_root, deadline=deadline,
+            transcribe=lambda item: _transcribe(asr, item, features=features),
+        )
+        if history_errors and not getattr(args, "allow_missing_history", False):
+            print(f"ERROR: {sample_id}: {'; '.join(history_errors)}", file=sys.stderr)
+            return EXIT_DATASET
         transcript, asr_info = _transcribe(asr, sample, features=features)
         asr_error = asr_info.get("error")
         if asr_error or (asr_checked and not transcript):
@@ -1036,7 +1056,6 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             config=cfg,
             guardrail=_flag(features, "postprocessing", "enhanced_schema_guardrail_enabled"),
         )
-        deadline = time.monotonic() + float(cfg.agent.time_budget_seconds)
         try:
             asr_hyp = asr_info.get("hypotheses")
             result = agent.run(sample, transcript=transcript, deadline=deadline, asr_hypotheses=asr_hyp)

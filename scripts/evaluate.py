@@ -161,6 +161,8 @@ def _build_config(args: argparse.Namespace) -> Any:
     if args.use_mock_env:
         cfg.inference.use_mock_env = True
     cfg.inference.split = args.split
+    if getattr(args, "asr", None):
+        cfg.asr.backend = args.asr
     _feature_config(cfg, args)
     return cfg
 
@@ -372,14 +374,29 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
 
     eval_mode = getattr(args, "evaluation_mode", "text_to_action")
     transcripts = None
+    cache_stats = {}
+    prepare_history = None
+    history_path = getattr(cfg.inference, "history_transcripts", None)
+    if history_path:
+        from lifemate.data.history import apply_history_texts, load_history_texts
+        apply_history_texts(samples, load_history_texts(history_path, data_root=data_root), args.split)
     if eval_mode == "audio_to_action":
         from lifemate.asr.transcription import transcribe_samples_cached
 
+        infer = _infer_module()
+        asr_backend = infer._build_asr(args, cfg, samples)
+        from lifemate.data.history import transcribe_missing_history
+        def prepare_history(sample, deadline):
+            errors = transcribe_missing_history(sample, split=args.split, data_root=data_root, deadline=deadline,
+                transcribe=lambda item: infer._transcribe(asr_backend, item, features=features))
+            if errors:
+                raise LifeMateError("; ".join(errors))
         cache_path = getattr(args, "transcript_cache", None) or (Path(cfg.evaluation.output_dir) / "transcripts_cache.json")
         transcripts, cache_stats = transcribe_samples_cached(
             samples,
             cfg,
             features=features,
+            asr=asr_backend,
             split=args.split,
             cache_path=cache_path,
             args=args,
@@ -400,7 +417,26 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
         split_paths=paths,
         evaluation_mode=eval_mode,
         transcripts=transcripts,
+        asr_info=cache_stats.get("asr_info"),
+        prepare_history=prepare_history,
     )
+    if eval_mode == "audio_to_action":
+        info = cache_stats.get("asr_info", {})
+        execution = {}
+        for feature, enabled in (("asr.nbest", _flag(features, "asr", "nbest_enabled")), ("asr.multi_asr", _flag(features, "asr", "multi_asr_enabled"))):
+            if not enabled:
+                continue
+            entries = list(info.values())
+            def succeeded(item):
+                if item.get("error"):
+                    return False
+                if feature == "asr.nbest":
+                    return not item.get("nbest_fallback") and bool((item.get("conditioning") or {}).get("nbest", {}).get("returned", 0) > 1)
+                return bool((item.get("conditioning") or {}).get("multi_asr", {}).get("executed"))
+            ok = sum(bool(succeeded(item)) for item in entries)
+            execution[feature] = {"n_requested": len(entries), "n_executed": ok, "n_degraded": len(entries) - ok, "n_blocked": sum(bool(item.get("error")) for item in entries)}
+        summary["feature_execution"] = execution
+        summary["degraded_features"] = [name for name, counts in execution.items() if counts["n_degraded"]]
     if mock:
         summary["mock_env"] = True
         summary["note"] = f"{MOCK_NOTE}: MockToolEnv, not the official simulator"
@@ -506,7 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_DATA
 
-    do_teacher = args.validation_only or not args.closed_loop
+    do_teacher = args.validation_only or (not args.closed_loop and getattr(args, "evaluation_mode", "text_to_action") != "audio_to_action")
     do_closed = args.closed_loop or not args.validation_only
     if not do_teacher and not do_closed:
         print("ERROR: nothing to evaluate (pass --validation-only or --closed-loop)", file=sys.stderr)
@@ -561,6 +597,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if do_teacher and not do_closed:
         eval_mode = "text_to_action"
     extra["evaluation_mode"] = eval_mode
+    if closed_payload:
+        extra["feature_execution"] = closed_payload.get("feature_execution", {})
+        extra["degraded_features"] = closed_payload.get("degraded_features", [])
     payload = evaluate_split(
         cfg=cfg,
         split=args.split,

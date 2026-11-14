@@ -339,6 +339,13 @@ def build_report(
     """Validate, (optionally) run, and assemble the comparison report."""
     _validate_arms(arms)
     _validate_fairness(arms, experimental_variables=experimental_variables)
+    arm_features = [set(enabled_features(_arm_config(arm)[1])) for arm in arms]
+    changed = set().union(*(item ^ arm_features[0] for item in arm_features))
+    if any(name.startswith(("asr.", "audio.")) for name in changed):
+        if evaluation_mode is None:
+            evaluation_mode = "audio_to_action"
+        elif evaluation_mode != "audio_to_action":
+            raise ValueError("ASR/audio ablations require audio_to_action evaluation")
 
     first_app, _first_features, _prov, _unknown = _arm_config(arms[0])
     features_wired = hasattr(first_app, "features")
@@ -438,7 +445,12 @@ def build_report(
             n_successful = payload.get("n_successful", 0)
             n_failed = payload.get("n_failed", 0)
         degraded = list(payload.get("degraded_features") or [])
-        effective = [f for f in entry["enabled_features"] if f not in degraded]
+        execution = payload.get("feature_execution") or {}
+        observed = {name for name, counts in execution.items() if counts.get("n_requested", 0) and counts.get("n_executed") == counts.get("n_requested")}
+        runtime_features = {f for f in entry["enabled_features"] if f.startswith(("asr.", "audio."))}
+        unknown_execution = runtime_features - set(execution)
+        degraded = sorted(set(degraded) | unknown_execution)
+        effective = [f for f in entry["enabled_features"] if f not in degraded and (f not in runtime_features or f in observed)]
         entry["n_samples"] = n_samples
         entry["n_successful"] = n_successful
         entry["n_failed"] = n_failed
@@ -452,6 +464,13 @@ def build_report(
             "model_mode": provenance_block.get("model_mode"),
             "checkpoint": provenance_block.get("checkpoint"),
         }
+        if degraded:
+            entry["deltas"] = {key: None for key in COMPARED_METRICS}
+            entry["deltas_note"] = "invalid comparison: a requested feature degraded or was blocked"
+            if index == 0:
+                reference_metrics = None
+            arm_reports.append(entry)
+            continue
         if index == 0:
             reference_metrics = metrics
             entry["deltas"] = {

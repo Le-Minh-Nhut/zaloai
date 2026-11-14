@@ -28,6 +28,8 @@ def format_feature_report(
     registry: Any = REGISTRY,
 ) -> str:
     """Render the effective configuration; labels are contractual."""
+    if getattr(getattr(cfg, "asr", None), "gipformer_v15_enabled", False):
+        asr_id = "g-group-ai-lab/gipformer1.5-68M-rnnt (requested)"
     enabled = enabled_features(cfg)
     known = registry.ids
     disabled = sorted(set(known) - set(enabled))
@@ -58,6 +60,8 @@ def feature_report_dict(
     registry: Any = REGISTRY,
 ) -> dict[str, Any]:
     """JSON-ready feature report (checkpoint metadata / ``report.json``)."""
+    if getattr(getattr(cfg, "asr", None), "gipformer_v15_enabled", False):
+        asr_id = "g-group-ai-lab/gipformer1.5-68M-rnnt"
     enabled = enabled_features(cfg)
     provenance: Mapping[str, str] = getattr(cfg, "provenance", {}) or {}
     return {

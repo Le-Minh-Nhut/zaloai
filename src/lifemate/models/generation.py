@@ -205,7 +205,7 @@ class HFGenerator:
             ) from exc
 
     # -------------------------------------------------------------- generate
-    def generate(self, messages: Sequence[dict[str, str]]) -> str:
+    def generate(self, messages: Sequence[dict[str, str]], *, deadline: float | None = None) -> str:
         """Generate exactly one assistant turn (text, not token ids).
 
         Raises :class:`LifeMateError` when the decode was cut off by
@@ -239,6 +239,11 @@ class HFGenerator:
             # the previous kwargs byte-identical for single-EOS checkpoints.
             "eos_token_id": eos_ids[0] if len(eos_ids) == 1 else eos_ids,
         }
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LifeMateError("generation deadline exhausted")
+            kwargs["max_time"] = remaining
         if self.do_sample:
             kwargs["temperature"] = max(self.temperature, 1e-5)
             if self.top_p is not None:
