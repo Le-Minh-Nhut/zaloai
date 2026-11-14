@@ -1,0 +1,29 @@
+{
+  "python": "/tmp/cudaenv/bin/python",
+  "model": "models/MiniCPM5-2B",
+  "dataset": "outputs/datasets/minicpm_baseline/train",
+  "training_config": "configs/training_lora.yaml",
+  "inference_config": "configs/competition_inference.yaml",
+  "work_dir": "outputs/overnight_gated",
+  "validation_limit": 20,
+  "minimum_free_gib": 15,
+  "minimum_start_minutes": 120,
+  "inference_features": [
+    "prompt.itn",
+    "postprocessing.enhanced_schema_guardrail",
+    "decoding.constrained",
+    "audio.vad",
+    "audio.rms_normalization"
+  ],
+  "sft_variants": [
+    "slot_masking",
+    "tool_dropout",
+    "noisy_asr"
+  ],
+  "noisy_asr_transcripts": null,
+  "noisy_asr_provenance": null,
+  "ai_review_gate": {
+    "enabled": true,
+    "timeout_seconds": 300
+  }
+}

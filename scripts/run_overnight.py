@@ -21,6 +21,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
+sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'src'))
 from lifemate.data.loader import load_samples
 from lifemate.evaluation.heldout import select_heldout
@@ -427,9 +428,23 @@ def worker(c, state, state_path, deadline):
     env.update(PYTHONPATH='src', HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
                TOKENIZERS_PARALLELISM='false', LIFEMATE_LOCAL_METRICS='1', WANDB_MODE='disabled')
     stop_path = root / 'STOP'
+    gate = None
+    gate_config = c.get('ai_review_gate') or {}
+    if gate_config.get('enabled'):
+        from ai_review_gate import ReviewGate
+        gate = ReviewGate(root / 'ai_gate', ROOT, timeout=int(gate_config.get('timeout_seconds', 300)))
+
+    def reviewed(name, command, entry, training):
+        if gate is not None:
+            phase = 'AFTER_TRAIN' if training is not None else ('SUBMISSION_CHECK' if name.startswith(('submission', 'submit-')) else 'AFTER_EVAL')
+            return gate.check(phase, name, command, state, entry, is_training=training is not None)
+        return 'CONTINUE'
+
     def job(name, command, *, training=None):
         existing = state['jobs'].get(name, {})
-        if existing.get('status') == 'COMPLETED': return True
+        if existing.get('status') == 'COMPLETED':
+            reviewed(name, command, existing, training)
+            return True
         if existing.get('status') == 'RUNNING':
             if same_process(existing.get('pid'), existing.get('process_start')):
                 raise RuntimeError(f'previous job {name} is still running; refusing a second GPU job')
@@ -452,6 +467,9 @@ def worker(c, state, state_path, deadline):
             state['status'] = 'INTERRUPTED'; atomic(state_path, state); return False
         if shutil.disk_usage(root).free < int(c['minimum_free_gib']) * 1024**3:
             raise RuntimeError('insufficient disk before job')
+        if gate is not None:
+            gate.check('BEFORE_TRAIN' if training is not None else 'BEFORE_JOB', name, command,
+                       state, {'status': 'PENDING', 'previous': existing}, is_training=training is not None)
         free, busy = gpu_free()
         if busy or free < 12000: raise RuntimeError(f'GPU busy or insufficient VRAM: free={free} MiB processes={busy!r}')
         log = root / 'logs' / f'{name}.log'; log.parent.mkdir(parents=True, exist_ok=True)
@@ -511,7 +529,22 @@ def worker(c, state, state_path, deadline):
                      elapsed_seconds=max(0.0, (ended - dt.datetime.fromisoformat(entry['started'])).total_seconds()),
                      status='INTERRUPTED' if stop_sent else ('COMPLETED' if proc.returncode == 0 else 'FAILED'))
         atomic(state_path, state)
-        if entry['status'] != 'COMPLETED': state['status'] = entry['status']; atomic(state_path, state); return False
+        if entry['status'] != 'COMPLETED':
+            state['status'] = entry['status']; atomic(state_path, state)
+            if gate is not None and not stop_sent and training is not None:
+                recovery = reviewed(name, command, entry, training)
+                if recovery == 'RETRY_FROM_CHECKPOINT':
+                    if len(attempts) >= 1:
+                        raise RuntimeError('automatic recovery already attempted')
+                    candidates = sorted((p for p in (Path(training['directory']) / 'lora').glob('*-*')
+                                         if valid_checkpoint(p, training['horizon'])),
+                                        key=lambda p: int(p.name.rsplit('-', 1)[-1]))
+                    if not candidates or '--resume' in command:
+                        raise RuntimeError('no compatible checkpoint for automatic recovery')
+                    entry['status'] = 'INTERRUPTED'; state['status'] = 'RUNNING'; atomic(state_path, state)
+                    return job(name, [*command, '--resume', str(candidates[-1])], training=training)
+            return False
+        reviewed(name, command, entry, training)
         return True
     try:
         preflight(c)
@@ -712,7 +745,9 @@ def main():
     action.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     p.add_argument('--config', default='configs/overnight_experiments.yaml')
     p.add_argument('--stop-at', help='deadline ISO 8601 with timezone, e.g. 2026-11-16T07:00:00+07:00')
+    p.add_argument('--retry-review', help='on --resume, requeue one rejected review by its 64-character event id')
     args = p.parse_args()
+    if args.retry_review and not args.resume: raise RuntimeError('--retry-review requires --resume')
     config_path = assert_path_allowed(args.config); assert_path_allowed(config_path.resolve())
     c = json.loads(config_path.read_text()); root = assert_path_allowed(c['work_dir']); assert_path_allowed(root.resolve()); state_path = root / 'state.json'
     if args.status:
@@ -738,7 +773,9 @@ def main():
         try:
             worker(c, state, state_path, dt.datetime.fromisoformat(state['stop_at']))
         except Exception as exc:
-            state['status'] = 'FAILED'; state['error'] = f'{type(exc).__name__}: {exc}'
+            from ai_review_gate import GateBlocked
+            state['status'] = 'REVIEW_BLOCKED' if isinstance(exc, GateBlocked) else 'FAILED'
+            state['error'] = f'{type(exc).__name__}: {exc}'
             state['worker_pid'] = None; atomic(state_path, state)
             raise
         return 0
@@ -770,7 +807,10 @@ def main():
         for job_info in state.get('jobs', {}).values():
             if job_info.get('status') == 'RUNNING' and same_process(job_info.get('pid'), job_info.get('process_start')):
                 raise RuntimeError('a prior child is still running; refusing a duplicate job')
-        if state.get('status') not in ('INTERRUPTED', 'RUNNING', 'STARTING'): raise RuntimeError(f'refusing automatic retry from {state.get("status")}')
+        if state.get('status') not in ('INTERRUPTED', 'RUNNING', 'STARTING', 'REVIEW_BLOCKED'): raise RuntimeError(f'refusing automatic retry from {state.get("status")}')
+        if args.retry_review:
+            from ai_review_gate import retry_rejected
+            retry_rejected(root / 'ai_gate', args.retry_review)
         if args.stop_at:
             deadline=dt.datetime.fromisoformat(args.stop_at)
             if deadline.tzinfo is None or deadline <= now(): raise RuntimeError('invalid stop time')

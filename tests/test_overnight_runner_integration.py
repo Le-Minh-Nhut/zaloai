@@ -137,3 +137,43 @@ def test_global_gpu_lock_prevents_second_worker(tmp_path,monkeypatch):
         state=json.loads((run/'state.json').read_text())
         assert state['status']=='FAILED' and state.get('jobs')=={}
         assert not (run/'baseline').exists()
+
+
+def test_gated_worker_runs_reviewed_synthetic_pipeline(tmp_path,monkeypatch):
+    runner,run,config=_setup(tmp_path,monkeypatch)
+    cfg=json.loads(config.read_text()); cfg['ai_review_gate']={'enabled':True,'timeout_seconds':5}; config.write_text(json.dumps(cfg))
+    original=runner.prepare_worktree
+    def gated_tree(path,revision):
+        target=original(path,revision)
+        harness=target/'scripts/run_overnight.py'
+        content=harness.read_text()
+        inject=f'''\nsys.path.insert(0,{str(SOURCE.parents[1]/"scripts")!r})\nimport ai_review_gate\ndef fake_review(self,event,facts,output,log):\n return {{"event_id":event["id"],"experiment_id":event["job"],"verdict":"MODEL_UNDERPERFORMANCE" if event["kind"]=="AFTER_EVAL" else "PASS","confidence":"HIGH","evidence":["synthetic job artifact"],"root_cause":None,"affected_components":[],"recommended_action":"continue","decision":"CONTINUE","retraining_necessary":False,"checkpoint_valid":True}}\nai_review_gate.ReviewGate._invoke=fake_review\n'''
+        harness.write_text(content.replace('sys.exit(m.main())',inject+'\nsys.exit(m.main())'))
+        return target
+    monkeypatch.setattr(runner,'prepare_worktree',gated_tree)
+    assert _invoke(monkeypatch,runner,config,'--start','--stop-at','2099-01-01T07:00:00+07:00')==0
+    state=_wait_status(run,{'COMPLETED_WITH_SKIPS','FAILED','REVIEW_BLOCKED'},timeout=45)
+    assert state['status']=='COMPLETED_WITH_SKIPS',state
+    records=[json.loads(p.read_text()) for p in (run/'ai_gate').glob('*.json')]
+    assert records and all(r['status']=='APPROVED' for r in records)
+    assert any(r['event']['kind']=='AFTER_TRAIN' for r in records)
+    assert any(r['review']['verdict']=='MODEL_UNDERPERFORMANCE' for r in records)
+    assert state['selected']['score']==.5
+
+
+def test_gated_worker_blocks_before_training_on_inconclusive_review(tmp_path,monkeypatch):
+    runner,run,config=_setup(tmp_path,monkeypatch)
+    cfg=json.loads(config.read_text()); cfg['ai_review_gate']={'enabled':True,'timeout_seconds':5}; config.write_text(json.dumps(cfg))
+    original=runner.prepare_worktree
+    def gated_tree(path,revision):
+        target=original(path,revision); harness=target/'scripts/run_overnight.py'; content=harness.read_text()
+        inject=f'''\nsys.path.insert(0,{str(SOURCE.parents[1]/"scripts")!r})\nimport ai_review_gate\ndef reject(self,event,facts,output,log):\n return {{"event_id":event["id"],"experiment_id":event["job"],"verdict":"INCONCLUSIVE","confidence":"HIGH","evidence":["missing evidence"],"root_cause":None,"affected_components":[],"recommended_action":"investigate","decision":"INVESTIGATE","retraining_necessary":None,"checkpoint_valid":None}}\nai_review_gate.ReviewGate._invoke=reject\n'''
+        harness.write_text(content.replace('sys.exit(m.main())',inject+'\nsys.exit(m.main())')); return target
+    monkeypatch.setattr(runner,'prepare_worktree',gated_tree)
+    try:
+        _invoke(monkeypatch,runner,config,'--start','--stop-at','2099-01-01T07:00:00+07:00')
+    except RuntimeError as exc:
+        assert 'startup handshake' in str(exc)
+    state=_wait_status(run,{'REVIEW_BLOCKED','FAILED'},timeout=10)
+    assert state['status']=='REVIEW_BLOCKED',state
+    assert not (run/'baseline').exists()
