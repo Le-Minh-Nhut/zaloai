@@ -25,7 +25,7 @@ Kết quả, log và state dự kiến nằm trong `outputs/overnight/`: `state.
 - `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --dry-run`: PASS; xác nhận lệnh baseline và held-out, không train.
 - `/tmp/cudaenv/bin/python -m pytest -q tests/test_overnight_runner_integration.py tests/test_overnight_safety.py tests/test_submission_readiness_repairs.py`: **31 passed**. Các job tổng hợp sử dụng tiến trình tách rời thật, checkpoint giả và evaluator giả; kiểm tra start/duplicate/status, chuỗi tuần tự, episode model thất bại, candidate adapter-only, stop/resume, exit 7, khóa GPU, SFT riêng horizon khác và báo cáo. Đây không phải bằng chứng huấn luyện MiniCPM thật.
 - Kiểm thử journal/inference/evaluation liên quan: **61 passed**. Không chạy lại smoke MiniCPM 8192 hoặc full training theo yêu cầu; kết quả ở báo cáo trước không được tính là kết quả mới.
-- Regression toàn bộ và SHA cuối: xem kết quả xác minh Git sau commit bên dưới. Không commit model, dataset, checkpoint, log hoặc credentials.
+- Full regression tại worktree sạch từ commit mã `faa7fed`, với `WANDB_BASE_URL=http://127.0.0.1:9 PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q`: **983 passed, 1 skipped, 1 warning**, 79,72 giây. Lượt đầu có 3 test thất bại vì manifest ghi đường dẫn tuyệt đối của checkout; test nay xác nhận đường dẫn đúng rồi chuẩn hóa trường đó khi so digest, và 12 test dataset đã qua. Commit báo cáo sau đó chỉ thay tài liệu; code được test không đổi. Không commit model, dataset, checkpoint, log hoặc credentials.
 - Docker, full submission và điểm chính thức **NOT TESTED** trong phiên; không tuyên bố submission-ready. Candidate thật và chất lượng task chỉ xác định sau khi chạy thực tế.
 
 ## Gate G01–G30
@@ -52,14 +52,14 @@ Kết quả, log và state dự kiến nằm trong `outputs/overnight/`: `state.
 | G18 | PASS | Test khóa GPU toàn cục và từ chối worker thứ hai. |
 | G19 | PASS | Test exit code 7 được ghi FAILED. |
 | G20 | PASS | Test stop/resume worker với checkpoint tổng hợp; real training chưa chạy. |
-| G21 | PASS | Thiếu noisy-ASR asset được ghi SKIPPED_MISSING_ASSET. |
+| G21 | NOT TESTED | Nhánh xử lý thiếu noisy-ASR asset đã nối, chưa chạy integration thực cho nhánh này. |
 | G22 | PASS | So sánh cùng held-out, episode model thất bại tính 0; không phải official score. |
 | G23 | PASS | Tên submission theo SHA adapter; test luồng tổng hợp. |
 | G24 | NOT TESTED | Kiểm validator được nối; chưa tạo submission full thật. |
 | G25 | NOT TESTED | Không chạy Docker. |
 | G26 | PASS | Dry-run thật xuất lệnh baseline và evaluate. |
 | G27 | PASS | 31 test tập trung và 61 test liên quan như trên. |
-| G28 | NOT TESTED | Chờ kết quả full regression phiên này. |
+| G28 | PASS | 983 passed, 1 skipped, 1 warning ở worktree sạch commit mã `faa7fed`. |
 | G29 | PASS | Test start/status/stop/resume và báo cáo với tiến trình tổng hợp. |
 | G30 | PASS | Không khởi chạy full training trước GO. |
 
