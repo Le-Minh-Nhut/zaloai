@@ -170,11 +170,22 @@ QWEN3_5_PROFILE = ModelProfile(
     response_terminator=IM_END,
     no_think_suffix=CLOSED_THINK_SUFFIX,
     prompt_add_special_tokens=True,
-    preflight_params=4_000_000_000,
+    # MEASURED, not rounded: a meta-device Qwen3_5ForCausalLM built from the
+    # released text config sums to exactly this over its 426 tensors, with no
+    # separate lm_head (tie_word_embeddings=true, so the head IS embed_tokens and
+    # allocates nothing extra). state_dict() reports 4,841,450,496 only because it
+    # counts the tied tensor twice (difference 635,699,200 = 248320 * 2560), and
+    # that is the wrong basis for a memory estimate. See
+    # docs/FINAL_PRETRAINING_READINESS_AUDIT.md:146.
+    preflight_params=4_205_751_296,
     preflight_layers=32,
     preflight_hidden=2560,
     preflight_vocab=248320,
-    preflight_source="released text_config (32 layers, hidden 2560, vocab 248320)",
+    preflight_source=(
+        "meta-device build of the released text_config (32 layers, hidden 2560, "
+        "vocab 248320); sum(parameters()) = 4,205,751,296 over 426 tensors, "
+        "lm_head tied to embed_tokens and not counted twice"
+    ),
     notes=("tokenizer.eos_token_id IS <|im_end|>, so the old terminator was correct",),
 )
 

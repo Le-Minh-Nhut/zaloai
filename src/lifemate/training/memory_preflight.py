@@ -83,10 +83,6 @@ TIGHT_FRACTION = 0.9
 DEFAULT_PARAMS = 2_516_756_480
 DEFAULT_LAYERS = 42
 DEFAULT_HIDDEN = 2048
-#: Qwen3.5-4B shape, kept for the explicit Qwen profile.
-QWEN_PARAMS = 4_000_000_000
-QWEN_LAYERS = 32
-QWEN_HIDDEN = 2560
 #: nf4 storage ≈ 0.5 byte/param (4-bit + per-block absmax scale); the frozen base
 #: is not kept in 16-bit alongside it.
 NF4_BYTES_PER_PARAM = 0.5
@@ -164,7 +160,8 @@ def _model_shape(cfg: Any, model: Any = None) -> tuple[int, int, int, int, str]:
     2. ``config.json`` of a LOCAL model directory named by ``cfg.model.name``
        (stdlib JSON read, offline, no network);
     3. the model profile's verified fallbacks (MiniCPM5-2B: 2,516,756,480 params
-       / 42 layers / 2048 hidden — measured; Qwen3.5-4B: 4e9 / 32 / 2560).
+       / 42 layers / 2048 hidden — measured; Qwen3.5-4B: 4,205,751,296 / 32 /
+       2560 — measured on a meta-device build of the released text config).
 
     ``source`` is stamped into the report so an estimate states where its shape
     came from instead of implying a measurement.

@@ -2,9 +2,11 @@
 #
 # Memory plan (decimal GB, estimate — see docs/TRAINING_GUIDE.md):
 #   `--dry-run --tuning full` with this config's model (MiniCPM5-2B,
-#   2,516,756,480 params) prints TOTAL 43.62 GB: weights 10.07 + grads 10.07
-#   + AdamW 20.13 + activations 2.82 (grad ckpt) + chunked logits 0.53.
-#   With `--model Qwen/Qwen3.5-4B --param-count 4205751296` it prints 70.99 GB.
+#   2,516,756,480 params) prints TOTAL 45.76 GB: weights 10.07 + grads 10.07
+#   + AdamW 20.13 + activations 2.82 (grad ckpt) + bf16 head logits 2.14
+#   + chunked fp32 logits 0.53.
+#   With `--model Qwen/Qwen3.5-4B` (4,205,751,296 params from the profile) it
+#   prints 75.06 GB.
 #   Either way `verdict: does_not_fit` a 16 GB card; full FT needs an
 #   80 GB-class GPU (or ZeRO-3 sharding).
 #   Parameters stay fp32 (AdamW writes its update into the parameter tensor; a bf16

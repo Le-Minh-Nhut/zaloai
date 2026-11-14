@@ -640,6 +640,9 @@ def test_preflight_shape_differs_per_profile_and_is_labelled() -> None:
     assert mini_report["param_count"] == 2_516_756_480, mini_report["param_count"]
     assert (mini_report["layers"], mini_report["hidden"]) == (42, 2048)
     assert (qwen_report["layers"], qwen_report["hidden"]) == (32, 2560)
+    # The measured text-config count, not a round 4e9: meta-device
+    # Qwen3_5ForCausalLM over the released config sums to exactly this.
+    assert qwen_report["param_count"] == 4_205_751_296, qwen_report["param_count"]
     assert mini_report["param_count"] != qwen_report["param_count"]
     assert mini_report["activations_gb"] != qwen_report["activations_gb"]
     # Honest provenance: the shape source and the estimate/measured split are
@@ -653,7 +656,7 @@ def test_preflight_shape_differs_per_profile_and_is_labelled() -> None:
     assert mini_report["base_weights_gb"] == 5.03, mini_report["base_weights_gb"]
     print(
         f"  preflight -> MiniCPM {mini_report['param_count']:,} params / 42L / "
-        f"base {mini_report['base_weights_gb']} GB vs Qwen 4,000,000,000 / 32L / "
+        f"base {mini_report['base_weights_gb']} GB vs Qwen {qwen_report['param_count']:,} / 32L / "
         f"base {qwen_report['base_weights_gb']} GB (both labelled estimates)"
     )
 
