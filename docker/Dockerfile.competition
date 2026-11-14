@@ -1,0 +1,18 @@
+# Build the existing runtime first, then build this image from repository root.
+# submission_models/ is an explicitly staged, local base/adapter/ASR bundle.
+FROM lifemate-runtime:latest
+USER root
+RUN /opt/venv/bin/pip install jupyterlab
+COPY submission_models/ /models/
+COPY docker/predict.sh docker/start_jupyter.sh docker/export_timed_submission.py docker/predict_notebook.ipynb /code/
+COPY src /code/training_code/src
+COPY scripts /code/training_code/scripts
+COPY configs /code/training_code/configs
+COPY pyproject.toml /code/training_code/pyproject.toml
+COPY docker/TRAINING_README.md /code/training_code/README.md
+RUN chmod +x /code/predict.sh /code/start_jupyter.sh && mkdir -p /result && chmod 777 /result
+ENV SPLIT="" MODEL_MODE=lora MODEL_NAME=/models/base CHECKPOINT=/models/adapter ASR_MODEL_DIR=/models/asr
+WORKDIR /app
+USER lifemate
+ENTRYPOINT []
+CMD ["/bin/bash", "/code/predict.sh"]

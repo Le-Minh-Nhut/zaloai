@@ -231,3 +231,5 @@ wandb/
 # Local binaries: dataset archive and model weights (hundreds of MB, never committed).
 train+public_test.zip
 /models/
+# Staged inference weights for the official Docker build (never commit artifacts).
+/submission_models/

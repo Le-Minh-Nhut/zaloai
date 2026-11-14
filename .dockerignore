@@ -41,3 +41,7 @@ notebooks
 *.pem
 wandb
 .netrc
+
+# Official image staging, populated explicitly after a candidate is selected.
+!submission_models/
+!submission_models/**

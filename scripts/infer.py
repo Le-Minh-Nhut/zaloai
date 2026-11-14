@@ -963,6 +963,7 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         return EXIT_DATASET
 
     # -- ASR --------------------------------------------------------------- #
+    model_load_started = time.monotonic()
     try:
         asr = _build_asr(args, cfg, samples)
     except (LifeMateError, AsrError) as exc:
@@ -981,6 +982,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # transformers/OOM/network failures land here
         print(f"ERROR: failed to load the model: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_MODEL
+
+    print(f"model and ASR loading: {time.monotonic() - model_load_started:.3f}s", flush=True)
 
     # -- resume ------------------------------------------------------------ #
     if output.exists() and not args.resume and not mock:
