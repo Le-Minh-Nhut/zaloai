@@ -201,8 +201,8 @@ Two different outcomes are never conflated in `manifest.json`:
   `target_value_truncated`). A target is never truncated.
 
 Qwen-era figures, which do **not** apply to MiniCPM: with the Qwen3.5-4B
-tokenizer, 8192 gave 47 truncated and 0 schema loss; 4096 gave 3520 truncated
-with 846/3305 schema-block loss.
+tokenizer (tokenizer only; no Qwen weights were loaded), 8192 gave 47 truncated
+and 0 schema loss; 4096 gave 3520 truncated with 846/3305 schema-block loss.
 
 ---
 
@@ -381,7 +381,8 @@ conservative defaults.
 
 `lora.target_modules: null` on MiniCPM resolves to the profile's 7 projections;
 on Qwen it stays architecture-aware discovery (12 suffixes / 248 Linear modules
-/ 32,464,896 trainable — **Qwen numbers, measured on Qwen, not on MiniCPM**).
+/ 32,464,896 trainable — **Qwen numbers, derived from the released `text_config`
+on a meta-device build (no Qwen weights on this machine), not from MiniCPM**).
 If a model exposes projections its profile does not list, training fails and says
 which knob to turn instead of adapting a silent subset.
 
