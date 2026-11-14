@@ -959,19 +959,19 @@ def test_ablation_deltas_are_zero_for_a_self_comparison():
     reference = {"tool_call_exact_match": 0.25, "sequence_f1": 0.5, "final_state_correctness": {"available": False}}
     assert module._deltas(reference, dict(reference)) == {
         "tool_call_exact_match": 0.0,
-        "tool_name_accuracy": 0.0,
-        "argument_accuracy": 0.0,
+        "tool_name_accuracy": "UNAVAILABLE",
+        "argument_accuracy": "UNAVAILABLE",
         "sequence_f1": 0.0,
-        "final_state_correctness": 0.0,
+        "final_state_correctness": "UNAVAILABLE",
     }
     worse = {"tool_call_exact_match": 0.15, "sequence_f1": 0.5, "final_state_correctness": {"available": False}}
     deltas = module._deltas(reference, worse)
     assert deltas["tool_call_exact_match"] == -0.1
     assert deltas["sequence_f1"] == 0.0
+    assert deltas["final_state_correctness"] == "UNAVAILABLE"
     # a number vs an unavailable metric is incomparable, never a fake 0 difference
     only_one = module._deltas(reference, {"tool_call_exact_match": {"available": False}})
-    assert only_one["tool_call_exact_match"] is None
-
+    assert only_one["tool_call_exact_match"] == "UNAVAILABLE"
 def test_ablation_blocks_rather_than_inventing_metrics_when_the_output_is_missing():
     module = _ablation_module()
     missing = "nope"

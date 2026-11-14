@@ -22,6 +22,10 @@ from .normalization import (
     tokenize_words,
     wer,
 )
+from .transcription import (
+    infer_module,
+    transcribe_samples_cached,
+)
 from .model_specs import (
     GIPFORMER_SPECS,
     GipformerSpec,
@@ -80,8 +84,9 @@ __all__ = [
     "evaluate_asr",
     "save_asr_metrics",
     "unavailable_metrics",
+    "infer_module",
+    "transcribe_samples_cached",
 ]
-
 
 def __getattr__(name: str) -> Any:
     # Heavy backends are exported lazily: importing lifemate.asr must not require torch/sherpa.

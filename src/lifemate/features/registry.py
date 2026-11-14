@@ -146,6 +146,7 @@ FEATURES: tuple[FeatureSpec, ...] = (
         config_path=("asr", "multi_asr_enabled"),
         params={
             "secondary_model_id": (str, ""),
+            "secondary_backend": (str, "whisper"),
             "multi_asr_policy": (str, "primary_topk_secondary_top1"),
             "multi_asr_max_hypotheses": (int, 3),
             "multi_asr_failure_policy": (str, "primary_only"),
@@ -167,7 +168,7 @@ FEATURES: tuple[FeatureSpec, ...] = (
         default=False,
         config_path=("prompt", "nbest_prompt_enabled"),
         scope="both",
-        dependencies=("asr.nbest",),
+        dependencies=(),
     ),
     FeatureSpec(
         id="training.noisy_asr",
@@ -175,7 +176,7 @@ FEATURES: tuple[FeatureSpec, ...] = (
         description="Replace a ratio of gold transcripts with ASR output during training.",
         default=False,
         config_path=("training", "noisy_asr_training_enabled"),
-        params={"noisy_asr_ratio": (float, 0.25)},
+        params={"noisy_asr_ratio": (float, 0.25), "noisy_asr_mode": (str, "augment")},
         scope="training",
     ),
     FeatureSpec(
@@ -261,13 +262,22 @@ def _multi_asr_rules(cfg: FeatureConfig) -> list[str]:
 
 def _noisy_asr_rules(cfg: FeatureConfig) -> list[str]:
     ratio = cfg.training.noisy_asr_ratio
+    mode = str(cfg.training.noisy_asr_mode)
+    problems: list[str] = []
     if not 0.0 < ratio <= 1.0:
-        return [
+        problems.append(
             f"training.noisy_asr is enabled but features.training.noisy_asr_ratio={ratio} "
             "is outside (0, 1]; set 0 < ratio <= 1 (the share of samples replaced by ASR "
             "text), or disable training.noisy_asr"
-        ]
-    return []
+        )
+    if mode not in ("augment", "replace"):
+        problems.append(
+            f"training.noisy_asr is enabled but features.training.noisy_asr_mode={mode!r} "
+            "is not one of ('augment', 'replace'); 'replace' keeps the record count and "
+            "makes the ratio a real noisy share, 'augment' appends variants and makes it "
+            "ratio/(1+ratio)"
+        )
+    return problems
 
 def _tool_dropout_rules(cfg: FeatureConfig) -> list[str]:
     if cfg.training.tool_dropout_max_tools < 1:
@@ -276,6 +286,14 @@ def _tool_dropout_rules(cfg: FeatureConfig) -> list[str]:
             "tool definitions are hidden per sample"
         ]
     return []
+def _nbest_format_rules(cfg: FeatureConfig) -> list[str]:
+    if not (cfg.asr.nbest_enabled or cfg.asr.multi_asr_enabled):
+        return [
+            "prompt.nbest_format is enabled but its dependency asr.nbest is not; "
+            "enable asr.nbest as well, or disable prompt.nbest_format"
+        ]
+    return []
+
 
 #: Per-id parameter checks. Each runs ONLY while that feature is enabled: a
 #: numeric parameter with its flag off is inert and must never raise.
@@ -284,6 +302,7 @@ PARAM_RULES: Mapping[str, Callable[[FeatureConfig], list[str]]] = {
     "asr.multi_asr": _multi_asr_rules,
     "training.noisy_asr": _noisy_asr_rules,
     "training.tool_dropout": _tool_dropout_rules,
+    "prompt.nbest_format": _nbest_format_rules,
 }
 
 class FeatureRegistry:

@@ -26,6 +26,18 @@ from lifemate.asr.interface import AsrError, TranscriptResult
 from lifemate.asr.multi_backend import REAL_SECONDARY_BLOCKED, MultiAsrBackend
 from lifemate.asr.nbest import NBestResult, AsrHypothesis
 
+INFER_SCRIPT = REPO_ROOT / "scripts" / "infer.py"
+
+def _infer():
+    import importlib.util
+    name = "lifemate_infer_test_multi_asr"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, INFER_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 class FakeBackend:
     """Stand-in recognizer: canned texts, optional failure/latency, call log."""
@@ -327,3 +339,76 @@ def test_real_secondary_is_reported_blocked():
     assert REAL_SECONDARY_BLOCKED.startswith("BLOCKED")
     assert "python3 -c" in REAL_SECONDARY_BLOCKED
     assert "gipformer1.5-68M-rnnt" in REAL_SECONDARY_BLOCKED
+def test_chunkformer_secondary_backend_is_blocked_in_infer():
+    infer = _infer()
+    cfg = type("C", (), {
+        "features": type("F", (), {
+            "asr": type("ASR", (), {
+                "multi_asr_enabled": True,
+                "secondary_model_id": "khanhld/chunkformer-rnnt-large-vie",
+                "secondary_backend": "chunkformer",
+                "multi_asr_failure_policy": "strict",
+                "multi_asr_policy": "primary_topk_secondary_top1",
+                "multi_asr_max_hypotheses": 3,
+            })(),
+        })()
+    })()
+    primary = FakeBackend("primary", ["xin chào"])
+    try:
+        infer._compose_multi_asr(cfg, primary)
+    except AsrError as exc:
+        assert "chunkformer" in str(exc)
+        assert "unsupported" in str(exc)
+    else:
+        raise AssertionError("strict chunkformer secondary must raise AsrError")
+
+
+def test_multi_asr_hypotheses_flow_to_agent_prompt():
+    from lifemate.agent.agent import ToolAgent
+    from lifemate.agent.prompt_builder import NBEST_HEADER
+    from lifemate.agent.tool_registry import ToolRegistry
+
+    prompts = []
+
+    class _CaptureGen:
+        def generate(self, messages):
+            prompts.append(messages[-1]["content"])
+            return '<action>{"type": "finish"}</action>'
+
+    class _MockEnv:
+        def get_tool_calls(self):
+            return []
+        def get_state_hash(self):
+            return "hash"
+
+    class _MockCatalog:
+        tools = {}
+        def tool_names(self):
+            return []
+
+    cfg = type("C", (), {
+        "agent": type("A", (), {"time_budget_seconds": 60, "max_steps": 2, "max_consecutive_failures": 3})(),
+        "features": type("F", (), {
+            "asr": type("ASR", (), {"nbest_enabled": False, "nbest_size": 3, "multi_asr_enabled": True, "multi_asr_max_hypotheses": 3})(),
+            "prompt": type("P", (), {"nbest_prompt_enabled": False})(),
+            "postprocessing": type("PP", (), {"enhanced_schema_guardrail_enabled": False})(),
+        })()
+    })()
+
+    agent = ToolAgent(
+        generator=_CaptureGen(),
+        registry=ToolRegistry(_MockCatalog()),
+        env=_MockEnv(),
+        config=cfg,
+    )
+
+    hypotheses = [
+        AsrHypothesis(text="bật đèn ngủ", rank=0, source="primary"),
+        AsrHypothesis(text="tắt đèn ngủ", rank=0, source="secondary"),
+    ]
+    agent.run({"id": "s1"}, transcript="bật đèn ngủ", asr_hypotheses=hypotheses)
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert NBEST_HEADER in prompt
+    assert "primary: bật đèn ngủ" in prompt
+    assert "secondary: tắt đèn ngủ" in prompt

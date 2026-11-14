@@ -143,6 +143,49 @@ def _validate_arms(arms: Sequence[Path]) -> None:
     if problems:
         joined = "\n".join(f"  - {problem}" for problem in problems)
         raise FeatureConfigurationError(f"refusing to start: {len(problems)} arm problem(s)\n{joined}")
+def _validate_fairness(
+    arms: Sequence[Path],
+    *,
+    experimental_variables: Sequence[str] | None = None,
+) -> None:
+    """Ensure fixed configuration fields match across all arms unless declared variable."""
+    if len(arms) <= 1:
+        return
+    ref_arm = arms[0]
+    ref_app, _ref_feat, _prov, _unk = _arm_config(ref_arm)
+    allowed = {str(v).strip().lower() for v in (experimental_variables or [])}
+
+    problems: list[str] = []
+    for arm in arms[1:]:
+        app, feat, _prov, _unk = _arm_config(arm)
+        arm_allowed = set(allowed)
+        for var in getattr(app, "experimental_variables", []) or []:
+            arm_allowed.add(str(var).strip().lower())
+
+        for dotted, label in FIXED_FIELDS:
+            field_tokens = {
+                dotted.lower(),
+                label.lower(),
+                dotted.split(".")[0].lower(),
+                dotted.split(".")[-1].lower(),
+            }
+            if arm_allowed & field_tokens:
+                continue
+
+            ref_val = _read_dotted(ref_app, dotted)
+            arm_val = _read_dotted(app, dotted)
+            if ref_val != arm_val:
+                problems.append(
+                    f"{arm.name}: fixed field {label!r} ({dotted}) has value {arm_val!r}, "
+                    f"differs from reference {ref_arm.name} ({ref_val!r})."
+                )
+    if problems:
+        joined = "\n".join(f"  - {p}" for p in problems)
+        raise FeatureConfigurationError(
+            f"Ablation fairness violation: fixed configuration mismatch across arms\n{joined}\n"
+            "Declare experimental variables via --experimental-variable / --allow-mismatch to permit variation."
+        )
+
 
 def _materialize_arm_config(arm: Path, *, features_wired: bool, out_dir: Path, dry_run: bool) -> Path:
     """Path to hand ``scripts/evaluate.py`` as ``--config``.
@@ -175,6 +218,7 @@ def _evaluate_command(
     mock_env: bool,
     generator: str | None,
     predictions: str | None,
+    evaluation_mode: str | None = None,
 ) -> list[str]:
     """The exact ``scripts/evaluate.py`` command for one arm."""
     command = [
@@ -197,6 +241,8 @@ def _evaluate_command(
         command += ["--generator", generator]
     if predictions:
         command += ["--predictions", predictions]
+    if evaluation_mode:
+        command.append(f"--evaluation-mode={evaluation_mode}")
     return command
 
 def _metrics_from(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -224,21 +270,23 @@ def _scalar(value: Any) -> float | None:
     return None
 
 def _deltas(reference: Mapping[str, Any], other: Mapping[str, Any]) -> dict[str, Any]:
-    """Per-metric difference vs the reference arm.
+    """Per-metric difference vs reference arm.
 
-    ``0.0`` when neither arm produced the metric (identical absence is zero
-    change, which is what the self-comparison noise test asserts); ``None`` only
-    when one side has a number and the other does not — an incomparable pair is
-    reported as such, never as a difference of zero.
+    Unavailable metrics report "UNAVAILABLE", never a false 0% improvement.
     """
     out: dict[str, Any] = {}
     for key in COMPARED_METRICS:
-        base = _scalar(reference.get(key))
-        candidate = _scalar(other.get(key))
-        if base is None and candidate is None:
-            out[key] = 0.0
-        elif base is None or candidate is None:
-            out[key] = None
+        ref_val = reference.get(key)
+        cand_val = other.get(key)
+        ref_unavail = (isinstance(ref_val, Mapping) and ref_val.get("available") is False) or (ref_val is None)
+        cand_unavail = (isinstance(cand_val, Mapping) and cand_val.get("available") is False) or (cand_val is None)
+        if ref_unavail or cand_unavail:
+            out[key] = "UNAVAILABLE"
+            continue
+        base = _scalar(ref_val)
+        candidate = _scalar(cand_val)
+        if base is None or candidate is None:
+            out[key] = "UNAVAILABLE"
         else:
             out[key] = round(candidate - base, 6)
     return out
@@ -285,9 +333,12 @@ def build_report(
     dry_run: bool,
     generator: str | None = None,
     predictions: str | None = None,
+    evaluation_mode: str | None = None,
+    experimental_variables: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Validate, (optionally) run, and assemble the comparison report."""
     _validate_arms(arms)
+    _validate_fairness(arms, experimental_variables=experimental_variables)
 
     first_app, _first_features, _prov, _unknown = _arm_config(arms[0])
     features_wired = hasattr(first_app, "features")
@@ -311,6 +362,7 @@ def build_report(
             mock_env=mock_env,
             generator=generator,
             predictions=predictions,
+            evaluation_mode=evaluation_mode,
         )
         run = _run_arm(command, dry_run=dry_run)
         entry: dict[str, Any] = {
@@ -326,6 +378,16 @@ def build_report(
             "evaluate_config": str(materialized),
             "command": run["command"],
             "run_status": run["status"],
+            "model": str(_read_dotted(app_cfg, "model.name") or "unknown"),
+            "checkpoint": _read_dotted(app_cfg, "inference.checkpoint"),
+            "dataset": str(_read_dotted(app_cfg, "data.root") or split),
+            "enabled_features": enabled_features(feature_cfg),
+            "effective_features": enabled_features(feature_cfg) if features_wired else [],
+            "degraded_features": [],
+            "evaluation_mode": evaluation_mode or "text_to_action",
+            "n_samples": limit,
+            "n_successful": None,
+            "n_failed": None,
         }
         if run.get("returncode") is not None:
             entry["returncode"] = run["returncode"]
@@ -362,16 +424,45 @@ def build_report(
         entry["mock_env"] = bool(payload.get("mock_env", mock_env))
         entry["evaluation_notes"] = list(payload.get("comparison_notes") or [])
         provenance_block = payload.get("provenance") or {}
+        cl_block = payload.get("closed_loop") or {}
+        tf_block = payload.get("teacher_forced") or {}
+        sc = cl_block.get("status_counts") or {}
+        n_samples = provenance_block.get("n_samples") or cl_block.get("n_run") or tf_block.get("n_records") or payload.get("n_samples")
+        if cl_block:
+            n_successful = sc.get("finished", 0) + sc.get("ok", 0)
+            n_failed = cl_block.get("n_failures", 0)
+        elif tf_block:
+            n_successful = tf_block.get("n_records", 0)
+            n_failed = tf_block.get("n_ungradeable", 0)
+        else:
+            n_successful = payload.get("n_successful", 0)
+            n_failed = payload.get("n_failed", 0)
+        degraded = list(payload.get("degraded_features") or [])
+        effective = [f for f in entry["enabled_features"] if f not in degraded]
+        entry["n_samples"] = n_samples
+        entry["n_successful"] = n_successful
+        entry["n_failed"] = n_failed
+        entry["effective_features"] = effective
+        entry["degraded_features"] = degraded
+        entry["evaluation_mode"] = payload.get("evaluation_mode") or evaluation_mode or "text_to_action"
         entry["evaluated"] = {
             "git_commit": provenance_block.get("git_commit"),
             "dataset_manifest_hash": provenance_block.get("dataset_manifest_hash"),
-            "n_samples": provenance_block.get("n_samples"),
+            "n_samples": n_samples,
             "model_mode": provenance_block.get("model_mode"),
             "checkpoint": provenance_block.get("checkpoint"),
         }
         if index == 0:
             reference_metrics = metrics
-            entry["deltas"] = {key: 0.0 for key in COMPARED_METRICS}
+            entry["deltas"] = {
+                key: (
+                    0.0
+                    if not (isinstance(metrics.get(key), Mapping) and metrics[key].get("available") is False)
+                    and _scalar(metrics.get(key)) is not None
+                    else "UNAVAILABLE"
+                )
+                for key in COMPARED_METRICS
+            }
             entry["deltas_note"] = "reference arm: deltas are relative to itself"
         elif reference_metrics is None:
             entry["deltas"] = {key: None for key in COMPARED_METRICS}
@@ -446,6 +537,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--generator", default=None, metavar="dumpscript:PATH", help="forwarded test hook")
     parser.add_argument("--predictions", default=None, help="forwarded decision-record JSONL")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and commands, execute nothing")
+    parser.add_argument(
+        "--experimental-variable",
+        "--allow-mismatch",
+        action="append",
+        default=[],
+        dest="experimental_variables",
+        help="declared experimental variable allowed to differ across arms (e.g. asr.model_id, asr)",
+    )
+    parser.add_argument(
+        "--evaluation-mode",
+        choices=("text_to_action", "audio_to_action"),
+        default=None,
+        help="evaluation mode for arms",
+    )
     return parser.parse_args(argv)
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -464,6 +569,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             generator=args.generator,
             predictions=args.predictions,
+            evaluation_mode=args.evaluation_mode,
+            experimental_variables=args.experimental_variables,
         )
     except FeatureConfigurationError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)

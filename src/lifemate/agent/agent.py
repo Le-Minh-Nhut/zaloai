@@ -203,6 +203,8 @@ class ToolAgent:
         sample_or_fields: Any,
         transcript: str | None = None,
         deadline: float | None = None,
+        *,
+        asr_hypotheses: Sequence[Any] | None = None,
     ) -> AgentResult:
         """Run the loop for one sample.
 
@@ -212,7 +214,7 @@ class ToolAgent:
         """
         fields = _sample_fields(sample_or_fields)
         text = transcript if transcript is not None else str(fields.get("transcript") or "")
-        return self._run_loop(fields, text, deadline)
+        return self._run_loop(fields, text, deadline, asr_hypotheses=asr_hypotheses)
 
     def run_batch(
         self, samples: Iterable[Any], transcripts: Sequence[str] | None = None
@@ -233,7 +235,14 @@ class ToolAgent:
     #: Injectable monotonic clock (tests replace it to fake the budget).
     clock: Callable[[], float] = staticmethod(time.monotonic)
 
-    def _run_loop(self, fields: dict[str, Any], transcript: str, deadline: float | None) -> AgentResult:
+    def _run_loop(
+        self,
+        fields: dict[str, Any],
+        transcript: str,
+        deadline: float | None,
+        *,
+        asr_hypotheses: Sequence[Any] | None = None,
+    ) -> AgentResult:
         """The single generate → parse → execute loop shared by all entry points."""
         registry = self._registry_for(fields)
         tracker = StateTracker()
@@ -271,15 +280,36 @@ class ToolAgent:
                 status, finish_reason = _STATUS_BY_REASON.get(reason, reason), reason
                 break
 
-            prompt = self.prompt_builder(
-                transcript=transcript,
-                context=context,
-                history=history,
-                installed_apps=installed,
-                catalog=registry,
-                prior_steps=tracker.steps,
-                history_limit=self.history_limit,
-            )
+            features = getattr(self.config, "features", None)
+            nbest_format = False
+            nbest_limit = 3
+            if features is not None:
+                prompt_sec = getattr(features, "prompt", None)
+                asr_sec = getattr(features, "asr", None)
+                nbest_format = bool(
+                    getattr(prompt_sec, "nbest_prompt_enabled", False)
+                    or getattr(asr_sec, "nbest_enabled", False)
+                    or getattr(asr_sec, "multi_asr_enabled", False)
+                )
+                nbest_limit = int(
+                    getattr(asr_sec, "nbest_size", 3)
+                    or getattr(asr_sec, "multi_asr_max_hypotheses", 3)
+                    or 3
+                )
+            kwargs: dict[str, Any] = {
+                "transcript": transcript,
+                "context": context,
+                "history": history,
+                "installed_apps": installed,
+                "catalog": registry,
+                "prior_steps": tracker.steps,
+                "history_limit": self.history_limit,
+            }
+            if asr_hypotheses is not None:
+                kwargs["asr_hypotheses"] = asr_hypotheses
+                kwargs["nbest_format"] = nbest_format
+                kwargs["nbest_limit"] = nbest_limit
+            prompt = self.prompt_builder(**kwargs)
             messages = to_messages(prompt)
             try:
                 raw_output = self.generator.generate(messages)

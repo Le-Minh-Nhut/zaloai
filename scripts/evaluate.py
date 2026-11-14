@@ -89,6 +89,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="torch device")
     parser.add_argument("--model", default=None, help="override model.name (base model id or path)")
     parser.add_argument("--quiet", action="store_true", help="suppress per-sample progress lines")
+    parser.add_argument(
+        "--evaluation-mode",
+        "--eval-mode",
+        choices=("text_to_action", "audio_to_action"),
+        default="text_to_action",
+        help="evaluation mode: text_to_action (gold/fixed transcript) or audio_to_action (full audio->ASR->agent)",
+    )
+    parser.add_argument("--transcript-cache", default=None, help="transcript cache JSON file")
+    parser.add_argument(
+        "--asr",
+        choices=("gipformer", "oracle", "whisper", "none"),
+        default=None,
+        help="ASR backend for audio_to_action mode",
+    )
+    parser.add_argument("--allow-oracle", action="store_true", help="permit oracle ASR on labeled split")
     return parser.parse_args(argv)
 
 
@@ -355,6 +370,26 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
             guardrail=_flag(features, "postprocessing", "enhanced_schema_guardrail_enabled"),
         )
 
+    eval_mode = getattr(args, "evaluation_mode", "text_to_action")
+    transcripts = None
+    if eval_mode == "audio_to_action":
+        from lifemate.asr.transcription import transcribe_samples_cached
+
+        cache_path = getattr(args, "transcript_cache", None) or (Path(cfg.evaluation.output_dir) / "transcripts_cache.json")
+        transcripts, cache_stats = transcribe_samples_cached(
+            samples,
+            cfg,
+            features=features,
+            split=args.split,
+            cache_path=cache_path,
+            args=args,
+        )
+        if not getattr(args, "quiet", False):
+            print(
+                f"audio_to_action: {len(transcripts)} transcripts ready "
+                f"(cache hits={cache_stats.get('cache_hit')}, misses={cache_stats.get('cache_miss')})"
+            )
+
     summary = evaluate_closed_loop(
         factory,
         samples,
@@ -363,6 +398,8 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
         max_samples=args.limit,
         deadline_seconds=float(cfg.agent.time_budget_seconds),
         split_paths=paths,
+        evaluation_mode=eval_mode,
+        transcripts=transcripts,
     )
     if mock:
         summary["mock_env"] = True
@@ -520,6 +557,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     extra: dict[str, Any] = {"features": feature_report} if feature_report else {}
     if asr_payload is not None:
         extra["asr"] = asr_payload
+    eval_mode = getattr(args, "evaluation_mode", "text_to_action")
+    if do_teacher and not do_closed:
+        eval_mode = "text_to_action"
+    extra["evaluation_mode"] = eval_mode
     payload = evaluate_split(
         cfg=cfg,
         split=args.split,
@@ -532,6 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_mode=cfg.inference.model_mode,
         mock_env=bool(args.use_mock_env),
         extra=extra or None,
+        evaluation_mode=eval_mode,
     )
     if asr_payload is not None:
         metrics_md = Path(cfg.evaluation.output_dir) / "metrics.md"
@@ -547,10 +589,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _fmt(block: Any) -> str:
     if isinstance(block, dict):
         if block.get("available") is False:
-            return "n/a"
+            return "UNAVAILABLE"
         value = block.get("value")
         return f"{value:.4f}" if isinstance(value, float) else str(value)
-    return "n/a"
+    return "UNAVAILABLE"
 
 
 if __name__ == "__main__":

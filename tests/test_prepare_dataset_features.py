@@ -268,3 +268,47 @@ def test_manifest_records_the_feature_report_and_fingerprint():
 def test_real_split_is_not_required_but_available():
     """The real train split exists; this test only pins the data root's presence."""
     assert (DATA / "train" / "train.jsonl").is_file()
+
+def test_prepare_dataset_noisy_asr_mode_replace_vs_augment():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        transcripts = _transcripts(base, _fixture_ids(), ("một", "hai"))
+        
+        out_rep = base / "out_replace"
+        probe_rep = _run(
+            out_rep,
+            "--enable-feature",
+            "training.noisy_asr",
+            "--noisy-asr-transcripts",
+            str(transcripts),
+            "--noisy-asr-ratio",
+            "1.0",
+            "--noisy-asr-mode",
+            "replace",
+        )
+        assert probe_rep.returncode == 0, (probe_rep.stdout, probe_rep.stderr)
+        records_rep = _train_records(out_rep)
+        manifest_rep = json.loads((out_rep / "train" / "manifest.json").read_text())
+        assert manifest_rep["augmentation"]["noisy_asr_mode"] == "replace"
+        assert manifest_rep["augmentation"]["reports"]["noisy_asr"]["augmentation_mode"] == "replace"
+        
+        out_aug = base / "out_augment"
+        probe_aug = _run(
+            out_aug,
+            "--enable-feature",
+            "training.noisy_asr",
+            "--noisy-asr-transcripts",
+            str(transcripts),
+            "--noisy-asr-ratio",
+            "1.0",
+            "--noisy-asr-mode",
+            "augment",
+        )
+        assert probe_aug.returncode == 0, (probe_aug.stdout, probe_aug.stderr)
+        records_aug = _train_records(out_aug)
+        manifest_aug = json.loads((out_aug / "train" / "manifest.json").read_text())
+        assert manifest_aug["augmentation"]["noisy_asr_mode"] == "augment"
+        
+        # Replace keeps original record count; augment appends variants
+        assert len(records_rep) < len(records_aug)
+        assert len(records_aug) == len(records_rep) * 2

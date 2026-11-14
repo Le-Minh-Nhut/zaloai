@@ -298,3 +298,52 @@ def test_transcript_result_carries_acoustic_score_fields():
     plain = TranscriptResult(text="a")
     assert plain.acoustic_logprob is None and plain.n_tokens is None
     assert REQUIRED_FROM_TRANSDUCER_ARGS[0] == "encoder"
+def test_nbest_hypotheses_flow_to_agent():
+    from lifemate.agent.agent import ToolAgent
+    from lifemate.agent.prompt_builder import NBEST_HEADER
+    from lifemate.agent.tool_registry import ToolRegistry
+
+    prompts = []
+
+    class _CaptureGen:
+        def generate(self, messages):
+            prompts.append(messages[-1]["content"])
+            return '<action>{"type": "finish"}</action>'
+
+    class _MockEnv:
+        def get_tool_calls(self):
+            return []
+        def get_state_hash(self):
+            return "hash"
+
+    class _MockCatalog:
+        tools = {}
+        def tool_names(self):
+            return []
+
+    cfg = type("C", (), {
+        "agent": type("A", (), {"time_budget_seconds": 60, "max_steps": 2, "max_consecutive_failures": 3})(),
+        "features": type("F", (), {
+            "asr": type("ASR", (), {"nbest_enabled": True, "nbest_size": 3, "multi_asr_enabled": False})(),
+            "prompt": type("P", (), {"nbest_prompt_enabled": False})(),
+            "postprocessing": type("PP", (), {"enhanced_schema_guardrail_enabled": False})(),
+        })()
+    })()
+
+    agent = ToolAgent(
+        generator=_CaptureGen(),
+        registry=ToolRegistry(_MockCatalog()),
+        env=_MockEnv(),
+        config=cfg,
+    )
+
+    hypotheses = [
+        AsrHypothesis(text="mở đèn phòng khách", rank=0, source="primary"),
+        AsrHypothesis(text="mở rèm phòng khách", rank=1, source="primary"),
+    ]
+    agent.run({"id": "s1"}, transcript="mở đèn phòng khách", asr_hypotheses=hypotheses)
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    assert NBEST_HEADER in prompt
+    assert "1. mở đèn phòng khách" in prompt
+    assert "2. mở rèm phòng khách" in prompt

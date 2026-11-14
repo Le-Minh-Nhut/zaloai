@@ -100,6 +100,7 @@ class AsrFeatureConfig:
     nbest_size: int = 3
     multi_asr_enabled: bool = False
     secondary_model_id: str = ""
+    secondary_backend: str = "whisper"
     multi_asr_policy: str = "primary_topk_secondary_top1"
     multi_asr_max_hypotheses: int = 3
     multi_asr_failure_policy: str = "primary_only"
@@ -117,6 +118,7 @@ class TrainingFeatureConfig:
 
     noisy_asr_training_enabled: bool = False
     noisy_asr_ratio: float = 0.25
+    noisy_asr_mode: str = "augment"
     nbest_training_format_enabled: bool = False
     slot_masking_enabled: bool = False
     tool_dropout_enabled: bool = False

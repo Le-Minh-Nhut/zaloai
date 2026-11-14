@@ -28,6 +28,7 @@ from lifemate.errors import LifeMateError
 
 __all__ = [
     "NBEST_HEADER",
+    "NOISY_ASR_MODES",
     "REQUEST_HEADER",
     "TranscriptHypothesis",
     "TranscriptRecord",
@@ -225,10 +226,22 @@ def _with_prompt(record: Any, prompt_body: str, meta: dict[str, Any]) -> dict[st
 def _ids_hash(ids: Iterable[str]) -> str:
     joined = "\n".join(sorted(str(item) for item in ids))
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+def _dataset_fingerprint(records: Iterable[Any], key: str = "sample_id") -> str:
+    tokens = []
+    for r in records:
+        sid = str(_get(r, key) or "")
+        aug = str((_get(r, "meta") or {}).get("augmentation") or "")
+        prompt = _prompt_of(r)
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
+        tokens.append(f"{sid}:{aug}:{prompt_hash}")
+    return hashlib.sha256("\n".join(tokens).encode("utf-8")).hexdigest()[:16]
+
 
 # --------------------------------------------------------------------------- #
 # Noisy ASR
 # --------------------------------------------------------------------------- #
+NOISY_ASR_MODES = ("augment", "replace")
+
 def apply_noisy_asr(
     records: Sequence[Any],
     transcripts: Mapping[str, TranscriptRecord] | None,
@@ -238,8 +251,9 @@ def apply_noisy_asr(
     seed: int = 42,
     key: str = "sample_id",
     hypothesis_rank: int = 1,
+    mode: str = "augment",
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Add one ``ratio``-sampled variant per original record, using a noisy hypothesis.
+    """Swap a ``ratio``-sampled record's transcript for a noisy hypothesis.
 
     ``hypothesis_rank`` is 1-based over the deduplicated hypotheses: rank 1 is
     the recogniser's own best output, which replaces the gold transcript (the
@@ -247,6 +261,16 @@ def apply_noisy_asr(
     the clean reference). The sampled set is fixed per sample id by
     ``sha256(seed:id)``, so reordering or subsetting the input cannot change
     which ids are chosen.
+
+    ``mode`` decides what the sampled set *means*:
+
+    * ``"augment"`` — every clean record is kept and one variant is appended
+      after it. The record count grows, so the noisy SHARE of the result is
+      ``ratio / (1 + ratio)``, not ``ratio`` (0.5 -> 33 % noisy).
+    * ``"replace"`` — the sampled clean record is replaced by its noisy variant.
+      The record count is unchanged and the noisy share really is ``ratio``
+      (0.5 -> 50 % clean / 50 % noisy). Samples with no usable transcript stay
+      clean and are counted in ``n_skipped``/``n_missing_transcripts``.
 
     The variant preserves ``sample_id``, ``step_index``, the rendered history,
     context, installed apps, tool trajectory and the TARGET action verbatim: the
@@ -256,6 +280,10 @@ def apply_noisy_asr(
         return records, {}
     if not 0.0 < float(ratio) <= 1.0:
         raise LifeMateError(f"noisy ASR ratio must be in (0, 1], got {ratio!r}")
+    if str(mode) not in NOISY_ASR_MODES:
+        raise LifeMateError(
+            f"noisy ASR mode must be one of {NOISY_ASR_MODES}, got {mode!r}"
+        )
     if not transcripts:
         raise LifeMateError(
             "noisy ASR is enabled but no transcripts were loaded\n"
@@ -264,57 +292,76 @@ def apply_noisy_asr(
     if int(hypothesis_rank) < 1:
         raise LifeMateError(f"hypothesis_rank is 1-based, got {hypothesis_rank!r}")
 
+    mode = str(mode)
     out: list[Any] = []
     selected_ids: list[str] = []
     n_created = n_missing = n_thin = n_no_section = 0
     for record in records:
-        out.append(record)
         sample_id = str(_get(record, key) or "")
         if not sample_id or not _selected(seed, sample_id, ratio):
+            out.append(record)
             continue
         selected_ids.append(sample_id)
+        variant = None
         transcript = transcripts.get(sample_id)
         if transcript is None:
             n_missing += 1
+        else:
+            hypothesis = transcript.at_rank(int(hypothesis_rank))
+            if hypothesis is None:
+                n_thin += 1
+            else:
+                section = render_request_section(
+                    TranscriptRecord(
+                        sample_id=sample_id,
+                        hypotheses=(hypothesis,),
+                        asr_model=transcript.asr_model,
+                        asr_revision=transcript.asr_revision,
+                        asr_config=transcript.asr_config,
+                    )
+                )
+                prompt = replace_request_section(_prompt_of(record), section)
+                if prompt is None:
+                    n_no_section += 1
+                else:
+                    variant = _with_prompt(
+                        record,
+                        prompt,
+                        {
+                            "augmentation": "noisy_asr",
+                            "asr_model": transcript.asr_model,
+                            "asr_revision": transcript.asr_revision,
+                            "asr_rank": int(hypothesis_rank),
+                            "noisy_asr_ratio": float(ratio),
+                            "noisy_asr_mode": mode,
+                            "augmentation_seed": int(seed),
+                            "gold_transcript_replaced": True,
+                        },
+                    )
+        if variant is None:
+            out.append(record)
             continue
-        hypothesis = transcript.at_rank(int(hypothesis_rank))
-        if hypothesis is None:
-            n_thin += 1
-            continue
-        section = render_request_section(
-            TranscriptRecord(
-                sample_id=sample_id,
-                hypotheses=(hypothesis,),
-                asr_model=transcript.asr_model,
-                asr_revision=transcript.asr_revision,
-                asr_config=transcript.asr_config,
-            )
-        )
-        prompt = replace_request_section(_prompt_of(record), section)
-        if prompt is None:
-            n_no_section += 1
-            continue
-        out.append(
-            _with_prompt(
-                record,
-                prompt,
-                {
-                    "augmentation": "noisy_asr",
-                    "asr_model": transcript.asr_model,
-                    "asr_revision": transcript.asr_revision,
-                    "asr_rank": int(hypothesis_rank),
-                    "noisy_asr_ratio": float(ratio),
-                    "augmentation_seed": int(seed),
-                    "gold_transcript_replaced": True,
-                },
-            )
-        )
         n_created += 1
+        if mode == "replace":
+            out.append(variant)
+        else:
+            out.extend([record, variant])
+    n_total = len(out)
     report = {
         "enabled": True,
         "ratio": float(ratio),
         "seed": int(seed),
         "hypothesis_rank": int(hypothesis_rank),
+        "augmentation_mode": mode,
+        "n_original_records": len(records),
+        "n_clean_records": n_total - n_created,
+        "n_noisy_records": n_created,
+        "n_total_records": n_total,
+        "requested_noisy_ratio": float(ratio),
+        "effective_noisy_ratio": round(n_created / n_total, 6) if n_total else 0.0,
+        "n_skipped": len(selected_ids) - n_created,
+        "n_missing_transcripts": n_missing,
+        "dataset_fingerprint": _dataset_fingerprint(out, key),
         "n_records_in": len(records),
         "n_variants_created": n_created,
         "n_missing_transcript": n_missing,

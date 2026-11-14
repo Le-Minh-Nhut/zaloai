@@ -346,3 +346,74 @@ def test_all_flags_off_returns_the_same_objects_and_bytes():
     assert noisy is records and nbest is records
     assert noisy_report == {} and nbest_report == {}
     assert [(id(record), json.dumps(record, sort_keys=True)) for record in records] == before
+
+def test_noisy_asr_replace_mode_maintains_record_count_and_ratio():
+    records = _records(10)
+    transcripts = {record["sample_id"]: _record(record["sample_id"], ["noisy hyp"]) for record in records}
+    produced, report = apply_noisy_asr(records, transcripts, enabled=True, ratio=0.5, seed=42, mode="replace")
+    assert len(produced) == 10
+    assert report["n_original_records"] == 10
+    assert report["n_total_records"] == 10
+    assert report["augmentation_mode"] == "replace"
+    assert report["requested_noisy_ratio"] == 0.5
+    assert report["effective_noisy_ratio"] == round(report["n_noisy_records"] / 10, 6)
+    assert report["n_clean_records"] + report["n_noisy_records"] == 10
+    for key in (
+        "n_original_records",
+        "n_clean_records",
+        "n_noisy_records",
+        "n_total_records",
+        "requested_noisy_ratio",
+        "effective_noisy_ratio",
+        "n_missing_transcripts",
+        "n_skipped",
+        "augmentation_mode",
+        "seed",
+        "dataset_fingerprint",
+    ):
+        assert key in report, f"missing {key} in report"
+    assert len(report["dataset_fingerprint"]) == 16
+
+def test_noisy_asr_augment_mode_preserves_clean_and_appends():
+    records = _records(10)
+    transcripts = {record["sample_id"]: _record(record["sample_id"], ["noisy hyp"]) for record in records}
+    produced, report = apply_noisy_asr(records, transcripts, enabled=True, ratio=0.5, seed=42, mode="augment")
+    assert report["augmentation_mode"] == "augment"
+    assert report["n_original_records"] == 10
+    assert report["n_clean_records"] == 10
+    assert report["n_total_records"] == 10 + report["n_noisy_records"]
+    assert len(produced) == report["n_total_records"]
+
+def test_noisy_asr_missing_transcripts_skipped_in_replace_mode():
+    records = _records(10)
+    # Only s0 has transcript; s1..s9 missing
+    transcripts = {"s0": _record("s0", ["noisy hyp"])}
+    produced, report = apply_noisy_asr(records, transcripts, enabled=True, ratio=1.0, seed=42, mode="replace")
+    assert len(produced) == 10
+    assert report["n_missing_transcripts"] == 9
+    assert report["n_skipped"] == 9
+    assert report["n_noisy_records"] == 1
+    assert report["n_clean_records"] == 9
+    assert produced[0]["meta"].get("augmentation") == "noisy_asr"
+    assert all(r["meta"].get("augmentation") != "noisy_asr" for r in produced[1:])
+
+def test_noisy_asr_sample_grouping_preserved():
+    records = _records(5)
+    # Duplicate sample_ids to simulate multi-turn steps for same sample
+    multi_turn = []
+    for r in records:
+        step0 = dict(r)
+        step1 = dict(r)
+        step1["step_index"] = 1
+        multi_turn.extend([step0, step1])
+    transcripts = {r["sample_id"]: _record(r["sample_id"], ["noisy"]) for r in records}
+    produced, _report = apply_noisy_asr(multi_turn, transcripts, enabled=True, ratio=0.6, seed=42, mode="replace")
+    # For each sample_id, either all steps are noisy or none are
+    by_sid: dict[str, list[bool]] = {}
+    for item in produced:
+        sid = item["sample_id"]
+        is_noisy = (item.get("meta") or {}).get("augmentation") == "noisy_asr"
+        by_sid.setdefault(sid, []).append(is_noisy)
+    for sid, statuses in by_sid.items():
+        assert len(statuses) == 2
+        assert statuses[0] == statuses[1], f"sample {sid} steps must have identical noisy status"

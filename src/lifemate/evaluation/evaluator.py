@@ -399,6 +399,8 @@ def evaluate_closed_loop(
     max_samples: int | None = None,
     deadline_seconds: float | None = None,
     split_paths: Any = None,
+    evaluation_mode: str = "text_to_action",
+    transcripts: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run the agent against a REAL environment per sample.
 
@@ -429,7 +431,8 @@ def evaluate_closed_loop(
             rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)]})
             continue
         try:
-            result = agent.run(sample, deadline=budget_deadline)
+            transcript = transcripts.get(sample_id) if transcripts is not None else None
+            result = agent.run(sample, transcript=transcript, deadline=budget_deadline)
         except Exception as exc:
             failures.append({"id": sample_id, "stage": "run", "error": f"{type(exc).__name__}: {exc}"[:300]})
             rows.append({"id": sample_id, "status": "error", "tool_calls": [], "state_hash": "", "errors": [str(exc)]})
@@ -482,6 +485,9 @@ def evaluate_closed_loop(
         "failures": failures[:50],
         "n_failures": len(failures),
         "rows": rows,
+        "evaluation_mode": evaluation_mode,
+        "n_successful": sum(1 for r in rows if r["status"] in {"finished", "ok"}),
+        "n_failed": len(failures),
         "final_state_correctness": {
             "available": False,
             "reason": "official scoring tooling unavailable",
@@ -529,18 +535,18 @@ def artifact_paths(output_dir: str | Path) -> dict[str, Path]:
 def _fmt(block: Any) -> str:
     if isinstance(block, Mapping):
         if block.get("available") is False:
-            return "n/a"
+            return "UNAVAILABLE"
         value = block.get("value")
         if isinstance(value, float):
             return f"{value:.4f}"
         if value is not None:
             return str(value)
-        return "n/a"
+        return "UNAVAILABLE"
     if isinstance(block, float):
         return f"{block:.4f}"
     if isinstance(block, (int, str)):
         return str(block)
-    return "n/a"
+    return "UNAVAILABLE"
 
 
 def render_metrics_md(payload: Mapping[str, Any]) -> str:
@@ -552,8 +558,8 @@ def render_metrics_md(payload: Mapping[str, Any]) -> str:
     provenance = payload.get("provenance", {})
     lines.append("| item | value |")
     lines.append("| --- | --- |")
-    for key in ("split", "model_mode", "checkpoint", "n_samples", "config_hash", "git_commit", "dataset_manifest_hash"):
-        lines.append(f"| {key} | {provenance.get(key, 'unavailable')} |")
+    for key in ("split", "evaluation_mode", "model_mode", "checkpoint", "n_samples", "config_hash", "git_commit", "dataset_manifest_hash"):
+        lines.append(f"| {key} | {provenance.get(key, payload.get(key, 'unavailable'))} |")
     env = payload.get("environment", {})
     for key in ("python", "torch", "cuda", "cuda_available", "gpu", "transformers"):
         lines.append(f"| env.{key} | {env.get(key, 'unavailable')} |")
@@ -629,6 +635,7 @@ def evaluate_split(
     model_mode: str | None = None,
     mock_env: bool = False,
     extra: Mapping[str, Any] | None = None,
+    evaluation_mode: str | None = None,
 ) -> dict[str, Any]:
     """Assemble provenance + metrics for one split and write all artifacts."""
     base = Path(output_dir or getattr(getattr(cfg, "evaluation", None), "output_dir", "outputs/evaluation"))
@@ -643,9 +650,12 @@ def evaluate_split(
         "n_samples": (closed_loop or {}).get("n_run")
         or (teacher_forced or {}).get("n_records")
         or len(predictions or []),
+        "evaluation_mode": evaluation_mode
+        or (closed_loop or {}).get("evaluation_mode")
+        or (teacher_forced or {}).get("evaluation_mode")
+        or "text_to_action",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
-
     comparisons: dict[str, Any] = {}
     if teacher_forced and isinstance(teacher_forced.get("metrics"), Mapping):
         comparisons["teacher_forced"] = teacher_forced["metrics"]
@@ -677,10 +687,19 @@ def evaluate_split(
         notes.append(
             "final_state_correctness is unavailable: the official scoring tooling is not installed."
         )
-    if teacher_forced and closed_loop:
+    eff_mode = provenance["evaluation_mode"]
+    if eff_mode == "text_to_action":
+        notes.append("evaluation_mode is text_to_action: LLM evaluated with gold/fixed transcript (not an ASR evaluation).")
+    elif eff_mode == "audio_to_action":
+        notes.append("evaluation_mode is audio_to_action: full pipeline audio -> ASR -> LLM -> actions.")
         notes.append("teacher_forced scores SFT decision records; closed_loop scores full episodes.")
 
     payload: dict[str, Any] = {
+        "evaluation_mode": eff_mode,
+        "n_successful": (closed_loop or {}).get("n_successful")
+        if closed_loop
+        else (teacher_forced or {}).get("n_records", 0),
+        "n_failed": (closed_loop or {}).get("n_failed") if closed_loop else (teacher_forced or {}).get("n_ungradeable", 0),
         "provenance": provenance,
         "environment": environment_report(),
         "metrics": combined,

@@ -134,6 +134,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="enable noisy-ASR variants (alias of --enable-feature training.noisy_asr)",
     )
     parser.add_argument(
+        "--noisy-asr-mode",
+        choices=("augment", "replace"),
+        default=None,
+        help=(
+            "'augment' keeps every clean record and appends a noisy variant (noisy share "
+            "= ratio/(1+ratio)); 'replace' swaps the sampled record for its noisy variant "
+            "(record count unchanged, noisy share = ratio). "
+            "Alias of features.training.noisy_asr_mode"
+        ),
+    )
+    parser.add_argument(
         "--slot-masking-enabled",
         action="store_true",
         help="enable slot-masking variants (alias of --enable-feature training.slot_masking)",
@@ -377,6 +388,14 @@ def _resolve_augmentation_config(
         )
     for kind, feature_id in _AUGMENTATION_FEATURES.items():
         effective[kind] = bool(resolved_value(resolved, feature_id))
+    mode = getattr(args, "noisy_asr_mode", None)
+    if mode:
+        training.noisy_asr_mode = str(mode)
+        notes.append(
+            f"note: --noisy-asr-mode overrides features.training.noisy_asr_mode "
+            f"(now {training.noisy_asr_mode})"
+        )
+    effective["noisy_asr_mode"] = str(training.noisy_asr_mode)
     return cfg, notes, effective
 
 def resolved_value(cfg: object, feature_id: str) -> object:
@@ -414,6 +433,7 @@ def _effective_augmentation_line(effective: dict[str, object]) -> str:
         "augmentation set    : "
         + (", ".join(active) if active else "NONE (no augmentation runs)")
         + f"  ratio={effective['noisy_asr_ratio']} "
+        f"mode={effective.get('noisy_asr_mode', 'augment')} "
         f"max_tools={effective['tool_dropout_max_tools']} seed={effective['augmentation_seed']}"
     )
 
@@ -457,8 +477,10 @@ def _augment(
 
     base = list(train_records)
     variants: list[dict] = []
+    replaced: list[dict] | None = None
     reports: dict[str, object] = {}
     sources: dict[str, object] = {}
+    mode = str(effective.get("noisy_asr_mode", "augment"))
 
     for name, path in (
         ("noisy_asr", args.noisy_asr_transcripts),
@@ -472,10 +494,15 @@ def _augment(
     if active["noisy_asr"]:
         transcripts = load_transcripts(args.noisy_asr_transcripts)
         produced, report = apply_noisy_asr(
-            base, transcripts, enabled=True, ratio=ratio, seed=seed
+            base, transcripts, enabled=True, ratio=ratio, seed=seed, mode=mode
         )
         reports["noisy_asr"] = report
-        variants.extend(_variant_records(produced, base))
+        if mode == "replace":
+            # Replace mode swaps the sampled clean records in place, so the
+            # record count stays the same and `ratio` is the real noisy share.
+            replaced = produced
+        else:
+            variants.extend(_variant_records(produced, base))
     if active["nbest_format"]:
         transcripts = load_transcripts(args.nbest_transcripts, require_multi=True)
         produced, report = apply_nbest_format(base, transcripts, enabled=True, k=3, seed=seed)
@@ -510,20 +537,32 @@ def _augment(
             "augment only after the group split"
         )
 
+    out_records = replaced if replaced is not None else base
+    augmented = [
+        record for record in out_records + variants if (record.get("meta") or {}).get("augmentation")
+    ]
     report = {
         "enabled": active,
         "seed": seed,
         "noisy_asr_ratio": ratio,
+        "noisy_asr_mode": mode,
         "tool_dropout_max_tools": max_tools,
         "transcript_sources": sources,
         "n_records_in": len(base),
-        "n_records_out": len(base) + len(variants),
-        "n_variants": len(variants),
-        "n_variants_by_kind": _count_variants(variants),
+        "n_records_out": len(out_records) + len(variants),
+        # A replaced record is an augmented record too: the count follows the
+        # dataset, so `augment` and `replace` are reported the same way.
+        "n_variants": len(augmented),
+        "n_appended_variants": len(variants),
+        "n_variants_by_kind": _count_variants(augmented),
         "reports": reports,
         "val_augmented": False,
     }
-    return report, base + variants
+    if replaced is not None:
+        report["n_replaced"] = sum(
+            1 for record in out_records if (record.get("meta") or {}).get("augmentation") == "noisy_asr"
+        )
+    return report, out_records + variants
 
 def _variant_records(produced: list[dict], base: list[dict]) -> list[dict]:
     """Variants a transform appended next to its originals.

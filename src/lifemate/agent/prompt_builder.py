@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from lifemate.agent.protocol import ACTION_CLOSE, ACTION_OPEN, FINISH_ACTION, render_action
 
 #: Default number of conversation turns kept in the prompt.
 DEFAULT_HISTORY_LIMIT = 10
+
+#: Request header used when the prompt lists several ASR hypotheses.
+#: Same bytes as ``lifemate.data.augmentation.NBEST_HEADER`` (training format).
+NBEST_HEADER = "# Các giả thuyết ASR"
 
 SYSTEM_PROMPT = """\
 You are a Vietnamese voice assistant that fulfils a user's spoken request by
@@ -282,6 +286,52 @@ def _render_action_safe(action: Any) -> str:
         return ACTION_OPEN + _json(action) + ACTION_CLOSE
 
 
+def _hypothesis_items(asr_hypotheses: Sequence[Any] | None) -> list[tuple[str, str]]:
+    """``(text, source)`` pairs: input order, deduped, empty texts dropped."""
+    from lifemate.asr.nbest import normalize_hypothesis_text  # stdlib-only module
+
+    items: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in asr_hypotheses or ():
+        if isinstance(raw, Mapping):
+            text, source = raw.get("text"), raw.get("source")
+        elif isinstance(raw, str):
+            text, source = raw, ""
+        else:
+            text, source = getattr(raw, "text", ""), getattr(raw, "source", "")
+        text = " ".join(str(text or "").split())
+        key = normalize_hypothesis_text(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append((text, str(source or "")))
+    return items
+
+def _render_request(
+    transcript: str,
+    asr_hypotheses: Sequence[Any] | None = None,
+    *,
+    nbest_format: bool = False,
+    limit: int = 3,
+) -> str:
+    """Request section: the numbered hypothesis list when it carries signal.
+
+    A single surviving hypothesis (or an empty list) keeps the baseline section
+    byte-for-byte: a one-item list would move the prompt distribution for no
+    signal, and the training format makes the same choice.
+    """
+    items = _hypothesis_items(asr_hypotheses) if nbest_format else []
+    if len(items) > 1:
+        shown = items[: max(1, int(limit))]
+        sources = {source for _text, source in shown if source}
+        labelled = len(sources) > 1
+        lines = [
+            f"{index}. {source + ': ' if labelled and source else ''}{text}"
+            for index, (text, source) in enumerate(shown, 1)
+        ]
+        return NBEST_HEADER + "\n\n" + "\n".join(lines)
+    return "# Yêu cầu\n" + (transcript or "").strip()
+
 def _render_context(context: Any, installed_apps: Iterable[str] | None = None) -> str:
     """Context section. ``user_profile`` keeps only keys that exist in the sample;
     values are the model-visible ones already present in the dataset context."""
@@ -395,6 +445,9 @@ def build_decision_prompt(
     catalog: Any,
     prior_steps: Sequence[StepRecord] | None = None,
     history_limit: int = DEFAULT_HISTORY_LIMIT,
+    asr_hypotheses: Sequence[Any] | None = None,
+    nbest_format: bool = False,
+    nbest_limit: int = 3,
 ) -> str:
     """Render the full decision prompt for one agent step.
 
@@ -402,11 +455,20 @@ def build_decision_prompt(
     profile keys, no timestamps of the moment of rendering. Contains no gold
     labels, no future observations and no tools of uninstalled apps (``catalog``
     is expected to be the per-sample catalog/registry view).
+
+    ``asr_hypotheses`` (strings, ``AsrHypothesis`` or ``{"text", "source"}``
+    mappings) is only rendered when ``nbest_format`` is on AND 2+ distinct texts
+    survive deduplication; otherwise the section is the baseline
+    ``"# Yêu cầu\\n" + transcript`` byte-for-byte.
     """
     steps = list(prior_steps or [])
 
     sections: list[str] = []
-    sections.append("# Yêu cầu\n" + (transcript or "").strip())
+    sections.append(
+        _render_request(
+            transcript, asr_hypotheses, nbest_format=nbest_format, limit=nbest_limit
+        )
+    )
     # ``context`` already carries installed_apps; the registry view supplies the tools.
     sections.append("# Ngữ cảnh\n" + _render_context(context, installed_apps))
     sections.append("# Lịch sử hội thoại\n" + _render_history(history, history_limit))
@@ -427,6 +489,7 @@ def to_messages(body: str, system_prompt: str = SYSTEM_PROMPT) -> list[dict[str,
 
 __all__ = [
     "DEFAULT_HISTORY_LIMIT",
+    "NBEST_HEADER",
     "SYSTEM_PROMPT",
     "StepRecord",
     "build_decision_prompt",

@@ -418,10 +418,21 @@ def _compose_multi_asr(cfg: Any, primary: Any) -> Any:
 
     secondary = None
     secondary_id = str(_param(features, "asr", "secondary_model_id", "") or "").strip()
+    sec_backend = str(_param(features, "asr", "secondary_backend", "whisper") or "whisper").strip().lower()
+    if "chunkformer" in secondary_id.lower() or "chunkformer" in sec_backend:
+        sec_backend = "chunkformer"
     if secondary_id:
         try:
-            secondary = create_asr_backend(cfg, backend="whisper", model_name=secondary_id)
+            if sec_backend == "chunkformer":
+                raise AsrError(
+                    f"secondary_backend='chunkformer' ({secondary_id!r}) is unsupported: "
+                    "no chunkformer weights or runtime available locally"
+                )
+            secondary = create_asr_backend(cfg, backend=sec_backend, model_name=secondary_id)
         except Exception as exc:  # noqa: BLE001 - degrade loudly, never silently
+            failure_pol = str(_param(features, "asr", "multi_asr_failure_policy", "primary_only"))
+            if failure_pol == "strict":
+                raise
             print(
                 f"WARNING: asr.multi_asr is ON but the secondary backend {secondary_id!r} could not "
                 f"be built ({type(exc).__name__}: {exc}); running PRIMARY ONLY. This run is not a "
@@ -553,6 +564,7 @@ def _transcribe(
     conditioning: dict[str, Any] = {}
     nbest_reason: str | None = None
     nbest_requested = False
+    hypotheses: list[Any] | None = None
     try:
         with contextlib.ExitStack() as stack:
             transcription_path = audio_path
@@ -576,11 +588,19 @@ def _transcribe(
                     result = asr.transcribe(transcription_path, sample_id=sample_id)
                 else:
                     result = nbest.to_transcript_result(source=backend_label)
+                    hypotheses = list(getattr(nbest, "hypotheses", []) or [])
                     conditioning["nbest"] = {
                         "requested": int(_param(features, "asr", "nbest_size", 3)),
-                        "returned": len(getattr(nbest, "hypotheses", []) or []),
+                        "returned": len(hypotheses),
                         "degraded": bool(getattr(nbest, "degraded", False)),
                     }
+            elif _flag(features, "asr", "multi_asr_enabled") and hasattr(asr, "transcribe_multi"):
+                multi_res = asr.transcribe_multi(transcription_path, sample_id=sample_id)
+                if multi_res.hypotheses:
+                    result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
+                    hypotheses = list(multi_res.hypotheses)
+                else:
+                    result = asr.transcribe(transcription_path, sample_id=sample_id)
             else:
                 result = asr.transcribe(transcription_path, sample_id=sample_id)
     except ProhibitedAccessError:
@@ -609,6 +629,8 @@ def _transcribe(
     }
     if conditioning:
         info["conditioning"] = conditioning
+    if hypotheses is not None:
+        info["hypotheses"] = hypotheses
     if nbest_requested:
         info["nbest_requested"] = True
     if nbest_reason is not None:
@@ -1015,7 +1037,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         )
         deadline = time.monotonic() + float(cfg.agent.time_budget_seconds)
         try:
-            result = agent.run(sample, transcript=transcript, deadline=deadline)
+            asr_hyp = asr_info.get("hypotheses")
+            result = agent.run(sample, transcript=transcript, deadline=deadline, asr_hypotheses=asr_hyp)
         except ProhibitedAccessError:
             raise  # compliance violation: never downgrade to a warning + empty row
         except Exception as exc:  # keep the run alive; record the failure
