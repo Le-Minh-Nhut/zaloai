@@ -428,7 +428,8 @@ def _compose_multi_asr(cfg: Any, primary: Any) -> Any:
                     f"secondary_backend='chunkformer' ({secondary_id!r}) is unsupported: "
                     "no chunkformer weights or runtime available locally"
                 )
-            secondary = create_asr_backend(cfg, backend=sec_backend, model_name=secondary_id)
+            model_arg = "model_id" if sec_backend == "gipformer" else "model_name"
+            secondary = create_asr_backend(cfg, backend=sec_backend, **{model_arg: secondary_id})
         except Exception as exc:  # noqa: BLE001 - degrade loudly, never silently
             failure_pol = str(_param(features, "asr", "multi_asr_failure_policy", "primary_only"))
             if failure_pol == "strict":

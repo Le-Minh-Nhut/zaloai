@@ -339,6 +339,24 @@ def test_real_secondary_is_reported_blocked():
     assert REAL_SECONDARY_BLOCKED.startswith("BLOCKED")
     assert "python3 -c" in REAL_SECONDARY_BLOCKED
     assert "gipformer1.5-68M-rnnt" in REAL_SECONDARY_BLOCKED
+
+
+def test_secondary_factory_receives_backend_specific_model_argument(monkeypatch):
+    from types import SimpleNamespace
+
+    infer = _infer()
+    calls = []
+    secondary = FakeBackend("secondary", ["xin chào"])
+    monkeypatch.setattr(infer, "create_asr_backend", lambda cfg, **kw: calls.append(kw) or secondary)
+    for backend, key in (("gipformer", "model_id"), ("whisper", "model_name")):
+        cfg = SimpleNamespace(features=SimpleNamespace(asr=SimpleNamespace(
+            multi_asr_enabled=True, secondary_backend=backend,
+            secondary_model_id="checkpoint", multi_asr_failure_policy="strict",
+        )))
+        infer._compose_multi_asr(cfg, FakeBackend("primary", ["chào"]))
+        assert calls[-1] == {"backend": backend, key: "checkpoint"}
+
+
 def test_chunkformer_secondary_backend_is_blocked_in_infer():
     infer = _infer()
     cfg = type("C", (), {
