@@ -14,11 +14,24 @@ weights          ``params * 4`` (fp32 master; AdamW writes the  ``params * bpp``
 gradients        ``params * 4``                                  adapter only (measured for MiniCPM5-2B: 25,116,672)
 optimizer state  ``params * 8`` (AdamW fp32 m,v + fp32 master)   adapter only
 activations      ``layers * seq * batch * hidden * k`` heuristic  same
-logits + CE      ``chunk * batch * vocab * 4`` (fp32 upcast)      same
-                 ``chunk = min(loss_chunk_tokens, seq)`` when chunked,
-                 else ``seq``; the unchunked cost is reported as
-                 ``logits_unchunked_gb`` for contrast
+logits (compute) ``seq * batch * vocab * bpp`` — the full causal-LM  same
+                 head output in the COMPUTE dtype. ``_forward_loss``
+                 calls the model WITHOUT ``labels`` whenever
+                 ``loss_chunk_tokens > 0``, so this tensor exists and
+                 stays alive through ``backward()`` (the chunked CE
+                 reads slices of it). Reported as
+                 ``logits_compute_gb``; bpp=2 for bf16/fp16, 4 fp32.
+logits + CE      ``chunk * batch * vocab * 4`` (fp32 upcast of ONE  same
+                 slice); ``chunk = min(loss_chunk_tokens, seq)`` when
+                 chunked, else ``seq``. Reported as ``logits_gb``.
+                 ``logits_unchunked_gb`` prices the whole-sequence fp32
+                 upcast nobody runs, for contrast only.
 ===============  ==============================================  =========================
+Both logits terms are real allocations of the same step and are added to
+``total_gb``. Pricing only the fp32 slice (what this module did before)
+under-estimates every chunked run by ``seq/bpp`` relative to the chunk —
+2.14 GB at MiniCPM5-2B's seq 8192 / vocab 130560, which is the difference
+between 8.54 GB and 10.68 GB for LoRA.
 For Qwen3.5-4B the LoRA adapter count is 32,464,896 (12 suffixes, hybrid
 linear-attention set); the preflight reports whatever the loaded model actually
 carries and labels the value ``measured`` or ``placeholder_0.5pct``.
@@ -28,6 +41,20 @@ without gradient checkpointing and 2 with it; gradient checkpointing trades
 recompute time for a ~5x smaller activation footprint. The estimate is
 deliberately conservative because underestimating VRAM loses a whole training
 run.
+
+**What the 14.37 GB measurement does and does not validate.** Both logits terms
+now in ``total_gb`` reproduce exactly: at seq 8192 / vocab 130560 / bf16 the
+compute-dtype logits are ``8192 * 130560 * 2 = 2.139 GB`` and the fp32 chunk is
+``1024 * 130560 * 4 = 0.535 GB``, and ``5.03 + 2.139 + 0.535 = 7.70 GB`` against
+the measured 14.37 GB. The remaining **6.67 GB** is *not* covered by the
+``ACTIVATION_K_CHECKPOINTED = 2`` heuristic, which prices only
+``layers * seq * batch * hidden * 2 * bpp`` = 2.82 GB for MiniCPM5-2B (42 * 8192
+* 2048 * 2 * 2). The gap is the rest of a real stepped graph: one checkpointed
+layer's full intermediates recomputed per block, the attention/MLP workspace,
+cuBLAS workspaces and the logits' backward buffer. So the corrected LoRA
+estimate (10.68 GB) still lands ~3.7 GB BELOW the measurement — this module
+under-estimates activations, and the measurement is the authority, not the
+estimate. Use the estimate to rank configurations, not to promise a fit.
 """
 
 from __future__ import annotations
@@ -349,7 +376,15 @@ def run_memory_preflight(
     chunk = min(chunk_tokens, seq) if chunk_tokens > 0 else seq
     logits = int(chunk * batch * vocab * LOGIT_BYTES) if vocab else 0
     logits_unchunked = int(seq * batch * vocab * LOGIT_BYTES) if vocab else 0
-    total = master_weights + adapter_weights + grads + optimizer + activations + logits
+    # The OTHER tensor of the same step: the causal-LM head returns full
+    # ``[batch, seq, vocab]`` in the COMPUTE dtype whenever the trainer asks for
+    # logits instead of a loss (``loss_chunk_tokens > 0``), and that tensor stays
+    # alive through ``backward()`` because the chunked CE reads slices of it. It is
+    # ``seq/chunk`` times larger than the fp32 slice above, so omitting it is the
+    # bigger error of the two: 2.14 GB at MiniCPM5-2B's 8192 / 130560.
+    logits_compute = int(seq * batch * vocab * bpp) if vocab else 0
+    total = (master_weights + adapter_weights + grads + optimizer + activations
+             + logits_compute + logits)
 
     gpu = dict(gpu_info) if gpu_info is not None else _gpu_info()
     available_bytes = gpu.get("free_bytes") or gpu.get("total_bytes") or 0
@@ -381,13 +416,19 @@ def run_memory_preflight(
         "gradients_gb": round(grads / 1e9, 2),
         "optimizer_gb": round(optimizer / 1e9, 2),
         "activations_gb": round(activations / 1e9, 2),
-        "logits_gb": round(logits / 1e9, 2),
+        "logits_gb": round((logits_compute + logits) / 1e9, 2),
+        "logits_compute_gb": round(logits_compute / 1e9, 2),
+        "logits_chunked_gb": round(logits / 1e9, 2),
         "logits_chunk_tokens": chunk,
         # What the same step would allocate WITHOUT chunking (``loss_chunk_tokens: 0``).
         "logits_unchunked_gb": round(logits_unchunked / 1e9, 2),
         "logits_note": (
-            f"headline logits term models the {'chunked' if chunk_tokens > 0 else 'unchunked'} "
-            f"path: {chunk} tokens upcast to fp32; unchunked would be "
+            f"``logits_gb`` is both real logits allocations of the "
+            f"{'chunked' if chunk_tokens > 0 else 'unchunked'} path: "
+            f"{round(logits_compute / 1e9, 2)} GB of compute-dtype ({bpp} B) "
+            f"``[seq, vocab]`` head output that stays alive through backward, plus "
+            f"{round(logits / 1e9, 2)} GB fp32 upcast of {chunk} tokens; the "
+            f"whole-sequence fp32 upcast nobody runs would be "
             f"{round(logits_unchunked / 1e9, 2)} GB"
         ),
         "vocab_size": vocab,
@@ -399,12 +440,15 @@ def run_memory_preflight(
         "heuristic": (
             f"activations = layers({layers}) * seq({seq}) * microbatch({batch}) * "
             f"hidden({hidden}) * k({k}) * {bpp} bytes; k=2 with gradient "
-            f"checkpointing else 10; logits = chunk({chunk}) * microbatch({batch}) * "
-            f"vocab({vocab}) * {LOGIT_BYTES} bytes, modelling the "
-            f"{'CHUNKED' if chunk_tokens > 0 else 'UNCHUNKED'} path "
+            f"checkpointing else 10; logits = compute({seq}) * microbatch({batch}) * "
+            f"vocab({vocab}) * {bpp} bytes "
+            f"({round(logits_compute / 1e9, 2)} GB bf16/fp16 head output held through "
+            f"backward) + chunk({chunk}) * microbatch({batch}) * vocab({vocab}) * "
+            f"{LOGIT_BYTES} bytes ({round(logits / 1e9, 2)} GB fp32 CE upcast), modelling "
+            f"the {'CHUNKED' if chunk_tokens > 0 else 'UNCHUNKED'} path "
             f"(loss_chunk_tokens={chunk_tokens if chunk_tokens > 0 else 0} -> chunk "
-            f"{chunk} tokens; transformers upcasts that slice to fp32 in the loss; "
-            f"unchunked would be {round(logits_unchunked / 1e9, 2)} GB). "
+            f"{chunk} tokens; unchunked fp32 would be "
+            f"{round(logits_unchunked / 1e9, 2)} GB). "
             f"Base weights at {master_bpp} byte(s)/param"
             f"{' (nf4)' if quantized else ''}. Shape from {shape_source}. "
             "Point estimate, not a measurement."
@@ -453,9 +497,12 @@ def format_report(report: Mapping[str, Any]) -> str:
         f"  gradients          : {report.get('gradients_gb')} GB",
         f"  optimizer state    : {report.get('optimizer_gb')} GB",
         f"  activations        : {report.get('activations_gb')} GB (heuristic)",
-        f"  logits + CE        : {report.get('logits_gb')} GB "
-        f"(chunk {report.get('logits_chunk_tokens')} of {report.get('seq_len')} tokens * vocab fp32; "
-        f"unchunked {report.get('logits_unchunked_gb')} GB)",
+        f"  logits (compute)   : {report.get('logits_compute_gb')} GB "
+        f"(full [{report.get('seq_len')}, {report.get('vocab_size')}] head output in the "
+        f"compute dtype, held through backward)",
+        f"  logits + CE        : {report.get('logits_chunked_gb')} GB "
+        f"(chunk {report.get('logits_chunk_tokens')} of {report.get('seq_len')} tokens * vocab "
+        f"fp32 upcast; unchunked {report.get('logits_unchunked_gb')} GB)",
         f"  TOTAL              : {report.get('total_gb')} GB",
         f"  checkpoint size    : {report.get('checkpoint_size_gb')} GB",
         f"  GPU                : {gpu_line}",

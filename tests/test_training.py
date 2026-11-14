@@ -838,7 +838,10 @@ def test_memory_preflight_math_is_exact() -> None:
     gradients    = 1e9 * 4             = 4.00 GB
     optimizer    = 1e9 * 8             = 8.00 GB
     activations  = 32*1024*1*2560*10*2 = 1.678 GB (k=10, no grad checkpointing)
-    total        = 17.678 GB           -> 17.68
+    logits       = the chunked path's TWO tensors at vocab 248320:
+                   compute (bf16) 1024*248320*2 = 0.509 GB, held through backward
+                   fp32 chunk     1024*248320*4 = 1.017 GB (chunk == seq here)
+    total        = 17.678 + 0.509 + 1.017  -> 19.20
     checkpoint   = weights + grads     = 8.00 GB
     """
     cfg = load_config()
@@ -858,11 +861,14 @@ def test_memory_preflight_math_is_exact() -> None:
     assert report["gradients_gb"] == 4.0, report
     assert report["optimizer_gb"] == 8.0, report
     assert report["activations_gb"] == 1.68, report
-    # logits + CE: transformers upcasts the whole [seq, vocab] tensor to fp32.
-    # Qwen3.5-4B vocab is 248320 -> 1024 * 248320 * 4 = 1.017 GB.
+    # Logits, both tensors the chunked path allocates at Qwen3.5-4B's vocab 248320:
+    # the bf16 head output the trainer asks for (1024 * 248320 * 2 = 0.509 GB, alive
+    # through backward) and the fp32 upcast of the slice (1024 * 248320 * 4 = 1.017 GB).
     assert report["vocab_size"] == 248320, report
-    assert report["logits_gb"] == 1.02, report
-    assert report["total_gb"] == 18.69, report
+    assert report["logits_compute_gb"] == 0.51, report
+    assert report["logits_chunked_gb"] == 1.02, report
+    assert report["logits_gb"] == 1.53, report
+    assert report["total_gb"] == 19.2, report
     assert report["checkpoint_size_gb"] == 8.0, report
     assert report["verdict"] == "unknown", report["verdict"]
     assert report["available_gb"] is None
@@ -876,15 +882,16 @@ def test_memory_preflight_math_is_exact() -> None:
     )
     # k=2: 32*1024*1*2560*2*2 = 335,544,320 bytes -> 0.34 GB
     assert checkpointed["activations_gb"] == 0.34, checkpointed
-    # 4.00 + 4.00 + 8.00 + 0.34 + 1.02 logits
-    assert checkpointed["total_gb"] == 17.35, checkpointed
+    # 4.00 + 4.00 + 8.00 + 0.34 + 0.51 compute logits + 1.02 fp32 chunk
+    assert checkpointed["total_gb"] == 17.86, checkpointed
     print("  preflight full -> 4.00 + 4.00 + 8.00 + 1.68 = 17.68 GB (hand-checked, fp32 masters, 32 layers)")
 
 def test_memory_preflight_verdicts_and_lora() -> None:
     """fits/tight/does_not_fit boundaries and the LoRA accounting."""
     cfg = _cfg_with(gradient_checkpointing=False, tuning_mode="full")
-    # 4+4+8 GB + 32*1024*2560*10*2 activation bytes + 1024*248320*4 logit bytes
-    total_bytes = 17_677_721_600 + 1_017_118_720
+    # 4+4+8 GB + 32*1024*2560*10*2 activation bytes
+    # + 1024*248320*2 bf16 head-logit bytes + 1024*248320*4 fp32 chunk bytes
+    total_bytes = 17_677_721_600 + 508_559_360 + 1_017_118_720
     for free, expected in (
         (total_bytes * 2, "fits"),
         (int(total_bytes / 0.95), "tight"),
@@ -912,12 +919,13 @@ def test_memory_preflight_verdicts_and_lora() -> None:
     assert lora["gradients_gb"] == 0.01, lora
     assert lora["optimizer_gb"] == 0.04, lora
     # 2.0 base + 0.01 adapter weights + 0.01 grads + 0.04 optimizer + 0.34 act
-    # + 1.02 logits = 3.41 (each term is rounded to 2dp before the sum)
-    assert lora["total_gb"] == 3.41, lora
+    # + 0.51 compute logits + 1.02 fp32 chunk = 3.92 (exact bytes, rounded at the end)
+    assert lora["total_gb"] == 3.92, lora
     assert lora["activations_gb"] == 0.34, lora
     text = format_report(lora)
     assert "verdict" in text and "TOTAL" in text and "estimate, not a measurement" in text
-    print("  preflight -> 3 verdicts correct; LoRA 3.41 GB vs 17.35 GB full (fp32 masters + fp32 logits)")
+    print("  preflight -> 3 verdicts correct; LoRA 3.92 GB vs 17.86 GB full "
+          "(fp32 masters + bf16 head logits + fp32 chunk)")
 
 def test_real_run_reports_measured_trainable_after_lora_configure() -> None:
     """A non-dry-run path preflights twice: first without weights, then with the model.
@@ -998,9 +1006,13 @@ def test_preflight_logits_term_models_the_chunked_path() -> None:
     """The headline logits term is the CE slice the trainer actually upcasts.
 
     With ``loss_chunk_tokens=1024`` at seq 8192 / vocab 130560 the shipped run
-    upcasts ``[1024, vocab]`` (0.53 GB), not ``[8192, vocab]`` (4.28 GB); the
-    unchunked cost is reported separately as ``logits_unchunked_gb``.
-    ``loss_chunk_tokens <= 0`` means "no chunking", so both terms coincide.
+    allocates TWO logits tensors: the bf16 head output ``[8192, vocab]`` the model
+    returns because the trainer withholds ``labels`` (2.14 GB, alive through
+    ``backward()``) and the fp32 upcast of one ``[1024, vocab]`` slice (0.53 GB).
+    ``logits_gb`` is their sum; ``logits_unchunked_gb`` prices the whole-sequence
+    fp32 upcast nobody runs (4.28 GB) for contrast. ``loss_chunk_tokens <= 0``
+    means "no chunking", so the fp32 term grows to the sequence width while the
+    compute-dtype term is unchanged.
     """
     from lifemate.training.memory_preflight import run_memory_preflight
 
@@ -1013,10 +1025,20 @@ def test_preflight_logits_term_models_the_chunked_path() -> None:
     )
     assert chunked["vocab_size"] == vocab, chunked["vocab_size"]
     assert chunked["logits_chunk_tokens"] == 1024, chunked["logits_chunk_tokens"]
-    assert chunked["logits_gb"] == round(1024 * vocab * 4 / 1e9, 2) == 0.53, chunked["logits_gb"]
+    assert chunked["logits_compute_gb"] == round(8192 * vocab * 2 / 1e9, 2) == 2.14, chunked
+    assert chunked["logits_chunked_gb"] == round(1024 * vocab * 4 / 1e9, 2) == 0.53, chunked["logits_gb"]
     assert chunked["logits_unchunked_gb"] == round(8192 * vocab * 4 / 1e9, 2) == 4.28, chunked
+    # logits_gb is the sum of the two terms that exist, never the fp32 slice alone.
+    assert chunked["logits_gb"] == round(chunked["logits_compute_gb"] + chunked["logits_chunked_gb"], 2)
+    assert chunked["logits_gb"] == 2.67, chunked["logits_gb"]
+    # The reported total must be the sum of the terms it prints.
+    assert chunked["total_gb"] == round(
+        sum(chunked[k] for k in ("weights_gb", "adapter_gb", "gradients_gb", "optimizer_gb",
+                                 "activations_gb", "logits_compute_gb", "logits_chunked_gb")), 2
+    ), chunked
     assert "CHUNKED" in chunked["heuristic"] and "chunk(1024)" in chunked["heuristic"], chunked["heuristic"]
-    assert "unchunked would be 4.28 GB" in chunked["logits_note"], chunked["logits_note"]
+    assert "unchunked fp32 would be 4.28 GB" in chunked["heuristic"], chunked["heuristic"]
+    assert "4.28 GB" in chunked["logits_note"], chunked["logits_note"]
 
     unchunked = run_memory_preflight(
         param_count=1_000_000_000,
@@ -1025,9 +1047,14 @@ def test_preflight_logits_term_models_the_chunked_path() -> None:
         gpu_info={"gpu": "unavailable"},
     )
     assert unchunked["logits_chunk_tokens"] == 8192, unchunked["logits_chunk_tokens"]
-    assert unchunked["logits_gb"] == unchunked["logits_unchunked_gb"] == 4.28, unchunked
+    # No chunking: the fp32 term coincides with the unchunked contrast term, and the
+    # compute-dtype head output is still there (it does not depend on chunking at all).
+    assert unchunked["logits_chunked_gb"] == unchunked["logits_unchunked_gb"] == 4.28, unchunked
+    assert unchunked["logits_compute_gb"] == chunked["logits_compute_gb"] == 2.14, unchunked
+    assert unchunked["logits_gb"] == 6.42, unchunked["logits_gb"]
     assert "UNCHUNKED" in unchunked["heuristic"], unchunked["heuristic"]
-    print("  preflight logits -> chunked 0.53 GB headline vs unchunked 4.28 GB at seq 8192; 0 means no chunking")
+    print("  preflight logits -> 2.14 GB bf16 head output + 0.53 GB fp32 chunk (4.28 GB unchunked "
+          "contrast) at seq 8192; 0 means no chunking")
 
 
 def test_model_shape_descends_into_text_config() -> None:
@@ -1830,9 +1857,11 @@ def test_dry_run_prints_preflight_and_plan() -> None:
     assert "Memory pre-flight" in out.stdout
     # 4e9 params, seq 8192, grad ckpt, 32 layers: weights 16.0 (fp32 master)
     # + grads 16.0 + AdamW 32.0 + activations 32*8192*1*2560*2*2 = 2.68 GB
-    # + the CHUNKED fp32 logits the run actually upcasts, 1024*248320*4 = 1.02 GB
-    # (unchunked would be 8192*248320*4 = 8.14 GB, reported alongside) = 67.70
-    assert "TOTAL              : 67.7 GB" in out.stdout, out.stdout
+    # + the bf16 head output the trainer asks for, 8192*248320*2 = 4.07 GB
+    # + the CHUNKED fp32 upcast, 1024*248320*4 = 1.02 GB
+    # (whole-sequence fp32 would be 8192*248320*4 = 8.14 GB, reported alongside) = 71.77
+    assert "TOTAL              : 71.77 GB" in out.stdout, out.stdout
+    assert "logits (compute)   : 4.07 GB" in out.stdout, out.stdout
     assert "logits + CE        : 1.02 GB" in out.stdout, out.stdout
     assert "unchunked 8.14 GB" in out.stdout, out.stdout
     assert "base weights       : 16.0 GB" in out.stdout, out.stdout
@@ -1840,7 +1869,8 @@ def test_dry_run_prints_preflight_and_plan() -> None:
     assert "layers(32)" in out.stdout, out.stdout
     assert '"tuning_mode": "full"' in out.stdout
     assert "no model loaded, no training launched" in out.stdout
-    print("  dry run full -> 67.70 GB at seq 8192 (fp32 masters + 1024-token chunked logits), plan printed, exit 0")
+    print("  dry run full -> 71.77 GB at seq 8192 (fp32 masters + bf16 head logits + "
+          "1024-token fp32 chunk), plan printed, exit 0")
 
     lora = _run(
         [
@@ -1861,13 +1891,15 @@ def test_dry_run_prints_preflight_and_plan() -> None:
     assert "tuning mode        : lora" in lora.stdout
     # configs/training_lora.yaml + --model Qwen/Qwen3.5-4B: batch 1, accum 8,
     # seq 8192, grad ckpt. base 8.00 + adapter 0.04 + grads 0.04 + optimizer
-    # 0.16 + activations 2.68 + chunked logits 1.02 = 11.94 GB
-    # (unchunked logits would add 7.12 GB back: 8.14 instead of 1.02)
+    # 0.16 + activations 2.68 + bf16 head logits 4.07 + fp32 chunk 1.02 = 16.01 GB
+    # (whole-sequence fp32 would be 8.14 instead of 1.02, and the 4.07 GB head output
+    # is not optional on the chunked path)
     assert "gradients          : 0.04 GB" in lora.stdout, lora.stdout
     assert "optimizer state    : 0.16 GB" in lora.stdout, lora.stdout
     assert "sequence length    : 8192 (microbatch 1, accum 8)" in lora.stdout, lora.stdout
-    assert "TOTAL              : 11.94 GB" in lora.stdout, lora.stdout
-    print("  dry run lora -> 11.94 GB at seq 8192 (microbatch 1 x accum 8, 1024-token chunked logits), exit 0")
+    assert "TOTAL              : 16.01 GB" in lora.stdout, lora.stdout
+    print("  dry run lora -> 16.01 GB at seq 8192 (microbatch 1 x accum 8, bf16 head logits + "
+          "1024-token fp32 chunk), exit 0")
 
 def test_fp16_overcommit_refused_before_launch() -> None:
     """An fp16 run the preflight calls ``does_not_fit`` exits 3 with the measured fact.

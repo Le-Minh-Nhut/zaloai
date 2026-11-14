@@ -120,11 +120,125 @@ well.
 Where 192 comes from: measured action targets over 4368 records — p50 33, p90 58,
 p99 113, **max 165 tokens** (terminator included). A thinking-disabled turn emits
 one short block, so 192 would cover every measured target; that is a statement
-about the observed targets, not about what the scripts use.
+about the observed targets, not about what the scripts use. It is **not** enough
+for think mode — see the next subsection.
 
 `evaluate.py` additionally accepts `--max-new-tokens N` for teacher-forced
 scoring. Changing `agent.max_new_tokens` changes the decode budget only — it does
 not change the profile, the prompt, the stop ids or the terminator.
+
+### Think vs no-think: two separate layers, only one of them settled
+
+`MINICPM5_PROFILE.chat_template_kwargs = {"enable_thinking": False}` is often
+described as simply "the correct branch". That conflates two very different
+claims. They are separated here because only the first one is a fact about bytes.
+
+**Layer 1 — prompt format (measured, token ids).** With `enable_thinking=False`
+the template renders a *closed empty* think block, `…<|im_start|>assistant\n\x3cthink\x3e\n\n\x3c/think\x3e\n\n`
+(escaped here so the tags stay string data, as in `models/profiles.py`), which
+is byte-identical to the serialization the template produces for a training assistant turn that has no `reasoning_content`. The
+inference prompt ids for a real SFT record are an exact prefix of that record's
+training ids. Re-measured by `tests/test_thinking_modes.py`: the two branches
+differ by exactly the trailing `\n\x3c/think\x3e\n\n` and agree everywhere before it
+(the think-mode *text* is a strict prefix of the no-think text; the two **id**
+lists are not prefix related — 18 vs 20 ids — because BPE merges across the
+newline). Layer 1 says the template branch exists and renders as intended. It
+says **nothing** about what the model then does.
+
+**Layer 2 — model behaviour (measured on real weights, 2 arms, same prompts).**
+
+```bash
+WANDB_BASE_URL=http://127.0.0.1:9 PYTHONPATH=src python3 scripts/compare_thinking_modes.py \
+    --model models/MiniCPM5-2B --n 20 --seed 0 --max-new-tokens 512 \
+    --out outputs/reports/thinking_ab.json
+```
+
+Both arms saw the same 20 real `train` records (first decision point each; the
+record sample is seeded, decode is **greedy** so the arms are deterministic),
+same prompt messages, same 512-token budget, `models/MiniCPM5-2B` bf16 on one
+RTX 5070 Ti, no adapter. Only `enable_thinking` differed.
+
+| metric | `enable_thinking=True` | `enable_thinking=False` (shipped) |
+|---|---|---|
+| n | 20 | 20 |
+| valid action (`parse_model_output` → `tool_call`) | **0.15** | **0.20** |
+| valid action, untruncated cases only | 0.30 (n=10) | 0.20 (n=20) |
+| `finish` | 0.05 | 0.00 |
+| parse failure | 0.80 | 0.80 |
+| truncated by the 512 budget | **0.50** | **0.00** |
+| self-repeating loop | 0.00 | 0.00 |
+| `<|im_end|>` emitted | 0.35 | 0.85 |
+| emitted `<function name=` instead of `<action>` | 0.25 | 0.10 |
+| mean / median / max generated tokens | 399.1 / 512 / 512 | **32.4 / 29 / 62** |
+| mean seconds per decision | 5.241 | **0.802** |
+
+A second seed (`--seed 7`, different 20 records) reproduced the ordering:
+valid action 0.15 vs 0.20, untruncated 0.25 vs 0.20, truncation 0.40 vs 0.00,
+`<|im_end|>` 0.45 vs 0.80, `<function name=` 0.45 vs 0.25, mean tokens 345.9 vs
+40.6, mean seconds 4.763 vs 1.008. Raw rows: `outputs/reports/thinking_ab.json`,
+`outputs/reports/thinking_ab_seed7.json`.
+
+What that means, honestly:
+
+* **Neither mode is good on the base checkpoint** — 0.15–0.20 valid actions with
+  no adapter. These numbers are a *relative* comparison of the two branches, not
+  an accuracy claim about a fine-tuned model.
+* **Think mode is not more accurate here, and it is ~12× more expensive.**
+  Its 50% truncation rate at 512 exists precisely because reasoning tokens are
+  spent before the decision; a truncated decode raises (§ above), so those
+  samples contribute no action at all.
+* **The failure mode of no-think is a missing `</action>`, not reasoning.** In
+  seed 0, 14/20 no-think outputs opened `<action>{…}` and stopped at `<|im_end|>`
+  without closing the block; 14/14 of those would have parsed as a valid
+  `tool_call` had the tag been closed. (Seed 7: 11/20 unclosed, 8/11 would have
+  parsed.) That is a base-model instruction-following gap and the natural target
+  for the adapter — not evidence for turning thinking on.
+* **The parser can consume reasoning when reasoning is actually finished.**
+  Every one of the 4/20 think-mode outputs that reached a complete `<action>`
+  block was parsed; 3 became `tool_call`, 1 `finish`. No think-mode failure was
+  "action inside unterminated reasoning" — all 16 were "no complete
+  `<action>…</action>` block found". So the parser's reasoning guard was not the
+  bottleneck; the token budget was.
+* **Both modes sometimes emit the template's own `<function name=…>` syntax
+  instead of the `<action>` protocol** (0.25 vs 0.10 here). Those count as parse
+  failures; a branch that emits `<function>` has not solved the task. Note this
+  is invisible in `HFGenerator`'s decoded text, because `<function` (id 18) and
+  `<param` (id 20) are *special* tokens and `skip_special_tokens=True` erases
+  them — the harness decodes the raw ids separately to count them.
+
+**Limitation of the no-think path, stated plainly.** MiniCPM5-2B was post-trained
+with deep-thinking SFT and RL, and the model card's official Transformers example
+(`models/MiniCPM5-2B/README.md`, "### Transformers" under Quickstart) passes
+`enable_thinking=True`. The no-think branch is a template branch that exists and
+renders correctly; it is not a documented behaviour guarantee from the author.
+Successful rendering ≠ validated model behaviour, and only the numbers above
+support keeping it.
+
+**Decision.** Keep `enable_thinking=False` as the shipped default. The evidence
+is (a) equal-or-better valid-action rate, (b) 12.3× fewer generated tokens,
+(c) 0% vs 50% truncation at the same budget, (d) 6.5× lower latency, and (e) a
+parser that never had to reject a reasoning-tainted decision. Revisit after
+fine-tuning: re-run `scripts/compare_thinking_modes.py` against the adapter, and
+flip only if think mode wins on valid-action rate.
+
+**How to switch to think mode** (the old path stays reachable — nothing below is
+the default):
+
+* Override the template kwarg without touching the profile, e.g. in a config or
+  harness: `dataclasses.replace(MINICPM5_PROFILE, chat_template_kwargs={**MINICPM5_PROFILE.chat_template_kwargs, "enable_thinking": True})`
+  and pass that profile to `HFGenerator`/`render_prompt_text`.
+* Budget: the profile's 192 and the shipped 512 are both too small. Think-mode
+  decisions in the run above used mean 399 / median 512 tokens and half hit the
+  512 ceiling; a truncated decode **raises**, so raise
+  `agent.max_new_tokens` (≥1024 is the honest starting point) before enabling it.
+  Note the memory ceiling: 1024+ was **NOT RUN** here (14.37/15.17 GB measured
+  peak at seq 8192 on a 16.57 GB card).
+* Parser: think-mode output carries reasoning before the decision. `parse_action`
+  takes the *last* complete `<action>…</action>` block and rejects a block that
+  sits inside an unterminated `think`, so reasoning is ignored when it is closed
+  and refused when it is not — but the agent pays for those tokens either way.
+  The prompt will also no longer be byte-identical to the training
+  serialization, which invalidates the Layer-1 parity argument.
 
 ### A truncated decode raises — hard rule
 
@@ -300,7 +414,7 @@ final-state scorer).
 | `... was trained for model ... but base ... was requested` | adapter from another family | pass the matching `--model` |
 | `submission validation: …` + exit 4 | row/order/type problem | see the printed line; re-run without `--resume` for a clean file |
 | `--asr oracle is forbidden for split …` | oracle on a test split | use `--asr gipformer` |
-| empty `tool_calls` for every sample | model never emitted a valid action | inspect `--debug-dump`; a base MiniCPM5-2B sometimes ends with EOS instead of `</action>` |
+| empty `tool_calls` for every sample | model never emitted a valid action | inspect `--debug-dump`. Measured on the base checkpoint: the usual cause is an `<action>{\u2026}` block left **unclosed** before `<|im_end|>` (14/20 and 11/20 cases in the A/B above), or the template's native `<function name=\u2026>` syntax instead of the `<action>` protocol (2/20 and 5/20) |
 | `--generator is a TEST HOOK` | scripted generator outside a mock run | add `--use-mock-env` (tests only) |
 
 Exit codes: `0` ok · `2` dataset/environment missing · `3` model load failure ·

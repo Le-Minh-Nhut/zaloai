@@ -145,10 +145,10 @@ Full fine-tuning still exists and trains **every** parameter
 (`configure_full_finetuning` raises unless `trainable == total`), but it does not
 fit this card: `--dry-run --tuning full` on the DEFAULT config (MiniCPM5-2B,
 2,516,756,480 params, seq 8192, micro-batch 1, grad-ckpt, vocab 130560, shape
-from the `minicpm5` profile fallback) prints **TOTAL 43.62 GB**
-(weights 10.07 + gradients 10.07 + optimizer 20.13 + activations 2.82 + chunked
-logits 0.53) and `verdict: does_not_fit`. That is estimator arithmetic, not a
-measured peak.
+from the `minicpm5` profile fallback) prints **TOTAL 45.76 GB**
+(weights 10.07 + gradients 10.07 + optimizer 20.13 + activations 2.82 + bf16
+logits 2.14 + fp32 chunked logits 0.53) and `verdict: does_not_fit`. That is
+estimator arithmetic, not a measured peak.
 
 ### Multimodal towers policy (Qwen3.5 variants only)
 
@@ -275,13 +275,19 @@ put it in the documented training command; add it only if a run on a busier card
 OOMs while `nvidia-smi` still shows free memory (fragmentation, not demand).
 
 The preflight estimator (`python3 scripts/train.py --dry-run`) reports
-**8.54 GB** for the shipped LoRA 8192 configuration (weights 5.03 + gradients
-0.03 + optimizer 0.10 + activations 2.82 + chunked logits 0.53, vocab 130560,
-`fits`), against a measured 14.37 GB allocated / 15.17 GB reserved — the formula
-misses the frozen base's activation/transient cost, so it is optimistic by
-~5.8 GB here. It models the CHUNKED logits term (`chunk = min(1024, seq)`,
-0.53 GB); the unchunked whole-vocabulary upcast would be 4.28 GB. At 12288 it
-prints **9.95 GB** for a configuration that in fact OOMs on this card.
+**10.68 GB** for the shipped LoRA 8192 configuration (weights 5.03 + adapter 0.03
++ gradients 0.03 + optimizer 0.10 + activations 2.82 + **bf16 logits 2.14** +
+**fp32 chunked logits 0.53**, vocab 130560, `fits`), against a measured 14.37 GB
+allocated / 15.17 GB reserved — the activation heuristic
+(`layers * seq * hidden * 2`, k=2) is not the same accounting as the real stepped
+graph, so the total is still optimistic by **3.69 GB** here. Both logits terms are
+priced because the chunked-CE path allocates both: the compute-dtype
+`[seq, vocab]` head output the trainer asks for by withholding `labels`
+(`logits_compute_gb`, 2.14 GB, alive through `backward()`) and the fp32 upcast of
+one `[1024, vocab]` slice (`logits_chunked_gb`, 0.53 GB). The whole-sequence fp32
+upcast would be 4.28 GB (`logits_unchunked_gb`, reported for contrast only).
+At 12288 it prints **13.16 GB** for a configuration that in fact OOMs on this
+card.
 **Treat the estimator as a plan, the measured peak as the answer.**
 
 Before a real launch, measure free VRAM immediately — free VRAM on a shared card

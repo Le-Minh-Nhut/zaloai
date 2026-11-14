@@ -45,6 +45,8 @@ __all__ = [
     "SFTTrainer",
     "TrainResult",
     "TrainingInterrupted",
+    "chunked_causal_lm_loss",
+    "forward_loss",
     "optimizer_steps_per_epoch",
     "read_training_state",
     "set_seed",
@@ -337,6 +339,17 @@ def _forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int =
             "model returned no loss; pass labels= so the causal-LM head computes cross-entropy"
         )
     return loss
+
+def forward_loss(model: Any, batch: Mapping[str, Any], loss_chunk_tokens: int = 0) -> Any:
+    """Public alias of the trainer's own loss entry point for external callers.
+
+    Same maths, same single-shape contract: ``loss_chunk_tokens > 0`` asks for
+    logits and computes the chunked CE here, ``<= 0`` keeps the model's own
+    single-shot loss. Notebooks and probes must call THIS, never a hand-rolled
+    ``model(**_batch).loss``, or they re-introduce the fp32 ``[seq, vocab]``
+    upcast the chunking exists to avoid.
+    """
+    return _forward_loss(model, batch, loss_chunk_tokens)
 
 #: Precision spellings that mean fp16 / bf16, lowercased (the loader's
 #: ``DTYPE_MAP`` accepts exactly these). fp16 needs loss scaling; bf16 does not.

@@ -42,7 +42,7 @@ repo vẫn áp dụng được.
 
 | GPU | VRAM | bf16? | Notebook làm gì |
 | --- | --- | --- | --- |
-| T4 | 16 GB | **Không** (sm_75) | tự chọn `float16`; mục 2b tự suy ra `TRAINING_METHOD=qlora` (LoRA 16-bit chỉ vừa tới seq 4096) |
+| T4 | 16 GB | **Không** (sm_75) | tự chọn `float16`; mục 2b tự suy ra `TRAINING_METHOD=qlora` (LoRA 16-bit chỉ vừa tới seq 3840) |
 | L4 | 24 GB | Có | `bfloat16`; LoRA 16-bit chạy được |
 | A100 | 40 / 80 GB | Có | `bfloat16`; dư VRAM, có thể tăng `MAX_SEQ_LENGTH` |
 
@@ -63,10 +63,28 @@ notebook **dừng** với thông báo cụ thể thay vì OOM giữa chừng.
 └── logs/          # stdout của train
 ```
 
-Checkpoint được ghi **nguyên tử**: copy vào thư mục staging → `fsync` → `rename`,
-sau đó mới ghi marker `SYNC_COMPLETE.json`. Logic resume **từ chối** thư mục
-checkpoint trên Drive nếu thiếu marker, nên một lần copy bị ngắt không bao giờ
-được coi là checkpoint hợp lệ.
+Checkpoint được ghi **nguyên tử và có thể rollback**:
+
+```text
+copy -> <dst>.incomplete-<ts>            # bản copy đang chạy, không bao giờ là checkpoint
+     -> fsync cả cây
+     -> SYNC_COMPLETE.json (size + sha256 của TỪNG file, tổng, source, schema=2)
+     -> nếu <dst> đã tồn tại: rename <dst> -> <dst>.prev-<n>   (KHÔNG xoá)
+     -> rename staging -> <dst>
+     -> verify lại <dst>, rồi mới prune các .prev-* cũ (giữ KEEP_PREVIOUS=1)
+```
+
+Không có bước nào `rmtree` bản duy nhất còn sống: crash ở bất kỳ điểm nào cũng để lại
+một thư mục **đầy đủ** dưới `<dst>` hoặc `<dst>.prev-<n>` (test giả lập crash giữa hai
+lần rename và kiểm tra đúng điều đó). Thư mục staging còn sót mang tên `.incomplete-*`
+và bị `checkpoint_ready()` từ chối thẳng.
+
+Resume **verify** marker chứ không chỉ nhìn sự tồn tại của nó: mọi file được liệt kê đều
+được băm lại (size + sha256), nên một bản copy bị cắt cụt mà vẫn còn marker cũ sẽ bị từ
+chối kèm **tên file** sai. Marker do phiên bản notebook cũ ghi (không có `sha256`) được
+báo là `legacy marker, cannot be verified` và **không** dùng để resume — phải sync lại
+thư mục đó. Các kiểm tra cũ (`training_state.json` với `step > 0`, có weights, có
+`optimizer_state.pt`) vẫn nguyên vẹn, và còn được siết thêm `run_name` khi resume từ Drive.
 
 `USE_GOOGLE_DRIVE = False` vẫn chạy được, nhưng mất runtime là mất checkpoint.
 
@@ -114,20 +132,40 @@ Cấu hình khởi đầu khuyến nghị (**ESTIMATE**, trừ khi ghi TESTED):
 | | T4 16 GB | L4 24 GB | A100 40/80 GB |
 | --- | --- | --- | --- |
 | `TRAINING_METHOD` | `qlora` (bắt buộc ở 8192) | `lora` (tới 8192) | `lora` (tới 16384 / 32768) |
-| `MAX_SEQ_LENGTH` | 8192 với `qlora`, tối đa 4096 với `lora` | 8192 với `lora`, tới 12288 với `qlora` | 8192 (A100-40 có thể 16384; A100-80 tới 32768) |
+| `MAX_SEQ_LENGTH` | 8192 với `qlora`, tối đa 3840 với `lora` | 8192 với `lora`, tới 12288 với `qlora` | 8192 (A100-40 có thể 16384; A100-80 tới 32768) |
 | `MICRO_BATCH_SIZE` | 1 | 1 | 1–2 |
 | `GRADIENT_ACCUMULATION_STEPS` | 8 | 8 | 8 (hoặc 4 nếu micro=2) |
 | `NUM_EPOCHS` | 3 | 3 | 3 |
 | `LEARNING_RATE` | 2e-4 | 2e-4 | 2e-4 |
-| VRAM dự kiến (đỉnh) | 9–13 GB — **ESTIMATE** | 11–14 GB — **ESTIMATE** | 12–16 GB — **ESTIMATE** |
+| VRAM dự kiến (đỉnh) | 13.5 GB — **ESTIMATE** | 19.8 GB — **ESTIMATE** | 29.3 GB (A100-40, seq 16384) / 48.2 GB (A100-80, seq 32768) — **ESTIMATE** |
 | Thời gian / epoch (4368 records, ~546 step) | 1.3–2.3 h — **ESTIMATE** | 0.8–1.3 h — **ESTIMATE** | 0.4–0.8 h — **ESTIMATE** |
 
 **GPU quyết định cả METHOD, không chỉ sequence length.** Qwen3.5-4B là
 `Qwen3_5ForConditionalGeneration` với phần text ~4B tham số (hidden 2560, 32 lớp):
-weights fp16 đóng băng ~8.8 GB, cộng ~7.9 GB activation + logits ở 8192 token =
-**17.3 GB**, trong khi T4 chỉ dùng được ~14.9 GB. Vì vậy trên tier `T4-16GB`,
-`lora` @8192 bị suy ra thành `qlora` (10.9 GB) kèm phép tính in ra, và `lora` bị chặn
-ở 4096 (13.3 GB, mức "tight"). Mọi con số đó là **ESTIMATE** (heuristic, in kèm nhãn).
+weights fp16 đóng băng ~8.8 GB, cộng ~5.4 GB activation, ~4.1 GB logits **bf16**
+(`[seq, vocab]` ở 8192 token) và ~1.0 GB cross-entropy fp32 (chunked) =
+**19.8 GB ESTIMATE**, trong khi T4 chỉ dùng được ~14.9 GB. Vì vậy trên tier
+`T4-16GB`, `lora` @8192 bị suy ra thành `qlora` (**13.5 GB ESTIMATE**) kèm phép
+tính in ra, và `lora` bị chặn ở **3840** (**14.8 GB ESTIMATE**, ~100% usable →
+"tight"). Mọi con số đó là **ESTIMATE** (heuristic, in kèm nhãn).
+
+**Vocabulary không còn hard-code.** Ô 2b lấy `vocab_size` theo thứ tự: (a) `config.json`
+của model nếu có đường dẫn local (kể cả `text_config.vocab_size`) → (b) `preflight_vocab`
+từ `src/lifemate/models/profiles.py` → (c) **raise**, không đoán. Qwen3.5-4B khai báo
+**248320**; con số 151936 của Qwen2/Qwen2.5 cũ đã bị xoá vì nó đánh giá thấp hạng tử
+logits **1.63 lần**. Số dùng được in ngay cạnh ước lượng, kèm nguồn.
+
+**Hai hạng tử logits, không phải một.** Đường chunked mà trainer thực chạy giữ *hai*
+tensor cùng lúc: (1) `logits_compute_gb` — output đầy đủ của causal-LM head
+`[micro_batch, seq, vocab]` ở dtype compute (bf16/fp16, 2 B/logit; fp32 nếu chạy fp32).
+Vì `loss_chunk_tokens > 0` nên trainer gọi model **không** kèm `labels`, head trả logits
+thay vì loss, và tensor đó sống suốt `backward()` vì chunked CE đọc từng slice của nó:
+8192 × 248320 × 2 B = **4.1 GB**; và (2) `logits_chunked_gb` — bản upcast fp32 của *một*
+slice, `min(loss_chunk_tokens, seq) * micro_batch * vocab * 4` (mặc định 1024 →
+**1.0 GB**). `logits_gb` = (1) + (2). Bảng 2b in thêm `logits_unchunked` để đối chiếu:
+**8.1 GB** nếu upcast fp32 cả sequence (8192 × 248320 × 4 B) — đúng khoản allocation mà
+`loss_chunk_tokens` tồn tại để tránh. Chỉ tính (2), như bản trước, đánh giá thấp mỗi lần
+chạy chunked đúng bằng khoản (1).
 
 `MAX_SEQ_LENGTH` bạn đặt **không bao giờ bị hạ âm thầm**: khi nó không vừa tier, mục 2b
 in `!! MAX_SEQ_LENGTH <cũ> -> <mới>` kèm ước lượng đã buộc phải chặn và cách giữ giá
@@ -169,16 +207,31 @@ bị tính tiền — xong việc thì `Runtime → Disconnect and delete runtim
 
 Notebook kiểm tra trước khi resume:
 
-* có `SYNC_COMPLETE.json` (nếu đến từ Drive),
+* nếu checkpoint đến từ Drive: `SYNC_COMPLETE.json` phải **verify được** — mọi file
+  trong marker được băm lại (size + sha256); thiếu file, thừa file, sai size, sai
+  sha256, hay marker `legacy` (không có sha256) đều bị **từ chối** kèm tên file;
+* marker (nếu có ghi) phải mang đúng `run_name` của session này;
 * có `training_state.json` với `step > 0`,
 * có weights **và** `optimizer_state.pt`,
 * `config_hash` của checkpoint khớp `config_hash` hiện tại (lr, seed, seq len,
   batch, epoch, precision, tuning mode) — lệch là dừng, vì trainer cũng sẽ từ chối.
 
-Mục 9 chứng minh resume thật: chạy thêm 2 step và khẳng định số step tăng lên,
-in dòng `resumed ... at step N` của trainer. **Chỉ load `adapter_model.safetensors`
-là "adapter-only loading"**, không phải resume optimizer — notebook không bao giờ
-gọi đó là resume.
+### 7.1 Mục 9: đọc (luôn luôn) và chứng minh resume (tuỳ chọn)
+
+Mục 9 có hai nửa:
+
+1. **Luôn chạy, chỉ đọc**: in nội dung thư mục checkpoint, chạy `checkpoint_ready`,
+   so `config_hash` với session hiện tại. Không subprocess, không tạo `step-<n>` mới,
+   không ghi gì lên Drive.
+2. **Chỉ khi `RUN_RESUME_PROOF = True`** (ô param ở mục 2, mặc định **`False`**): chạy
+   thêm 2 optimizer step từ checkpoint và khẳng định số step tăng lên, in dòng
+   `resumed ... at step N` của trainer. Bước này **làm thay đổi experiment**: nó in ra
+   tên các `step-<n>` mới được tạo, sync chúng lên Drive, và ghi `resume_proof.json` với
+   `"isolated": false` + `from_step` / `to_step` / `new_step_dirs`. Vì vậy nó không bao
+   giờ chạy ngầm: một experiment đã xong không bị nối dài mà không ai yêu cầu.
+
+**Chỉ load `adapter_model.safetensors` là "adapter-only loading"**, không phải resume
+optimizer — notebook không bao giờ gọi đó là resume.
 
 ## 8. Export adapter
 
@@ -229,9 +282,14 @@ không phải là đánh giá tool-calling thành công** — đó chỉ là ki�
   truncation 47/4368 @8192 lấy từ `manifest.json` của repo; và — không phải trên
   notebook này — `models/MiniCPM5-2B` đã được load, forward/backward và generate thật
   trên GPU RTX 5070 Ti của máy này (README gốc).
-* **TESTED ở mức code, không ở mức phần cứng**: `derive_run_config` được gọi thật với
-  input tier tổng hợp (T4/L4/A100) trong một script `/tmp` — tách hàm ra bằng `ast`,
-  không cần GPU. Đó là kiểm tra logic, không phải kiểm tra VRAM thật.
+* **TESTED ở mức code, không ở mức phần cứng**: `derive_run_config` / `estimate_vram_gb`
+  / `revalidate_tier_caps` được gọi thật với input tier tổng hợp (T4/L4/A100-40/A100-80)
+  từ `tests/test_colab_notebook.py` — tách hàm ra khỏi `.ipynb` bằng `ast`, không cần GPU.
+  Đó là kiểm tra logic, không phải kiểm tra VRAM thật. Cùng file đó chạy thật
+  `atomic_sync`/`verify_sync_marker`/`checkpoint_ready` trên thư mục tạm (stdlib), gồm
+  cả một lần **giả lập crash** giữa hai lần rename, và `release_model_refs` với một
+  "model" giả để chứng minh tham chiếu bị xoá thật (weakref chết) chứ không chỉ bị gán
+  `None`.
 * **TESTED ở mức code, không cài gì**: cổng phiên bản ở mục 1c (tách hàm bằng `ast` ra
   `/tmp`, thay `importlib.metadata.version` + `pip` bằng bản giả) — `transformers` 4.44.2
   với floor `>=5.22` báo `upgrade`, đúng `5.22` báo `none`, gói vắng báo `install`, và
@@ -240,7 +298,11 @@ không phải là đánh giá tool-calling thành công** — đó chỉ là ki�
   `peft>=0.21`, `accelerate>=0.33`, `pyyaml>=6`). `torch` chỉ **kiểm tra** (dưới 2.15 thì
   bảo chọn runtime mới hơn), không pip cài, vì torch của Colab gắn với CUDA của runtime.
 * **ESTIMATE**: mọi con số VRAM, thời gian, Compute Unit, và toàn bộ bảng cấu hình
-  khuyến nghị. Chưa có lần chạy Colab nào.
+  khuyến nghị. Chưa có lần chạy Colab nào. Các con số trong mục 5 (`13.5 / 19.8 / 14.8 /
+  18.2 / 29.3 / 48.2 GB`) là output thật của `estimate_vram_gb` ở vocab **248320** với
+  **cả hai** hạng tử logits của đường CE chunked (`logits_compute` bf16 `[seq, vocab]` +
+  `logits_chunked` fp32 ở `loss_chunk_tokens=1024`), không phải số chép tay; bảng đầy đủ
+  (kèm `lg_compute` / `lg_fp32_chunk` / `lg_unchunked`) do chính ô 2b in ra khi chạy.
 * **Chưa kiểm chứng được**: load `Qwen/Qwen3.5-4B` trên GPU (không có weights ở máy
   này), hiệu quả của QLoRA (không có `bitsandbytes` ở đây), đường fp16 +
   `torch.amp.GradScaler` trên T4, chấm điểm closed-loop với `zaic_tools`, độ chính

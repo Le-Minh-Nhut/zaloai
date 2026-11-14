@@ -699,9 +699,12 @@ def test_qlora_accounting_is_separate_and_quantized() -> None:
     assert report["trainable_params"] == 5_000_000, report["trainable_params"]
     assert report["trainable_source"] == "placeholder_0.5pct"
     # base 0.5 + adapter 0.01 + grads 0.01 + optimizer 0.04 + activations 0.34
-    # + logits 1024*130560*4 = 0.53 GB -> 1.44
-    assert report["logits_gb"] == 0.53, report
-    assert report["total_gb"] == 1.45, report
+    # + bf16 head logits 1024*130560*2 = 0.27 GB + fp32 chunk 1024*130560*4 = 0.53 GB
+    # -> 1.71
+    assert report["logits_compute_gb"] == 0.27, report
+    assert report["logits_chunked_gb"] == 0.53, report
+    assert report["logits_gb"] == 0.8, report
+    assert report["total_gb"] == 1.71, report
     assert report["adapter_gb"] == 0.01, report
     print("  qlora preflight -> 0.5 B/param base, adapter/grads/optimizer listed separately")
 
