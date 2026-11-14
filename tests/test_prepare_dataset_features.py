@@ -22,7 +22,7 @@ DATA = ROOT / "data"
 PINNED_ALL_OFF = {
     "train.jsonl": "64b3bdf7fc252a04f415746f951c69ae395d40f9fdebd38a9b503ae94ca85d9f",
     "val.jsonl": "b050077ecf2dd2ba82951c05296faa1a3f1d9a7cf6d2fe8c65d4a0e610d98f65",
-    "manifest.json": "519ac94f468ae62b2ca787acd2792c0231eb5162f8710b7a37e60b406e18e95c",
+    "manifest.json": "a70536eb9f6c1dd6a2aa4592724a4265dd7375109afba6b05c19898e493d34f5",
     "stats.json": "8b1e32de4714f1bc68355117be558d948b3031b4bdae3c714f6f689d45098f86",
 }
 
@@ -42,10 +42,19 @@ def _run(out: Path, *extra: str) -> subprocess.CompletedProcess:
 
 def _digests(out: Path) -> dict[str, str]:
     split = out / "train"
-    return {
-        name: hashlib.sha256((split / name).read_bytes()).hexdigest()
-        for name in ("train.jsonl", "val.jsonl", "manifest.json", "stats.json")
-    }
+    result = {}
+    for name in ("train.jsonl", "val.jsonl", "manifest.json", "stats.json"):
+        content = (split / name).read_bytes()
+        if name == "manifest.json":
+            # The manifest intentionally records the absolute source path. Keep
+            # checking that path, then normalize it for the pinned digest so
+            # the same semantic manifest can be checked in any worktree.
+            manifest = json.loads(content)
+            assert manifest["data_root"] == str(FIXTURES.resolve())
+            manifest["data_root"] = "<FIXTURE_ROOT>"
+            content = (json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        result[name] = hashlib.sha256(content).hexdigest()
+    return result
 
 def _transcripts(tmp: Path, sample_ids: list[str], ratio_texts: tuple[str, str]) -> Path:
     """A 2-hypothesis transcript file for ``sample_ids`` (best first)."""
