@@ -84,6 +84,6 @@ Chế độ chất lượng có thể dùng cache và ghi `quality_asr_latency_e
 | G17 | PASS | G18 | PASS | G19 | PASS | G20 | BLOCKED (artifact hub mutable chưa bao phủ) |
 | G21 | PASS (từ chối spec chưa xác minh) | G22 | PASS | G23 | PASS (regression) | G24 | PASS |
 | G25 | PASS (một mẫu SDK thật) | G26 | PASS (schema một mẫu) | G27 | BLOCKED (Docker) | G28 | PASS (quét và test) |
-| G29 | PASS | G30 | PASS (suite khả dụng) | G31 | PASS (diff review) | G32 | NOT TESTED (xác minh sau push bằng Git) |
+| G29 | PASS | G30 | PASS (suite khả dụng) | G31 | PASS (diff review) | G32 | PASS (commit mã `addb59eb2079130239feb7a0265456b93f02bc73` đã push và đối chiếu remote; kiểm tra đầu nhánh hiện tại bằng Git) |
 
 Các gate PASS ở mức code/test không mở rộng thành khẳng định chất lượng hay hiệu năng trên bộ chấm. Danh sách file và commit chính xác kiểm tra bằng `git show --stat --oneline HEAD`; trạng thái push kiểm tra bằng `git ls-remote`.
