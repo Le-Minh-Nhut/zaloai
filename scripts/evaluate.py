@@ -55,6 +55,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation-only", action="store_true", help="teacher-forced scoring only")
     parser.add_argument("--closed-loop", action="store_true", help="run full episodes in an environment")
     parser.add_argument("--checkpoint", default=None, help="checkpoint directory")
+    parser.add_argument("--heldout-dataset", default=None, help="prepared train dataset directory used to select verified validation source IDs")
+    parser.add_argument("--allow-training-samples", action="store_true", help="explicitly permit non-held-out train diagnostics")
     parser.add_argument("--model-mode", choices=("base", "full", "lora"), default=None)
     parser.add_argument("--config", default=None, help="YAML config file")
     try:  # optional slice: absent -> no feature flags at all
@@ -206,6 +208,8 @@ def _generator(cfg: Any, args: argparse.Namespace | None = None, sample_id: list
     checkpoint = cfg.inference.checkpoint
     if mode in {"full", "lora"} and not checkpoint:
         raise LifeMateError(f"--model-mode {mode} requires --checkpoint")
+    if mode == "lora" and (not Path(str(checkpoint)).is_dir() or not (Path(str(checkpoint)) / "adapter_config.json").is_file()):
+        raise LifeMateError(f"LoRA adapter checkpoint missing or invalid: {checkpoint}")
     from lifemate.models.generation import HFGenerator
     from lifemate.models.loader import load_model_and_tokenizer
 
@@ -305,6 +309,7 @@ def _feature_execution_counts(samples: Any, features: Any, info: Mapping[str, An
         ("asr.gipformer_v15", _flag(features, "asr", "gipformer_v15_enabled")),
         ("audio.vad", _flag(features, "audio", "vad_enabled")),
         ("audio.rms_normalization", _flag(features, "audio", "rms_normalization_enabled")),
+        ("prompt.itn", _flag(features, "prompt", "itn_enabled")),
     )
     for feature, enabled in enabled_features:
         if not enabled:
@@ -329,6 +334,9 @@ def _feature_execution_counts(samples: Any, features: Any, info: Mapping[str, An
             elif feature == "asr.gipformer_v15":
                 observed = bool(item.get("model_id"))
                 success = item.get("model_id") == "g-group-ai-lab/gipformer1.5-68M-rnnt"
+            elif feature == "prompt.itn":
+                observed = "itn_applied" in item
+                success = bool(item.get("itn_applied"))
             else:
                 key = "vad" if feature == "audio.vad" else "rms"
                 observed = key in conditioning
@@ -350,9 +358,17 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     data_root = Path(cfg.data.root)
     try:
         paths = require_split(data_root, args.split)
-        samples = load_samples(data_root, args.split, limit=args.limit, with_labels=True)
+        heldout = getattr(args, "heldout_dataset", None)
+        if args.split == "train" and not heldout and not getattr(args, "use_mock_env", False) and not getattr(args, "allow_training_samples", False) and not getattr(args, "allow_scripted_official", False):
+            raise LifeMateError("train closed-loop requires --heldout-dataset; use --allow-training-samples for explicitly non-held-out diagnostics")
+        samples = load_samples(data_root, args.split, limit=None if heldout else args.limit, with_labels=True)
+        if heldout:
+            from lifemate.evaluation.heldout import select_heldout
+            samples, heldout_info = select_heldout(samples, heldout, split=args.split, limit=args.limit)
+        else:
+            heldout_info = None
         catalog = load_catalog(data_root, args.split)
-    except DatasetNotFoundError as exc:
+    except (DatasetNotFoundError, LifeMateError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(EXIT_DATA)
     if not samples:
@@ -471,6 +487,8 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
         prepare_history=prepare_history,
         transcribe_sample=transcribe_sample,
     )
+    if heldout_info is not None:
+        summary["heldout_selection"] = heldout_info
     if eval_mode == "audio_to_action":
         info = cache_stats.get("asr_info", {})
         execution = _feature_execution_counts(samples, features, info)

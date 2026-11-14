@@ -219,6 +219,9 @@ def _evaluate_command(
     generator: str | None,
     predictions: str | None,
     evaluation_mode: str | None = None,
+    checkpoint: str | None = None,
+    model: str | None = None,
+    heldout_dataset: str | None = None,
 ) -> list[str]:
     """The exact ``scripts/evaluate.py`` command for one arm."""
     command = [
@@ -243,6 +246,12 @@ def _evaluate_command(
         command += ["--predictions", predictions]
     if evaluation_mode:
         command.append(f"--evaluation-mode={evaluation_mode}")
+    if checkpoint:
+        command += ["--model-mode", "lora", "--checkpoint", checkpoint]
+    if model:
+        command += ["--model", model]
+    if heldout_dataset:
+        command += ["--heldout-dataset", heldout_dataset]
     return command
 
 def _metrics_from(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -335,8 +344,16 @@ def build_report(
     predictions: str | None = None,
     evaluation_mode: str | None = None,
     experimental_variables: Sequence[str] | None = None,
+    checkpoint: str | None = None,
+    model: str | None = None,
+    heldout_dataset: str | None = None,
 ) -> dict[str, Any]:
     """Validate, (optionally) run, and assemble the comparison report."""
+    if not dry_run and not mock_env and not generator:
+        if not checkpoint or not (Path(checkpoint) / "adapter_config.json").is_file():
+            raise FeatureConfigurationError("real ablation requires --checkpoint pointing to a LoRA adapter")
+        if not heldout_dataset:
+            raise FeatureConfigurationError("real ablation requires --heldout-dataset")
     _validate_arms(arms)
     _validate_fairness(arms, experimental_variables=experimental_variables)
     arm_features = [set(enabled_features(_arm_config(arm)[1])) for arm in arms]
@@ -355,6 +372,15 @@ def build_report(
     first_app, _first_features, _prov, _unknown = _arm_config(arms[0])
     features_wired = hasattr(first_app, "features")
     constants = _fixed_constants(first_app, split=split, mock_env=mock_env)
+    if checkpoint:
+        constants["checkpoint"] = checkpoint
+        constants["model mode"] = "lora"
+    if model:
+        constants["model id"] = model
+    from lifemate.evaluation.progress import file_identity
+    checkpoint_sha256 = file_identity(Path(checkpoint) / "adapter_model.safetensors") if checkpoint else None
+    if checkpoint and checkpoint_sha256 is None:
+        checkpoint_sha256 = file_identity(Path(checkpoint) / "adapter_model.bin")
 
     arm_reports: list[dict[str, Any]] = []
     reference_metrics: Mapping[str, Any] | None = None
@@ -375,6 +401,7 @@ def build_report(
             generator=generator,
             predictions=predictions,
             evaluation_mode=evaluation_mode,
+            checkpoint=checkpoint, model=model, heldout_dataset=heldout_dataset,
         )
         run = _run_arm(command, dry_run=dry_run)
         entry: dict[str, Any] = {
@@ -390,8 +417,9 @@ def build_report(
             "evaluate_config": str(materialized),
             "command": run["command"],
             "run_status": run["status"],
-            "model": str(_read_dotted(app_cfg, "model.name") or "unknown"),
-            "checkpoint": _read_dotted(app_cfg, "inference.checkpoint"),
+            "model": model or str(_read_dotted(app_cfg, "model.name") or "unknown"),
+            "checkpoint": checkpoint or _read_dotted(app_cfg, "inference.checkpoint"),
+            "checkpoint_sha256": checkpoint_sha256,
             "dataset": str(_read_dotted(app_cfg, "data.root") or split),
             "enabled_features": enabled_features(feature_cfg),
             "effective_features": enabled_features(feature_cfg) if features_wired else [],
@@ -452,7 +480,7 @@ def build_report(
         degraded = list(payload.get("degraded_features") or [])
         execution = payload.get("feature_execution") or {}
         observed = {name for name, counts in execution.items() if counts.get("n_requested", 0) and counts.get("n_executed") == counts.get("n_requested")}
-        runtime_features = {f for f in entry["enabled_features"] if f.startswith(("asr.", "audio."))}
+        runtime_features = {f for f in entry["enabled_features"] if f.startswith(("asr.", "audio.", "prompt.", "decoding.", "postprocessing."))}
         unknown_execution = (runtime_features - set(execution)) | {
             name for name in runtime_features if (execution.get(name) or {}).get("n_not_observed", 0)
         }
@@ -471,9 +499,10 @@ def build_report(
             "model_mode": provenance_block.get("model_mode"),
             "checkpoint": provenance_block.get("checkpoint"),
         }
-        if degraded or unknown_execution:
+        if degraded or unknown_execution or n_failed:
+            entry["status"] = "INCOMPLETE"
             entry["deltas"] = {key: None for key in COMPARED_METRICS}
-            entry["deltas_note"] = "invalid comparison: a requested feature degraded, was blocked, or was not observed"
+            entry["deltas_note"] = "invalid comparison: failed samples or a requested feature degraded, was blocked, or was not observed"
             if index == 0:
                 reference_metrics = None
             arm_reports.append(entry)
@@ -562,6 +591,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--use-mock-env", action="store_true", help="MockToolEnv self-test (marks results NOT scores)")
     parser.add_argument("--generator", default=None, metavar="dumpscript:PATH", help="forwarded test hook")
     parser.add_argument("--predictions", default=None, help="forwarded decision-record JSONL")
+    parser.add_argument("--checkpoint", default=None, help="trained LoRA adapter shared by every arm")
+    parser.add_argument("--model", default=None, help="local base model used with the adapter")
+    parser.add_argument("--heldout-dataset", default=None, help="prepared dataset containing held-out IDs")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and commands, execute nothing")
     parser.add_argument(
         "--experimental-variable",
@@ -597,6 +629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             predictions=args.predictions,
             evaluation_mode=args.evaluation_mode,
             experimental_variables=args.experimental_variables,
+            checkpoint=args.checkpoint, model=args.model, heldout_dataset=args.heldout_dataset,
         )
     except FeatureConfigurationError as exc:
         print(f"refusing to run: {exc}", file=sys.stderr)
@@ -611,6 +644,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nwrote {out}")
     if args.dry_run:
         print("dry run: nothing was executed.")
+    elif any(arm.get("status") != "OK" for arm in report.get("arms", [])):
+        return EXIT_ARMS
     return EXIT_OK
 
 if __name__ == "__main__":

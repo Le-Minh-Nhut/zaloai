@@ -646,6 +646,8 @@ def _transcribe(
         "raw_transcript": raw_text,
         "model_id": getattr(getattr(asr, "primary", asr), "model_id", None),
     }
+    if _flag(features, "prompt", "itn_enabled"):
+        info["itn_applied"] = bool(raw_text)
     if conditioning:
         info["conditioning"] = conditioning
     if hypotheses is not None:
@@ -981,10 +983,55 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         return EXIT_MODEL
 
     # -- resume ------------------------------------------------------------ #
+    if output.exists() and not args.resume and not mock:
+        print(f"ERROR: output already exists: {output}; use --resume or a different output", file=sys.stderr)
+        return EXIT_SUBMISSION
     writer = SubmissionWriter(output)
     skip_ids: set[str] = set()
     expected_ids = [str(sample.id) for sample in samples]
-    if args.resume and output.exists():
+    from dataclasses import asdict, is_dataclass
+    from lifemate.evaluation.progress import ProgressJournal, file_identity
+    checkpoint_path = Path(str(cfg.inference.checkpoint or ""))
+    from lifemate.evaluation.transcripts import audio_identities, asr_cache_identity, _artifact_identity
+    from lifemate.data.history import _turns_of, _turn_role, _writeable_turn, _audio_path
+    history_audio = {}
+    for item in samples:
+        for index, turn in enumerate(_turns_of(item)):
+            if _turn_role(turn) == "user":
+                raw = _writeable_turn(turn) or {}
+                audio = _audio_path(raw, split, data_root)
+                history_audio[f"{item.id}:{index}"] = file_identity(audio)
+    model_path = assert_path_allowed(str(cfg.model.name))
+    assert_path_allowed(model_path.resolve())
+    model_files = sorted(model_path.glob("model*.safetensors")) if model_path.is_dir() else []
+    for model_file in model_files:
+        assert_path_allowed(model_file.resolve())
+    model_identity = [(p.name, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in model_files]
+    identity = {"config": asdict(cfg) if is_dataclass(cfg) else str(cfg),
+                "ids": expected_ids, "dataset": file_identity(getattr(paths, "jsonl", None)),
+                "audio": audio_identities(samples), "history_audio": history_audio,
+                "asr_identity": asr_cache_identity(cfg, features), "model_artifacts": model_identity,
+                "checkpoint_artifacts": _artifact_identity(cfg.inference.checkpoint),
+                "adapter": file_identity(checkpoint_path / "adapter_model.safetensors"),
+                "adapter_bin": file_identity(checkpoint_path / "adapter_model.bin"),
+                "adapter_config": file_identity(checkpoint_path / "adapter_config.json"),
+                "generator": args.generator,
+                "generator_file": file_identity(args.generator.split(":", 1)[1]) if args.generator and ":" in args.generator else None,
+                "transcripts": file_identity(getattr(args, "transcripts", None)),
+                "history_transcripts": file_identity(getattr(cfg.inference, "history_transcripts", None))}
+    journal = ProgressJournal(str(output) + ".progress.json", identity, expected_ids)
+    if journal.path.exists() and not args.resume:
+        print(f"ERROR: progress journal exists: {journal.path}; use --resume or a different output", file=sys.stderr)
+        return EXIT_SUBMISSION
+    if args.resume and journal.path.exists():
+        try:
+            for row in journal.read():
+                writer.add(row["id"], row["tool_calls"], row["state_hash"])
+                skip_ids.add(row["id"])
+        except SubmissionError as exc:
+            print(f"ERROR: cannot resume {journal.path}: {exc}", file=sys.stderr)
+            return EXIT_SUBMISSION
+    elif args.resume and output.exists():
         from lifemate.evaluation.submission import load_submission
 
         try:
@@ -1005,9 +1052,10 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         if skip_ids:
             print(f"resume: {len(skip_ids)} row(s) already present in {output}", file=sys.stderr)
     started = time.monotonic()
-    failures = 0
-    asr_failures = 0
-    non_empty_transcripts = 0
+    journal_statuses = list(journal.statuses) if journal.statuses else ["unknown"] * len(writer)
+    failures = sum(status in {"asr_failed", "history_incomplete", "agent_failed"} for status in journal_statuses)
+    asr_failures = sum(status == "asr_failed" for status in journal_statuses)
+    non_empty_transcripts = sum(status not in {"asr_failed", "unknown"} for status in journal_statuses)
     asr_errors: list[str] = []
     backend_name = (args.asr or cfg.asr.backend or "none").lower()
     asr_checked = backend_name not in {"none", "oracle"}
@@ -1103,7 +1151,15 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         try:
             writer.add(sample_id, tool_calls, state_hash)
             assert_env_sourced(writer.rows[-1], env)
-        except (SubmissionError, LifeMateError) as exc:
+            if not state_hash:
+                raise SubmissionError("official environment returned an empty state hash")
+            journal_statuses.append(
+                "asr_failed" if current_asr_failed else
+                "history_incomplete" if history_errors else
+                "agent_failed" if result is None or getattr(result, "status", "") not in {"finished", "ok"} else "ok"
+            )
+            journal.write(writer.rows, journal_statuses)
+        except (SubmissionError, LifeMateError, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return EXIT_SUBMISSION
         if args.debug_dump:
@@ -1169,6 +1225,7 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: submission validation: {error}", file=sys.stderr)
         return EXIT_SUBMISSION
 
+    journal.path.unlink(missing_ok=True)
     elapsed = time.monotonic() - started
     _write_run_provenance(output, cfg, feature_report, backend_name, report["n"])
     print(

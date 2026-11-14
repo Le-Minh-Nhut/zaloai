@@ -1,0 +1,12 @@
+{
+  "python": "/tmp/cudaenv/bin/python",
+  "model": "models/MiniCPM5-2B",
+  "dataset": "outputs/datasets/minicpm_baseline/train",
+  "training_config": "configs/training_lora.yaml",
+  "inference_config": "configs/competition_inference.yaml",
+  "work_dir": "outputs/overnight",
+  "validation_limit": 20,
+  "minimum_free_gib": 15,
+  "minimum_start_minutes": 120,
+  "inference_arms": ["configs/experiments/baseline.yaml", "configs/experiments/itn.yaml", "configs/experiments/enhanced_guardrail.yaml"]
+}
