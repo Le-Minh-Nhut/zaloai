@@ -471,6 +471,18 @@ def evaluate_closed_loop(
             continue
         try:
             transcript = runtime_transcript if transcribe_sample is not None else (transcripts.get(sample_id) if transcripts is not None else None)
+            current_info = runtime_info if runtime_info is not None else (asr_info or {}).get(sample_id, {})
+            if evaluation_mode == "audio_to_action" and (not transcript or current_info.get("error")):
+                env = getattr(agent, "env", None)
+                reason = str(current_info.get("error") or "empty ASR transcript")
+                rows.append({"id": sample_id, "status": "asr_failed",
+                             "tool_calls": _from_env(env, "get_tool_calls", []),
+                             "state_hash": _from_env(env, "get_state_hash", ""), "errors": [reason],
+                             "history_seconds": history_seconds, "current_asr_seconds": asr_seconds,
+                             "total_seconds": time.monotonic() - sample_started,
+                             "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline})
+                failures.append({"id": sample_id, "stage": "asr", "error": reason})
+                continue
             kwargs = {}
             if runtime_info is not None:
                 kwargs["asr_hypotheses"] = runtime_info.get("hypotheses")

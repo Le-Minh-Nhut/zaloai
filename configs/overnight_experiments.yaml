@@ -8,5 +8,8 @@
   "validation_limit": 20,
   "minimum_free_gib": 15,
   "minimum_start_minutes": 120,
-  "inference_arms": ["configs/experiments/baseline.yaml", "configs/experiments/itn.yaml", "configs/experiments/enhanced_guardrail.yaml"]
+  "inference_features": ["prompt.itn", "postprocessing.enhanced_schema_guardrail", "decoding.constrained", "audio.vad", "audio.rms_normalization"],
+  "sft_variants": ["slot_masking", "tool_dropout", "noisy_asr"],
+  "noisy_asr_transcripts": null,
+  "noisy_asr_provenance": null
 }

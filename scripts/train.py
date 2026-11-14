@@ -824,6 +824,9 @@ def _build_tracker(cfg: Any, args: argparse.Namespace, run_name: str | None = No
     if args.smoke:
         return NullTracker()
     if not enabled:
+        import os
+        if os.environ.get("LIFEMATE_LOCAL_METRICS") == "1":
+            return JsonlTracker(cfg.training.output_dir, run_name=run_name or cfg.training.tuning_mode)
         return NullTracker()
 
     name = run_name or getattr(wandb_cfg, "run_name", None) or cfg.training.tuning_mode

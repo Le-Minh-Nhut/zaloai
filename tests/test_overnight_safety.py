@@ -66,8 +66,8 @@ def test_inference_interruption_resumes_from_durable_progress(tmp_path, monkeypa
         calls.append(sample.id); return original_run(self,sample,*args,**kwargs)
     monkeypatch.setattr(ToolAgent,'run',track)
     original_write=ProgressJournal.write
-    def interrupted(self,rows,statuses=None):
-        original_write(self,rows,statuses)
+    def interrupted(self,rows,statuses=None,latencies=None,timeouts=None):
+        original_write(self,rows,statuses,latencies,timeouts)
         if len(rows)==2: raise KeyboardInterrupt()
     monkeypatch.setattr(ProgressJournal,'write',interrupted)
     out=tmp_path/'result.jsonl'
@@ -79,16 +79,18 @@ def test_inference_interruption_resumes_from_durable_progress(tmp_path, monkeypa
     assert calls==['one','two','three']
     assert [json.loads(line)['id'] for line in out.read_text().splitlines()]==['one','two','three']
     assert not (tmp_path/'result.jsonl.progress.json').exists()
+    runtime=json.loads((tmp_path/'result.jsonl.runtime.json').read_text())
+    assert runtime['n_samples']==3 and runtime['latency_seconds']['n']==3 and runtime['timeout_unknown']==0
 
 
-def test_unreleased_runner_refuses_start_without_creating_state(tmp_path):
+def test_runner_refuses_start_without_deadline(tmp_path):
     import subprocess
     import sys
     script=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
     config=tmp_path/'config.json'
     config.write_text(json.dumps({'work_dir':str(tmp_path/'run')}))
-    result=subprocess.run([sys.executable,str(script),'--config',str(config),'--start','--stop-at','2099-01-01T07:00:00+07:00'],capture_output=True,text=True)
-    assert result.returncode != 0 and 'not released' in result.stderr
+    result=subprocess.run([sys.executable,str(script),'--config',str(config),'--start'],capture_output=True,text=True)
+    assert result.returncode != 0 and 'requires --stop-at' in result.stderr
     assert not (tmp_path/'run'/'state.json').exists()
 
 
@@ -119,7 +121,9 @@ def test_protect_checkpoint_is_atomic_and_refuses_replacement(tmp_path):
     (source/'training_state.json').write_text(json.dumps({'exact_resume':True,'progress':{'planned_total_steps':1614}}))
     target=tmp_path/'protected'/'step-100'
     digest=module.protect_checkpoint(source,target,0)
-    assert module.valid_checkpoint(target)
+    assert module.valid_candidate(target)
+    assert not module.valid_checkpoint(target)
+    assert not (target/'optimizer_state.pt').exists()
     assert json.loads((target/'candidate_identity.json').read_text())['adapter_sha256']==digest
     assert module.protect_checkpoint(source,target,0)==digest
     (source/'adapter_model.safetensors').write_text('different')
@@ -136,3 +140,116 @@ def test_heldout_and_progress_reject_prohibited_paths(tmp_path):
     with pytest.raises(ProhibitedAccessError): select_heldout([],forbidden.parent,split='train')
     link=tmp_path/'alias';link.symlink_to(forbidden)
     with pytest.raises(ProhibitedAccessError): file_identity(link)
+
+
+def test_runner_derives_horizon_and_rejects_incompatible_checkpoint(tmp_path):
+    path=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
+    spec=importlib.util.spec_from_file_location('overnight_horizon',path); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    (tmp_path/'manifest.json').write_text(json.dumps({'fit':{'method':'tokenizer','n_fit':11,'max_seq_length':8192}}))
+    cfg=Path(__file__).resolve().parents[1]/'configs'/'training_lora.yaml'
+    assert module.expected_horizon(tmp_path,cfg)==6
+    ckpt=tmp_path/'step-1';ckpt.mkdir()
+    for name in ('adapter_config.json','adapter_model.safetensors','optimizer_state.pt'):
+        (ckpt/name).write_text('x')
+    (ckpt/'training_state.json').write_text(json.dumps({'exact_resume':True,'progress':{'planned_total_steps':6}}))
+    assert module.valid_checkpoint(ckpt,6) and not module.valid_checkpoint(ckpt,1614)
+
+
+def test_candidate_scoring_counts_model_failures_but_rejects_infrastructure():
+    path=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
+    spec=importlib.util.spec_from_file_location('overnight_scoring',path); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    samples=[SimpleNamespace(id=x,label=SimpleNamespace(tool_calls=[])) for x in ('a','b')]
+    rows=[{'id':'a','status':'finished','state_hash':'h1','tool_calls':[]},
+          {'id':'b','status':'repeated_failure','state_hash':'h2','tool_calls':[]}]
+    payload={'closed_loop':{'rows':rows,'heldout_selection':{'ids':['a','b']},'n_failures':1}}
+    score=module.score_evaluation(payload,['a','b'],samples)
+    assert score['value']==.5 and score['model_failures']==1 and score['official_score']=='UNAVAILABLE'
+    rows[1]['status']='error'
+    with pytest.raises(RuntimeError,match='infrastructure'): module.score_evaluation(payload,['a','b'],samples)
+    rows[1]['status']='max_steps';rows[1]['id']='a'
+    with pytest.raises(RuntimeError,match='rows'): module.score_evaluation(payload,['a','b'],samples)
+
+
+def test_clean_worktree_keeps_dirty_user_file_and_links_assets(tmp_path, monkeypatch):
+    import subprocess
+    path=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
+    spec=importlib.util.spec_from_file_location('overnight_worktree',path); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    repo=tmp_path/'repo';repo.mkdir()
+    subprocess.run(['git','init','-q',str(repo)],check=True)
+    subprocess.run(['git','-C',str(repo),'config','user.email','tests@example.invalid'],check=True)
+    subprocess.run(['git','-C',str(repo),'config','user.name','tests'],check=True)
+    (repo/'tracked.txt').write_text('committed')
+    subprocess.run(['git','-C',str(repo),'add','tracked.txt'],check=True)
+    subprocess.run(['git','-C',str(repo),'commit','-qm','fixture'],check=True)
+    revision=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+    (repo/'tracked.txt').write_text('user dirty')
+    for name in ('data','models','outputs'): (repo/name).mkdir()
+    monkeypatch.setattr(module,'ROOT',repo);monkeypatch.chdir(repo)
+    worktree=module.prepare_worktree(repo/'outputs'/'source',revision)
+    assert (worktree/'tracked.txt').read_text()=='committed'
+    assert (repo/'tracked.txt').read_text()=='user dirty'
+    for name in ('data','models','outputs'):
+        assert (worktree/name).resolve()==(repo/name).resolve()
+
+
+def test_runner_metrics_opt_in_is_local_and_preserves_default(tmp_path, monkeypatch):
+    from lifemate.config import load_config
+    from lifemate.training.callbacks import JsonlTracker, NullTracker
+    path=Path(__file__).resolve().parents[1]/'scripts'/'train.py'
+    spec=importlib.util.spec_from_file_location('overnight_train_metrics',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    cfg=load_config();cfg.training.output_dir=str(tmp_path)
+    args=SimpleNamespace(smoke=False)
+    monkeypatch.delenv('LIFEMATE_LOCAL_METRICS',raising=False)
+    assert isinstance(module._build_tracker(cfg,args,run_name='lora'),NullTracker)
+    monkeypatch.setenv('LIFEMATE_LOCAL_METRICS','1')
+    tracker=module._build_tracker(cfg,args,run_name='lora')
+    assert isinstance(tracker,JsonlTracker)
+    tracker.log({'step':10,'train_loss':.25,'learning_rate':.0002})
+    assert json.loads((tmp_path/'lora/metrics.jsonl').read_text())['step']==10
+
+
+def test_candidate_retention_preserves_best_and_recent(tmp_path):
+    path=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
+    spec=importlib.util.spec_from_file_location('overnight_retention',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    for step in range(1,6):
+        source=tmp_path/f'source-{step}';source.mkdir()
+        for name in ('adapter_config.json','adapter_model.safetensors','optimizer_state.pt'):(source/name).write_text(f'{name}-{step}')
+        (source/'training_state.json').write_text(json.dumps({'exact_resume':True,'progress':{'planned_total_steps':7}}))
+        module.protect_checkpoint(source,tmp_path/'candidates'/f'step-{step}',0,horizon=7)
+    root=tmp_path/'candidates'
+    (root/'best.json').write_text(json.dumps({'checkpoint':str(root/'step-1')}))
+    module.prune_candidates(root,keep=2)
+    assert {p.name for p in root.glob('step-*')}=={'step-1','step-4','step-5'}
+    assert all(not (p/'optimizer_state.pt').exists() for p in root.glob('step-*'))
+
+
+def test_audio_evaluation_asr_error_never_runs_agent(tmp_path):
+    from lifemate.evaluation.evaluator import evaluate_closed_loop
+    class Env:
+        def get_tool_calls(self): return []
+        def get_state_hash(self): return 'official-hash'
+    class Agent:
+        env=Env()
+        def run(self,*args,**kwargs): raise AssertionError('must not act')
+    result=evaluate_closed_loop(lambda _:Agent(),[SimpleNamespace(id='s',label=None)],split='train',data_root=tmp_path,
+        evaluation_mode='audio_to_action',transcribe_sample=lambda _:('',{'error':'corrupt audio'}))
+    assert result['rows'][0]['status']=='asr_failed' and result['rows'][0]['state_hash']=='official-hash'
+    assert result['n_failures']==1
+
+
+def test_effective_variant_count_respects_training_filter_and_validation(tmp_path):
+    path=Path(__file__).resolve().parents[1]/'scripts'/'run_overnight.py'
+    spec=importlib.util.spec_from_file_location('overnight_effective_variant',path)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    records=[{'meta':{'augmentation':'slot_masking'},'messages':[],'target':'keep'},
+             {'meta':{'augmentation':'slot_masking'},'messages':[],'target':'drop'},
+             {'meta':{},'messages':[],'target':'base'}]
+    (tmp_path/'train.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+    (tmp_path/'val.jsonl').write_text(json.dumps({'meta':{}})+'\n')
+    result=module.effective_variant_count(tmp_path,'slot_masking','unused',tokenizer=object(),
+                                           build=lambda tok,msg,target,n:{'kept':target=='keep'})
+    assert result=={'observed':2,'retained':1}
+    (tmp_path/'val.jsonl').write_text(json.dumps({'meta':{'augmentation':'slot_masking'}})+'\n')
+    with pytest.raises(RuntimeError,match='validation'): module.effective_variant_count(tmp_path,'slot_masking','unused',tokenizer=object(),build=lambda *a:{'kept':True})

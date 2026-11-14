@@ -1,105 +1,80 @@
-# Báo cáo chuẩn bị thí nghiệm qua đêm
+# Bàn giao runner qua đêm
 
-**TRẠNG THÁI: BLOCKED — CHƯA RELEASE RUNNER.** Không có full training nào được khởi chạy trong phiên. Đây là các sửa và bằng chứng đã hoàn tất, không phải xác nhận rằng toàn bộ yêu cầu đã xong. `--start`, `--resume` và worker bị khóa có chủ ý vì các giai đoạn bắt buộc còn thiếu. Không gửi GO để chạy runner này cho đến khi các blocker được xử lý.
+**BASELINE_READY: PASS ở mức preflight và kiểm thử điều phối tổng hợp.** Lệnh thật, dataset, model và cấu hình đã được preflight; chưa chạy một lượt baseline đầy đủ trong phiên này. **OVERNIGHT_READY: NOT TESTED ở mức chạy pipeline thật**: các stage đã được nối và kiểm thử bằng job tổng hợp, nhưng chưa có checkpoint baseline mới để chứng minh chuỗi đánh giá và submission thật. Không khởi chạy full training trước lệnh GO.
 
-## Phạm vi và nguồn chính thức
+## Phạm vi và sửa lỗi
 
-Bắt đầu tại `57cb1bec250f968ffa3297fb3542e57a96a68531`, nhánh `main`; so sánh mã hiện hành ở các điểm checkpoint, held-out, inference, ablation, trainer và ToolEnv. **Chưa hoàn thành audit toàn diện mọi dependency** như yêu cầu G01. [Mô tả LifeMate chính thức](https://challenge.zalo.ai/portal/lifemate) xác nhận audio, context/history/apps, tool calls, `sys.ask_missing_info`, no-action và state hash từ environment. [Trang timeline chính thức](https://challenge.zalo.ai/) hiện hiển thị hạn nộp solution 16/11/2026 23:59 GMT+7; cần theo dõi cập nhật chính thức. Các chi tiết giới hạn phần cứng/thời gian/parameter, Docker interface và công thức chấm không trích xuất được đầy đủ: UNVERIFIED. LCS-F1 và exact match ở đây là **chẩn đoán cục bộ**, không phải điểm chính thức.
+- Bắt đầu tại `9bdca519fa169b194fc112d1dccfb9ce7dceaf19`, nhánh `main`. Thay đổi có sẵn của người dùng trong `src/lifemate/evaluation/metrics.py` và các file untracked được giữ nguyên, không đưa vào commit. Worker chạy từ git worktree tách biệt tại SHA đã ghi, liên kết tới data, model và outputs; không dùng thay đổi chưa commit.
+- CLI worker nằm trong nhóm argparse hợp lệ; nguyên nhân cũ khiến không chạy là khóa release. Bỏ khóa, thêm handshake xác nhận PID đã vào worker, khóa launch/worker/GPU, xác minh danh tính process và từ chối chạy trùng.
+- Horizon lấy từ số record fit, batch, accumulation, epoch của từng dataset; checkpoint không tương thích bị từ chối. Nếu dừng, resume chọn checkpoint hợp lệ cùng horizon, không tự chạy lại từ bước 0. Lưu checkpoint mỗi 100 bước.
+- Candidate bảo vệ là bản **adapter-only**, copy atomic và kiểm SHA-256, không giả làm checkpoint exact-resume. Giữ các adapter mới gần đây và candidate tốt; checkpoint optimizer để trainer quản lý riêng. Kiểm tra dung lượng trước khi ghi.
+- Candidate so sánh trên cùng ID held-out gốc, dùng checkpoint LoRA thật trong lệnh evaluate. Episode model thất bại nhận điểm 0; lỗi hạ tầng, thiếu ID, kết quả hỏng hoặc sai thứ tự làm đánh giá vô hiệu. Exact-call là diagnostic cục bộ; **official score UNAVAILABLE**, không phải độ đúng final state.
+- Nối submission public-test với Gipformer, MiniCPM LoRA và official ToolEnv; file tên riêng, journal hỗ trợ resume và kiểm schema/thứ tự/coverage trước khi hoàn tất. Đánh giá audio lỗi ASR không gọi agent với transcript rỗng. Runtime sidecar ghi thống kê, số timeout và tình trạng thiếu đo; đo mỗi sample không bao gồm khởi tạo model, hash đầu vào toàn cục và ghi journal/output.
+- Nối thí nghiệm inference và SFT độc lập vào pipeline tuần tự; chỉ ghi delta inference khi có bằng chứng thực thi feature. Guardrail/constrained có thể `NOT_OBSERVED` nếu evaluator không cung cấp bằng chứng. Các job ghi state atomic, lệnh, log, kết quả và lý do skip; lỗi không được báo thành công. Bật log JSONL local chỉ trong worker, không đổi mặc định trainer.
 
-## Phát hiện và sửa thực tế
+## Dataset, thứ tự và tài nguyên
 
-| Phân loại | Vấn đề và thay đổi | Bằng chứng |
-|---|---|---|
-| CONFIRMED BUG | `feature_ablation.py` không truyền checkpoint/model mode; nay nhận `--checkpoint`, `--model`, `--heldout-dataset`, truyền LoRA adapter cho từng arm, ghi SHA-256 và từ chối real ablation thiếu adapter/held-out. | Test argv và hai arm thật trên một mẫu held-out dùng cùng adapter; cả hai mẫu lỗi lặp, không chứng minh chất lượng. |
-| CONFIRMED BUG | Closed-loop train lấy các mẫu đầu thay vì held-out; nay `--heldout-dataset` đọc ID từ JSONL chuẩn bị, đối chiếu hash manifest, tập ID, group và split trước khi dùng sample gốc/SDK. Real train evaluation mặc định yêu cầu held-out; có opt-in rõ ràng cho train diagnostics. | 156 source ID held-out, không giao nhóm; một mẫu dùng adapter thật và SDK thật. |
-| CONFIRMED BUG | Inference trước đây chỉ ghi khi kết thúc. Nay journal riêng `.progress.json` được ghi atomic, checksum, gắn config, dataset/audio/history/model/adapter identity; `--resume` kiểm tra thứ tự, hash, status lỗi và không chạy lại các hàng đã hoàn tất. File submission chính chỉ được finalize sau vòng lặp. | Test ngắt sau 2/3 mẫu, resume chỉ chạy mẫu còn lại; test journal hỏng và sai identity. Hash model cục bộ dùng metadata cho weights lớn, không phải xác thực mật mã toàn bộ base. |
-| CONFIRMED BUG | Các arm có lỗi sample vẫn có thể nhận delta; nay đánh dấu INCOMPLETE và từ chối delta khi có lỗi, feature degraded hoặc không được quan sát. Ghi nhận ITN thực thi; các feature khác thiếu bằng chứng không được tính effective. | Test episode lỗi và feature status. Hai arm thật trước sửa đều `repeated_failure`; không dùng số đo đó làm kết luận cải thiện. |
-| CONFIRMED DESIGN GAP | Candidate tốt có thể bị pruning trước khi được đánh giá. Prototype nay theo dõi và copy checkpoint hoàn chỉnh sang thư mục độc lập, không ghi đè, kiểm tra disk và SHA-256; chưa kiểm thử vòng theo dõi trên job training unattended thật. | Test copy không ghi đè và sao chép một checkpoint thật; BLOCKED cho bảo vệ trong suốt training. |
-| CONFIRMED DESIGN GAP | Chuỗi inference ablation, SFT độc lập và submission candidate chưa được tích hợp/kiểm thử tự động. | BLOCKED; hard gate ngăn chạy runner. |
-| ALREADY FIXED | Trainer MiniCPM LoRA, exact resume và tải adapter đã có trước; không rewrite trainer. | Tiny resume EQUIVALENT; real inference 1 sample với adapter smoke. |
-| ENVIRONMENT BLOCKER | Docker CLI không có; không có container run, official private scorer hoặc A30. | `bash -n docker/entrypoint.sh` chỉ kiểm tra cú pháp. |
-| UNVERIFIED | Truy cập đầy đủ quy định/điểm chính thức, toàn split, chất lượng final state và recovery unattended thật. | Không có điểm leaderboard hoặc tuyên bố submission ready. |
+Baseline dùng `outputs/datasets/minicpm_baseline/train`, `models/MiniCPM5-2B`, `configs/training_lora.yaml`: BF16, LoRA r16/alpha32, LR 2e-4, 8192 token, microbatch 1, accumulation 8, 3 epoch, horizon 1614. Preflight đọc manifest và đối chiếu held-out; 20 ID chọn có SHA-256 `494932f4343fa89ceaca509ab880bd637423746b73d0116acd3aa3bea52da5c2`. Không dùng training group làm validation. Đĩa trống quan sát 131 GiB, RTX 5070 Ti trống 14621 MiB tại thời điểm kiểm tra; runner kiểm tra lại GPU, RAM, disk trước job. Các giá trị này thay đổi theo thời gian.
 
-## Dataset, phân loại và cấu hình dự kiến
+Thứ tự: baseline → bảo vệ adapter → chọn trên held-out → submission candidate nếu còn đủ thời gian theo cận dưới đo được → audio baseline và ITN/guardrail/constrained/VAD/RMS → SFT độc lập khi thời gian và tài nguyên đủ. Mỗi variant có dataset, checkpoint, log và horizon riêng và bắt đầu từ base. Chuẩn bị thử trên dữ liệu train thật, không train: slot masking tạo 119 biến thể, 119 qua lọc tokenizer, horizon 1659; tool dropout tạo 4368 biến thể, 4308 qua lọc, horizon 3228; cùng held-out. Runner tự tạo lại vào thư mục experiment, kiểm hash và không ghi đè. Noisy-ASR hiện **SKIPPED_MISSING_ASSET**: chưa cấu hình transcript train và provenance có hash. Không giả lập transcript.
 
-Baseline dataset `outputs/datasets/minicpm_baseline/train` đã có; manifest khớp held-out, gồm 4.298 train/477 val record sau fit. Prototype baseline dự kiến dùng `configs/training_lora.yaml`, model `models/MiniCPM5-2B`, `--save-steps 100`, output `outputs/overnight/baseline/checkpoints/lora/`, giữ BF16, r16/alpha32, LR 2e-4, 8192 token, microbatch 1, accumulation 8, 3 epoch. Không dùng overlay như config training hoàn chỉnh.
+Kết quả, log và state dự kiến nằm trong `outputs/overnight/`: `state.json`, `worker.log`, `logs/`, `baseline/checkpoints/lora/`, `candidates/`, `evaluation/`, `variants/`, `submissions/`, `FINAL_RESULTS.vi.md`. Theo dõi tốc độ/ETA chỉ khi có dữ liệu đo; không tự bịa thời lượng. Hết thời gian hoặc `--stop` gửi SIGINT hợp tác và đợi tiến trình; nếu không có checkpoint hợp lệ để resume thì dừng và báo lỗi. Lỗi bất ngờ không được retry vô hạn; một số công việc không phải training bị gián đoạn yêu cầu kiểm tra thủ công thay vì ghi đè.
 
-| Loại | Thí nghiệm | Dataset / trạng thái |
-|---|---|---|
-| Training | baseline | dataset có sẵn; chưa train trong phiên |
-| Training | slot masking, tool dropout | dataset độc lập chưa chuẩn bị/kiểm định; BLOCKED |
-| Training | noisy-ASR | transcript thật và hiệu quả augmentation chưa được kiểm tra trong runner; BLOCKED / thiếu asset phải SKIPPED_MISSING_ASSET |
-| Inference | ITN, guardrail, constrained decoding, VAD, RMS | dùng adapter đã train; khung ablation có checkpoint/held-out, nhưng orchestration và quan sát thực thi toàn bộ feature chưa hoàn tất |
-| Tùy chọn | Gipformer 1.5, genuine N-best, Multi-ASR | chỉ chạy khi artifact/runtime thật được xác minh; không giả lập thành công |
+## Xác minh
 
-## Prototype runner và các hạn chế
-
-`scripts/run_overnight.py` cùng `configs/overnight_experiments.yaml` có dry-run, status, prototype state JSON atomic, log tách biệt, kế hoạch baseline/đánh giá held-out, signal dừng hợp tác, theo dõi checkpoint và copy candidate. Kế hoạch chọn trong prototype là local tool-call exact match trên cùng 20 ID held-out, chỉ so sánh các checkpoint còn lại; đó không phải official score hay bằng chứng chọn được checkpoint tốt nhất toàn bộ run. Bản copy một checkpoint MiniCPM thật có SHA-256 `c63789a4f4556b1f6ea7d357dd76c4e5af84221783b852be26f5da6349ac8334`; vòng theo dõi trong khi train chưa chạy. Prototype có ngưỡng disk 15 GiB, GPU free 12.000 MiB và thời gian khởi động tối thiểu 120 phút; chưa xác nhận đầy đủ RAM, race process, crash recovery, retention trong training hay thời lượng. **Các phần này chưa đủ điều kiện release.**
-
-Có thay đổi tracked tồn tại trước phiên ở `src/lifemate/evaluation/metrics.py`, cùng các file/thư mục untracked của người dùng. Chúng không bị sửa hoặc commit; prototype kiểm tra tracked tree sạch trước khi chạy để không gắn sai Git SHA. Do đó, ngoài các blocker kỹ thuật, cần xử lý trạng thái làm việc này bằng một checkout sạch hoặc theo quyết định của chủ sở hữu trước khi chạy unattended.
-
-Dự kiến thứ tự khi hệ thống hoàn chỉnh: baseline → bảo vệ checkpoint hợp lệ → held-out validation → chọn candidate bằng bằng chứng task-level → inference-only ablation → SFT độc lập nếu đủ thời gian/tài nguyên → submission candidate riêng → báo cáo. Hiện runner **không thực hiện được đầy đủ thứ tự này**; không có best candidate hay file submission tự động được tạo.
-
-## Xác minh và Docker
-
-- Targeted `.venv/bin/python -m pytest -q tests/test_overnight_safety.py tests/test_inference.py tests/test_submission_readiness_repairs.py`: 55 passed (bao gồm kiểm tra đường dẫn cấm và symlink).
-- Tiny exact resume `PYTHONPATH=src /tmp/cudaenv/bin/python scripts/verify_training_resume.py --tiny --steps 12 --interrupt-at 5 --accum 3`: EQUIVALENT.
-- Real smoke: `scripts/infer.py` với audio public thật, Gipformer, MiniCPM, adapter LoRA **smoke** và official ToolEnv, một hàng; SDK `zaic_tools --validate` báo 1 dòng, 0 lỗi schema. Agent `repeated_failure`, 6 calls. Một held-out closed-loop thật cũng lỗi lặp. Đây không phải checkpoint SFT cạnh tranh, không chứng minh action/final-state đúng.
-- Full regression sau sửa cuối: `WANDB_BASE_URL=http://127.0.0.1:9 PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q`: 983 passed, 1 skipped, 1 warning, 33,24 giây; bao gồm thay đổi người dùng tồn tại sẵn trong workspace. `git diff --check`, `bash -n docker/entrypoint.sh` chạy tại phiên này.
-- Không có Docker: build BLOCKED, container/offline runtime BLOCKED, submission runtime NOT VERIFIED. Khi có Docker và adapter thật, lệnh tham khảo sau cần thay `ADAPTER_DIR`; chưa chạy và chưa xác minh interface private-test:
-
-```bash
-docker build -f docker/Dockerfile -t lifemate-infer .
-ADAPTER_DIR=/duong/dan/adapter-thuc
-docker run --rm --gpus all --network none \
-  -v "$PWD/data":/data:ro -v "$PWD/models/MiniCPM5-2B":/models/base:ro \
-  -v "$ADAPTER_DIR":/models/ckpt:ro -v "$PWD/models/gipformer-68M-rnnt":/models/asr:ro \
-  -v "$PWD/outputs":/outputs -e SPLIT=public_test -e MODEL_MODE=lora \
-  -e MODEL_NAME=/models/base -e CHECKPOINT=/models/ckpt -e ASR=gipformer -e DEVICE=cuda lifemate-infer
-```
+- `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --dry-run`: PASS; xác nhận lệnh baseline và held-out, không train.
+- `/tmp/cudaenv/bin/python -m pytest -q tests/test_overnight_runner_integration.py tests/test_overnight_safety.py tests/test_submission_readiness_repairs.py`: **31 passed**. Các job tổng hợp sử dụng tiến trình tách rời thật, checkpoint giả và evaluator giả; kiểm tra start/duplicate/status, chuỗi tuần tự, episode model thất bại, candidate adapter-only, stop/resume, exit 7, khóa GPU, SFT riêng horizon khác và báo cáo. Đây không phải bằng chứng huấn luyện MiniCPM thật.
+- Kiểm thử journal/inference/evaluation liên quan: **61 passed**. Không chạy lại smoke MiniCPM 8192 hoặc full training theo yêu cầu; kết quả ở báo cáo trước không được tính là kết quả mới.
+- Regression toàn bộ và SHA cuối: xem kết quả xác minh Git sau commit bên dưới. Không commit model, dataset, checkpoint, log hoặc credentials.
+- Docker, full submission và điểm chính thức **NOT TESTED** trong phiên; không tuyên bố submission-ready. Candidate thật và chất lượng task chỉ xác định sau khi chạy thực tế.
 
 ## Gate G01–G30
 
-| Gate | Status | Bằng chứng hoặc giới hạn |
+| Gate | Status | Bằng chứng / giới hạn |
 |---|---|---|
-| G01 | NOT TESTED | Chưa audit toàn bộ dependency. |
-| G02 | PASS | Regression/tiny resume, không thay trainer. |
-| G03 | PASS | Held-out source/hash kiểm tra; dataset baseline đã tồn tại. |
-| G04 | PASS | Regression parser/target hiện hữu. |
-| G05 | PASS | Một lượt nạp adapter LoRA thật với SDK thật. |
-| G06 | PASS | ID held-out và một mẫu closed-loop thật. |
-| G07 | PASS | Guard ID/group overlap và kiểm tra 156 mẫu. |
-| G08 | PASS | Hai arm thật truyền cùng adapter và cùng held-out ID; mẫu thất bại nên không có kết luận chất lượng. |
-| G09 | BLOCKED | Chưa có pipeline config SFT độc lập hoàn chỉnh. |
-| G10 | NOT TESTED | Các dataset augmentation chưa được tạo/xác minh. |
-| G11 | BLOCKED | Một số feature thiếu quan sát thực thi; hiện fail closed. |
-| G12 | BLOCKED | Copy bảo vệ đã có và test độc lập, vòng theo dõi khi training chưa xác minh. |
-| G13 | PASS | Tiny exact resume EQUIVALENT. |
-| G14 | PASS | Journal checksum/order và ngắt/resume 3 mẫu mock. |
-| G15 | PASS | Một mẫu dùng SDK thật; không chứng minh task đúng. |
-| G16 | PASS | Guard đường dẫn, source compliance regression; không có chủ ý truy cập hidden state. |
-| G17 | BLOCKED | Chưa triển khai pipeline nhiều experiment. |
-| G18 | NOT TESTED | Có lock/kiểm tra GPU trong prototype nhưng chưa kiểm thử unattended thực. |
-| G19 | BLOCKED | Chưa kiểm thử toàn bộ chuỗi lỗi/khôi phục runner. |
-| G20 | BLOCKED | Worker resume thực chưa kiểm thử; hiện khóa. |
-| G21 | BLOCKED | Chưa triển khai skip asset cho pipeline SFT. |
-| G22 | BLOCKED | Chưa chạy lựa chọn checkpoint huấn luyện cạnh tranh. |
-| G23 | BLOCKED | Chưa triển khai tạo nhiều candidate submission. |
-| G24 | BLOCKED | Mới kiểm schema một hàng, chưa toàn split. |
-| G25 | PASS | Docker vắng được báo rõ, không tuyên bố đã chạy. |
-| G26 | BLOCKED | Dry-run baseline đúng, các stage sau còn placeholder/khóa. |
-| G27 | PASS | Các test tập trung đã chạy. |
-| G28 | PASS | Full suite 983 passed, 1 skipped (bao gồm workspace người dùng). |
-| G29 | BLOCKED | `--status`/dry-run hoạt động; start/resume/worker khóa có chủ ý, stop/recovery thật chưa kiểm thử. |
-| G30 | PASS | Không full training; `--start` từ chối trước khi tạo state. |
+| G01 | NOT TESTED | Không lặp lại audit toàn repository. |
+| G02 | PASS | Config baseline được preflight, regression chạy với code thay đổi. |
+| G03 | PASS | Manifest và held-out được kiểm khi preflight. |
+| G04 | NOT TESTED | Không chạy lại xác minh action format trên toàn dataset trong phiên. |
+| G05 | NOT TESTED | Lệnh chọn LoRA được kiểm; chưa nạp adapter mới thật trong phiên. |
+| G06 | PASS | `select_heldout` kiểm ID gốc; test và dry-run. |
+| G07 | PASS | Guard group và held-out hoạt động trong preflight. |
+| G08 | PASS | Lệnh mỗi arm truyền model mode và checkpoint; test lệnh. |
+| G09 | PASS | SFT variant dùng config baseline cùng feature override; test horizon riêng. |
+| G10 | PASS | Hai dataset train thử thật tạo biến thể và kiểm retained. |
+| G11 | PASS | Không quan sát được thì `NOT_OBSERVED`, không tính delta. |
+| G12 | PASS | Test candidate adapter-only, SHA, retention và best. |
+| G13 | NOT TESTED | Test stop/resume tổng hợp; không chạy lại real exact resume. |
+| G14 | PASS | Test journal bị ngắt và resume; không đại diện full inference thật. |
+| G15 | NOT TESTED | Đường lệnh dùng SDK chính thức; không chạy full pipeline thật. |
+| G16 | PASS | Guard đường dẫn và test truy cập cấm; không chủ ý đọc hidden state. |
+| G17 | PASS | Thư mục variant/candidate riêng được test tổng hợp. |
+| G18 | PASS | Test khóa GPU toàn cục và từ chối worker thứ hai. |
+| G19 | PASS | Test exit code 7 được ghi FAILED. |
+| G20 | PASS | Test stop/resume worker với checkpoint tổng hợp; real training chưa chạy. |
+| G21 | PASS | Thiếu noisy-ASR asset được ghi SKIPPED_MISSING_ASSET. |
+| G22 | PASS | So sánh cùng held-out, episode model thất bại tính 0; không phải official score. |
+| G23 | PASS | Tên submission theo SHA adapter; test luồng tổng hợp. |
+| G24 | NOT TESTED | Kiểm validator được nối; chưa tạo submission full thật. |
+| G25 | NOT TESTED | Không chạy Docker. |
+| G26 | PASS | Dry-run thật xuất lệnh baseline và evaluate. |
+| G27 | PASS | 31 test tập trung và 61 test liên quan như trên. |
+| G28 | NOT TESTED | Chờ kết quả full regression phiên này. |
+| G29 | PASS | Test start/status/stop/resume và báo cáo với tiến trình tổng hợp. |
+| G30 | PASS | Không khởi chạy full training trước GO. |
 
-## Lệnh trạng thái — không khởi chạy training
+## Lệnh sau khi bạn phát GO
+
+Chọn thời điểm dừng tương lai, có timezone và còn tối thiểu 120 phút. Chỉ chạy `--start` sau GO; runner từ chối nếu `outputs/overnight/state.json` đã tồn tại. Không xóa state/checkpoint để chạy lại.
 
 ```bash
 PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --dry-run
+PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --start --stop-at 2026-11-16T07:00:00+07:00
 PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --status
+PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --stop
+PYTHONPATH=src /tmp/cudaenv/bin/python scripts/run_overnight.py --resume --stop-at 2026-11-16T07:00:00+07:00
 ```
 
-CLI có `--stop`, `--start --stop-at <ISO8601 có timezone>` và `--resume`, nhưng **không có lệnh launch/recovery đã được release**: start/resume bị khóa cho đến khi các gate BLOCKED được xử lý. `--stop` chỉ có ý nghĩa nếu có state của một run. Không trình bày các lệnh này như workflow unattended sẵn sàng.
+`--resume` chỉ dùng cho run đã ngắt và checkpoint hợp lệ; phải chọn deadline mới nếu deadline cũ đã hết. Kiểm tra `state.json` và log trước khi xử lý FAILED, không xóa kết quả để tự động retry.
 
-Commit chứa báo cáo xác định bằng `git log -1 --format=%H -- docs/FINAL_OVERNIGHT_READINESS.vi.md`; đối chiếu HEAD/remote bằng `git rev-parse HEAD` và `git ls-remote origin refs/heads/main`. Không commit dataset, weights, checkpoint, log hay các thay đổi người dùng có sẵn.
+SHA commit chứa báo cáo: `git log -1 --format=%H -- docs/FINAL_OVERNIGHT_READINESS.vi.md`; SHA hiện hành và remote: `git rev-parse HEAD` và `git ls-remote origin refs/heads/main`.

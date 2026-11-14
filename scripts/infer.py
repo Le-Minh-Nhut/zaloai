@@ -990,7 +990,7 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
     skip_ids: set[str] = set()
     expected_ids = [str(sample.id) for sample in samples]
     from dataclasses import asdict, is_dataclass
-    from lifemate.evaluation.progress import ProgressJournal, file_identity
+    from lifemate.evaluation.progress import ProgressJournal, file_identity, write_runtime_stats
     checkpoint_path = Path(str(cfg.inference.checkpoint or ""))
     from lifemate.evaluation.transcripts import audio_identities, asr_cache_identity, _artifact_identity
     from lifemate.data.history import _turns_of, _turn_role, _writeable_turn, _audio_path
@@ -1053,6 +1053,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             print(f"resume: {len(skip_ids)} row(s) already present in {output}", file=sys.stderr)
     started = time.monotonic()
     journal_statuses = list(journal.statuses) if journal.statuses else ["unknown"] * len(writer)
+    journal_latencies = list(journal.latencies) if journal.latencies else [None] * len(writer)
+    journal_timeouts = list(journal.timeouts) if journal.timeouts else [None] * len(writer)
     failures = sum(status in {"asr_failed", "history_incomplete", "agent_failed"} for status in journal_statuses)
     asr_failures = sum(status == "asr_failed" for status in journal_statuses)
     non_empty_transcripts = sum(status not in {"asr_failed", "unknown"} for status in journal_statuses)
@@ -1065,7 +1067,8 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
         if sample_id in skip_ids:
             continue
         current_id["value"] = sample_id
-        deadline = time.monotonic() + float(cfg.agent.time_budget_seconds)
+        sample_started = time.monotonic()
+        deadline = sample_started + float(cfg.agent.time_budget_seconds)
 
         from lifemate.data.history import transcribe_missing_history
         history_errors = transcribe_missing_history(
@@ -1158,7 +1161,9 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
                 "history_incomplete" if history_errors else
                 "agent_failed" if result is None or getattr(result, "status", "") not in {"finished", "ok"} else "ok"
             )
-            journal.write(writer.rows, journal_statuses)
+            journal_latencies.append(time.monotonic() - sample_started)
+            journal_timeouts.append(time.monotonic() >= deadline or (result is not None and getattr(result, "status", "") == "time_budget"))
+            journal.write(writer.rows, journal_statuses, journal_latencies, journal_timeouts)
         except (SubmissionError, LifeMateError, OSError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return EXIT_SUBMISSION
@@ -1225,6 +1230,11 @@ def run_inference(argv: Sequence[str] | None = None) -> int:
             print(f"ERROR: submission validation: {error}", file=sys.stderr)
         return EXIT_SUBMISSION
 
+    try:
+        write_runtime_stats(str(output) + ".runtime.json", journal_statuses, journal_latencies, journal_timeouts)
+    except OSError as exc:
+        print(f"ERROR: cannot write runtime statistics: {exc}", file=sys.stderr)
+        return EXIT_SUBMISSION
     journal.path.unlink(missing_ok=True)
     elapsed = time.monotonic() - started
     _write_run_provenance(output, cfg, feature_report, backend_name, report["n"])
