@@ -23,3 +23,9 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src \
   --output-dir /home/heheboiz/data/zaloai/outputs/checkpoints/lifemate_e2 \
   --save-steps 100
 ```
+
+## Cập nhật lúc 16:41 GMT+7
+
+Smoke hoàn tất sau 331,1 giây, 1 optimizer step, loss train `0,1168001`; validation teacher-forced trên 477 record giữ lại cho loss `0,306475`, token accuracy `0,933605` trên 16.447 token mục tiêu. Đây chưa phải so sánh task-level với baseline. Chưa kiểm tra nạp lại checkpoint smoke.
+
+Run E2 chính đã thực sự bắt đầu lúc `2026-11-15 16:40:35 +07:00`, PID `689649`, qua `tmux` `lifemate_e2_training_queue_20261115`. GPU RTX 5070 Ti; checkpoint đầu của run chính chưa có lúc cập nhật. Log chứa dòng `planned_steps=1692` từ smoke tính trên số record trước lọc; lệnh train chính không truyền `--planned-steps` và tự tính theo 4.438 record sau lọc, dự kiến 1.665 step. Kiểm tra `training_state.json` của checkpoint chính khi có để xác nhận thực tế. Trạng thái và số bước tiếp tục thay đổi sau thời điểm báo cáo này; hãy xem log và tiến trình thực tế.
