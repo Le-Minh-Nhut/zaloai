@@ -24,6 +24,7 @@ step directory. ``save_total_limit`` prunes the oldest step dirs afterwards.
 from __future__ import annotations
 
 import dataclasses
+import copy
 import hashlib
 import json
 import math
@@ -1539,7 +1540,13 @@ class SFTTrainer:
             raise LifeMateError(f"cannot resume: {path} records step {step}; expected a positive step")
         stored_provenance = state.get('experiment_provenance')
         if stored_provenance != self.experiment_provenance and (stored_provenance or self.experiment_provenance):
-            raise LifeMateError('cannot resume: warm-start provenance differs from checkpoint')
+            oldp=dict(stored_provenance or {}); newp=dict(self.experiment_provenance or {})
+            oldp.pop('source_commit',None); newp.pop('source_commit',None)
+            old_horizon=int((state.get('progress') or {}).get('planned_total_steps') or 0)
+            if not (isinstance(stored_provenance, dict) and isinstance(self.experiment_provenance, dict)
+                    and stored_provenance.get('source_commit') and self.experiment_provenance.get('source_commit')
+                    and self.extend_horizon and self.planned_total_steps and self.planned_total_steps > old_horizon > 0 and oldp == newp):
+                raise LifeMateError('cannot resume: warm-start provenance differs from checkpoint')
         stored_lora = state.get("is_lora")
         if isinstance(stored_lora, bool) and stored_lora != self.is_lora:
             raise LifeMateError(
@@ -1556,7 +1563,24 @@ class SFTTrainer:
         if stored_config_hash:
             current = config_fingerprint(self.cfg)
             if stored_config_hash != current:
-                raise LifeMateError(
+                recorded_progress = state.get('progress') or {}
+                old_epochs = recorded_progress.get('epochs')
+                old_horizon = int(recorded_progress.get('planned_total_steps') or 0)
+                only_epoch_extension = False
+                if (self.extend_horizon and self.planned_total_steps and old_horizon > 0
+                        and self.planned_total_steps > old_horizon and isinstance(old_epochs, (int, float))
+                        and self.epochs > old_epochs > 0):
+                    for old_value in (old_epochs, int(old_epochs) if float(old_epochs).is_integer() else old_epochs):
+                        previous_cfg = copy.deepcopy(self.cfg)
+                        if isinstance(previous_cfg, dict):
+                            previous_cfg['training']['num_train_epochs'] = old_value
+                        else:
+                            previous_cfg.training.num_train_epochs = old_value
+                        if config_fingerprint(previous_cfg) == stored_config_hash:
+                            only_epoch_extension = True
+                            break
+                if not only_epoch_extension:
+                    raise LifeMateError(
                     "cannot resume: training config differs from the checkpoint "
                     f"({stored_config_hash} != {current}); the run would not continue the "
                     "same optimisation (the guard hashes training.* minus bookkeeping, "

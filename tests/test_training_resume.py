@@ -967,3 +967,24 @@ def test_training_feature_change_blocks_an_exact_resume() -> None:
     print(
         "  training features -> flipped flag refused (names tool_dropout); same flag resumes exact"
     )
+
+
+def test_epoch_extension_preserves_state_and_refuses_other_changes():
+    import copy
+    import pytest
+    if not _torch_available() or not _transformers_available(): pytest.skip('requires torch and transformers')
+    verify=_verify_module()
+    with tempfile.TemporaryDirectory(prefix='resume_epoch_extension_') as tmp:
+        work=Path(tmp); cfg=verify.build_config(accum=1,work=work);records=verify.synthetic_records(6)
+        source=verify._TracedTrainer(cfg=cfg,model=verify.build_tiny_model(),tokenizer=verify.CharTokenizer(),records=records,work=work,run_name='source',planned_total_steps=6,stop_after_steps=3)
+        source.run();checkpoint=source.trainer.checkpoint_manager.latest(); state=read_training_state(checkpoint)
+        def create(extended,lr=None,allow=True):
+            c=verify.build_config(accum=1,work=work);c.training.num_train_epochs=extended
+            if lr is not None:c.training.learning_rate=lr
+            return verify._TracedTrainer(cfg=c,model=verify.build_tiny_model(),tokenizer=verify.CharTokenizer(),records=records,work=work,run_name='next',planned_total_steps=30,stop_after_steps=4,extend_horizon=allow)
+        with pytest.raises(LifeMateError,match='config differs'):create(20,allow=False).trainer.resume(checkpoint)
+        with pytest.raises(LifeMateError,match='config differs'):create(20,lr=0.02).trainer.resume(checkpoint)
+        candidate=create(20);assert candidate.trainer.resume(checkpoint)==3
+        assert candidate.trainer.schedule_modified and candidate.trainer._cursor==state['progress']['next_micro_index']
+        assert candidate.trainer._optimizer_state_present and candidate.trainer.progress.sampler_rng_state
+        result=candidate.run();assert result.steps==4 and result.schedule_modified
