@@ -42,3 +42,7 @@ PYTHONPATH=src /tmp/cudaenv/bin/python -c 'import sys; from lifemate.data.condit
 ```
 
 `execution_report.json` chỉ được tạo sau merge và kiểm tra; chứa counts từng model, coverage 0–4, SHA256 và trạng thái replay K=1–4. Nếu có ASR thất bại, replay nghiêm ngặt có thể báo BLOCKED cho mẫu đó; không thay failure bằng gold. Artifact cuối cùng mong đợi tại `outputs/research/e3_four_asr_full_20261115/four_asr_train.jsonl`, **chưa tồn tại lúc viết**.
+
+## Thử nhanh GPU PhoWhisper
+
+Đã đo riêng ba audio pilot bằng GPU float16: thời gian decode 0,855/0,227/0,297 giây, ba transcript trùng chính xác CPU float32; peak CUDA allocated 568 MiB. Kết quả đo nằm tại `outputs/research/e3_four_asr_full_20261115/phowhisper_gpu_probe.json`, không nhập vào artifact. Ba mẫu chưa chứng minh parity toàn tập; worker chính tiếp tục cấu hình CPU float32 của pilot để giữ một decoder identity nhất quán, không dừng hay lặp lại công việc đã hoàn tất. Chưa đo batching.
