@@ -64,8 +64,26 @@ def merge(root, work):
     os.link(partial,output);os.link(tmp,manifest);partial.unlink();tmp.unlink()
     loaded,verified=load_records(output)
     if len(loaded)!=len(keys) or verified['sha256']!=checksum:raise LifeMateError('final verification failed')
-    atomic(work/'execution_report.json',{'expected_utterances':len(keys),'model_results':len(keys)*4,'four_model_coverage':dict(sorted(coverage.items())),'source_gipformer_sha256':bmeta['sha256'],'pilot_sha256':pmeta['sha256'],'output_sha256':checksum,'journal_sha256':journal_sha})
-    print('COMPLETE',checksum,'coverage',dict(coverage),flush=True)
+    model_counts={'gipformer_68m':{'success':len(keys),'failed':0,'reused':len(keys),'new':0}}
+    for name,items in journals.items():
+        values=list(items.values())
+        model_counts[name]={'success':sum(x['status']=='executed' for x in values),'failed':sum(x['status']!='executed' for x in values),'reused':sum(bool(x.get('cache_hit')) for x in values),'new':sum(not x.get('cache_hit') for x in values)}
+    replay={'status':'NOT VERIFIED'}
+    try:
+        from lifemate.data.loader import load_samples
+        from lifemate.evaluation.heldout import select_heldout
+        from lifemate.evaluation.artifact_replay import ArtifactReplay
+        samples=load_samples(root/'data','train',with_labels=True)
+        samples,selection=select_heldout(samples,root/'outputs/datasets/minicpm_baseline/train',split='train',limit=12)
+        counts={}
+        for k in (1,2,3,4):
+            reader=ArtifactReplay(output,samples,split='train',data_root=root/'data',k=k)
+            counts[str(k)]=[len(reader.current(sample)[1]['hypotheses']) for sample in samples]
+        replay={'status':'PASS','samples':len(samples),'ids_sha256':selection['ids_sha256'],'candidate_counts':counts,'asr_decode_executed':False}
+    except Exception as exc:
+        replay={'status':'BLOCKED','reason':f'{type(exc).__name__}: {exc}'[:500]}
+    atomic(work/'execution_report.json',{'expected_utterances':len(keys),'current_utterances':sum(turn=='current' for _,turn in keys),'history_utterances':sum(turn!='current' for _,turn in keys),'model_results':len(keys)*4,'models':model_counts,'four_model_coverage':{str(i):coverage[i] for i in range(5)},'source_gipformer_sha256':bmeta['sha256'],'pilot_sha256':pmeta['sha256'],'output_sha256':checksum,'journal_sha256':journal_sha,'replay':replay})
+    print('COMPLETE',checksum,'coverage',dict(coverage),'replay',replay['status'],flush=True)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--root',required=True,type=Path);p.add_argument('--output-dir',required=True,type=Path);a=p.parse_args();merge(a.root.resolve(),a.output_dir.resolve())
