@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import math
+import random
 import sys
 import time
 from pathlib import Path
@@ -58,6 +59,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="tuning mode; overrides training.tuning_mode from the config (default: from config, or 'lora'). "
         "'qlora' = LoRA on a 4-bit nf4 base and also sets training.quantization=nf4",
     )
+    parser.add_argument("--conditioned-exposure-ratio", type=float, default=None, help="in-memory deterministic conditioned exposure target (maximum 5 copies per example)")
+    parser.add_argument("--init-adapter", default=None, help="warm-start new LoRA run from adapter weights, without optimizer state")
     parser.add_argument("--dataset-dir", default=None, help="dir holding train.jsonl/val.jsonl")
     parser.add_argument("--model", default=None, help="override model.name (wins over YAML)")
     parser.add_argument("--output-dir", default=None, help="override training.output_dir")
@@ -242,6 +245,19 @@ def load_records(dataset_dir: str | Path) -> tuple[list[dict], list[dict], dict]
     if not train:
         raise LifeMateError(f"{train_path} holds no SFT records; run scripts/prepare_dataset.py")
     return train, val, manifest
+
+def conditioned_exposures(records, ratio, seed, max_copies=5):
+    """Balance exposure in memory, preserving all clean records and original targets."""
+    if not 0 < ratio < 1: raise LifeMateError('conditioned exposure ratio must be between 0 and 1')
+    conditioned=[r for r in records if (r.get('meta') or {}).get('augmentation')=='conditioned_multi_asr']
+    clean=[r for r in records if (r.get('meta') or {}).get('augmentation')!='conditioned_multi_asr']
+    if not conditioned or not clean: raise LifeMateError('conditioned and clean records both required')
+    target=min(math.ceil(ratio*len(clean)/(1-ratio)), len(conditioned)*max_copies)
+    rng=random.Random(seed);extras=[]
+    for _ in range(max_copies-1):
+        pool=list(conditioned);rng.shuffle(pool)
+        extras.extend(pool[:max(0,target-len(conditioned)-len(extras))])
+    return list(records)+extras, {'unique_conditioned':len(conditioned),'clean':len(clean),'additional_exposures':len(extras),'planned_exposure_ratio':(len(conditioned)+len(extras))/(len(records)+len(extras)),'max_copies':max_copies,'seed':seed}
 
 def _dataset_dir(args: argparse.Namespace, cfg: Any) -> Path:
     if args.dataset_dir:
@@ -573,6 +589,15 @@ def main(argv: list[str] | None = None) -> int:
             f"({len(train_records)} train / {len(val_records)} val records)"
         )
 
+    sampling_info=None
+    if args.conditioned_exposure_ratio is not None:
+        try:
+            if not manifest.get('conditioned_multi_asr'): raise LifeMateError('conditioned dataset manifest required')
+            train_records,sampling_info=conditioned_exposures(train_records,args.conditioned_exposure_ratio,int(cfg.training.seed))
+            print('sampling    :',json.dumps(sampling_info),flush=True)
+        except LifeMateError as exc:
+            print(f'sampling error: {exc}'); return EXIT_FAIL
+
     # -------------------------------------------------------------- preflight
     if args.dry_run and args.param_count is None and not args.smoke:
         print("\n(--dry-run without --param-count: using the model profile's verified parameter count)")
@@ -639,6 +664,26 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ENV
 
     # ------------------------------------------------------------- configure
+    provenance = None
+    if args.init_adapter:
+        try:
+            parent=Path(args.init_adapter).resolve()
+            weights=parent/'adapter_model.safetensors'
+            meta=json.loads((parent/'lifemate_meta.json').read_text())
+            if cfg.training.tuning_mode != 'lora' or meta.get('tuning_mode') != 'lora' or meta.get('model_profile') != 'minicpm5' or Path(cfg.model.name).name != 'MiniCPM5-2B':
+                raise LifeMateError('warm-start requires the verified MiniCPM5-2B LoRA parent and base')
+            if not weights.is_file(): raise LifeMateError('warm-start adapter weights missing')
+            import subprocess
+            source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+            provenance={'experiment':'E3-WARMSTART','base_model_id':'openbmb/MiniCPM5-2B','parent_adapter_path':str(parent),
+                'parent_adapter_sha256':hashlib.sha256(weights.read_bytes()).hexdigest(), 'parent_training_step':meta.get('global_step'),
+                'asr_artifact_sha256':(manifest.get('conditioned_multi_asr') or {}).get('artifact_sha256'),
+                'prompt_version':(manifest.get('conditioned_multi_asr') or {}).get('prompt_version'),'source_commit':source_commit, 'sampling':sampling_info}
+            if not provenance['asr_artifact_sha256'] or not provenance['prompt_version'] or provenance['parent_training_step'] != 1614:
+                raise LifeMateError('warm-start parent or conditioned dataset provenance missing')
+            print('warm_start  :', json.dumps(provenance,ensure_ascii=False), flush=True)
+        except (OSError, ValueError, subprocess.SubprocessError, LifeMateError) as exc:
+            print(f'warm-start error: {exc}'); return EXIT_FAIL
     is_lora = cfg.training.tuning_mode in ("lora", "qlora")
     try:
         if is_lora:
@@ -647,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.training.tuning_mode == "qlora":
                 report = lora_finetuning.configure_qlora(model, tokenizer, cfg)
             else:
-                report = lora_finetuning.configure_lora(model, cfg)
+                report = lora_finetuning.configure_lora(model, cfg, init_adapter=args.init_adapter)
             model = report.pop("model")
             print(
                 f"LoRA        : r={report['r']} alpha={report['alpha']} "
@@ -728,6 +773,7 @@ def main(argv: list[str] | None = None) -> int:
         best_effort=bool(args.best_effort_resume),
         is_lora=is_lora,
         dataset_manifest_hash=manifest_hash,
+        experiment_provenance=provenance,
         stop=stop,
     )
 

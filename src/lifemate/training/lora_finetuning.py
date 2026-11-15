@@ -215,6 +215,7 @@ def configure_lora(
     model: Any,
     cfg: Any,
     target_modules: Sequence[str] | None = None,
+    init_adapter: str | None = None,
 ) -> dict:
     """Freeze the base model, attach a LoRA adapter, and report what happened.
 
@@ -277,7 +278,16 @@ def configure_lora(
         task_type="CAUSAL_LM",
         target_modules=resolved,
     )
-    peft_model = get_peft_model(model, peft_config)
+    if init_adapter:
+        from peft import PeftConfig, PeftModel
+        parent = PeftConfig.from_pretrained(init_adapter, local_files_only=True)
+        if (getattr(parent, 'peft_type', None) != 'LORA' or int(parent.r) != r
+                or int(parent.lora_alpha) != alpha or float(parent.lora_dropout) != dropout
+                or str(parent.bias) != bias or set(parent.target_modules or []) != set(resolved)):
+            raise LifeMateError('warm-start adapter configuration differs from the requested LoRA configuration')
+        peft_model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True, local_files_only=True)
+    else:
+        peft_model = get_peft_model(model, peft_config)
     counts = count_parameters(peft_model)
 
     checkpointing = False

@@ -567,6 +567,7 @@ class SFTTrainer:
         checkpoint_manager: CheckpointManager | None = None,
         is_lora: bool = False,
         dataset_manifest_hash: str | None = None,
+        experiment_provenance: dict | None = None,
         optimizer: Any = None,
         scheduler: Any = None,
         log_every: int | None = None,
@@ -585,6 +586,8 @@ class SFTTrainer:
         self.device = device
         self.is_lora = bool(is_lora)
         self.dataset_manifest_hash = dataset_manifest_hash
+        self.exposure_counts = {"clean": 0, "conditioned": 0}
+        self.experiment_provenance = experiment_provenance
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.stop = stop or StopController()
@@ -683,6 +686,7 @@ class SFTTrainer:
                 profile=self.profile,
             )
             if example.get("kept"):
+                example["conditioned_exposure"] = (item.get("meta") or {}).get("augmentation") == "conditioned_multi_asr"
                 examples.append(example)
             else:
                 reason = str(example.get("reason") or "unknown")
@@ -898,6 +902,9 @@ class SFTTrainer:
                 while self._cursor < micro_count and not self._limit_reached(step):
                     start = self._cursor * self.micro_batch
                     chunk = self._permutation[start : start + self.micro_batch]
+                    for i in chunk:
+                        exposure_key = 'conditioned' if train_examples[i].get('conditioned_exposure') else 'clean'
+                        self.exposure_counts[exposure_key] += 1
                     batch = self.collator([train_examples[i] for i in chunk])
                     tensors = to_torch_batch(batch, self.device)
                     with self._autocast():
@@ -1094,6 +1101,9 @@ class SFTTrainer:
         except Exception:  # pragma: no cover - fake optimizer
             lr = None
         payload = {"step": step, "train_loss": round(loss, 6)}
+        if self.experiment_provenance:
+            payload["conditioned_exposures"] = self.exposure_counts["conditioned"]
+            payload["clean_exposures"] = self.exposure_counts["clean"]
         if lr is not None:
             payload["learning_rate"] = lr
         self.metrics_history.append(dict(payload))
@@ -1374,6 +1384,8 @@ class SFTTrainer:
             "seed": self.seed,
             "config_hash": config_fingerprint(self.cfg),
             "dataset_manifest_hash": self.dataset_manifest_hash,
+            "experiment_provenance": self.experiment_provenance,
+            "exposure_counts": dict(self.exposure_counts),
             "is_lora": self.is_lora,
             "precision": self.precision,
             "torch_rng_state": progress.torch_rng_state,
@@ -1423,6 +1435,7 @@ class SFTTrainer:
                 "seed": self.seed,
                 "config": _cfg_dict(self.cfg),
                 "dataset_manifest_hash": self.dataset_manifest_hash,
+                "experiment_provenance": self.experiment_provenance,
                 "dataset_order_hash": getattr(self, "_dataset_order_hash", None),
                 "config_hash": config_fingerprint(self.cfg),
                 "tuning_mode": world["tuning_mode"],
@@ -1524,6 +1537,9 @@ class SFTTrainer:
         step = int(state.get("step") or 0)
         if step <= 0:
             raise LifeMateError(f"cannot resume: {path} records step {step}; expected a positive step")
+        stored_provenance = state.get('experiment_provenance')
+        if stored_provenance != self.experiment_provenance and (stored_provenance or self.experiment_provenance):
+            raise LifeMateError('cannot resume: warm-start provenance differs from checkpoint')
         stored_lora = state.get("is_lora")
         if isinstance(stored_lora, bool) and stored_lora != self.is_lora:
             raise LifeMateError(
@@ -1600,6 +1616,7 @@ class SFTTrainer:
                 )
 
         self._restore_rng(state, progress, exact=not effort)
+        self.exposure_counts = dict(state.get("exposure_counts") or {"clean": 0, "conditioned": 0})
         self.progress = progress
         self.progress.global_step = step  # the single counter, asserted below
         self.start_step = step
