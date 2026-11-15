@@ -357,13 +357,16 @@ def _build_asr(args: argparse.Namespace, cfg: Any, samples: Sequence[Any]) -> An
 
     features = getattr(cfg, 'features', cfg)
     specs = _param(features, 'asr', 'multi_asr_models', [])
+    if backend == 'none' and _flag(features, 'asr', 'multi_asr_enabled') and specs:
+        raise AsrError('--asr none conflicts with enabled Multi-ASR models')
     if backend != 'oracle' and _flag(features, 'asr', 'multi_asr_enabled') and specs:
         if _flag(features, 'asr', 'nbest_enabled'):
             raise AsrError('four-model Top-1 mode does not support decoder N-best')
         from lifemate.asr.top1_models import build_top1_multi
         return build_top1_multi(cfg, specs,
-            max_hypotheses=int(_param(features, 'asr', 'multi_asr_max_hypotheses', 3)),
+            max_hypotheses=_param(features, 'asr', 'multi_asr_max_hypotheses', 3),
             failure_policy=str(_param(features, 'asr', 'multi_asr_failure_policy', 'primary_only')),
+            conditioned_sft=_flag(features, 'asr', 'conditioned_multi_sft_enabled'),
             budget_seconds=float(_param(features, 'asr', 'multi_asr_budget_seconds', 30.0)))
 
     if backend == "oracle":
@@ -469,7 +472,7 @@ def _compose_multi_asr(cfg: Any, primary: Any) -> Any:
         secondary,
         enabled=True,
         policy=str(_param(features, "asr", "multi_asr_policy", "primary_topk_secondary_top1")),
-        max_hypotheses=int(_param(features, "asr", "multi_asr_max_hypotheses", 3)),
+        max_hypotheses=_param(features, "asr", "multi_asr_max_hypotheses", 3),
         primary_topk=int(_param(features, "asr", "nbest_size", 3)) if _flag(features, "asr", "nbest_enabled") else 1,
         failure_policy=str(_param(features, "asr", "multi_asr_failure_policy", "primary_only")),
     )
@@ -587,6 +590,7 @@ def _transcribe(
     nbest_requested = False
     hypotheses: list[Any] | None = None
     multi_raw_results: list[dict[str, Any]] = []
+    preprocessing_seconds = 0.0
     try:
         with contextlib.ExitStack() as stack:
             transcription_path = audio_path
@@ -595,9 +599,11 @@ def _transcribe(
                 import tempfile
 
                 directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="lifemate_cond_"))
+                preprocessing_started = time.monotonic()
                 transcription_path, conditioning = _condition_audio(
                     audio_path, features, Path(directory)
                 )
+                preprocessing_seconds = time.monotonic() - preprocessing_started
             if _flag(features, "asr", "multi_asr_enabled") and hasattr(asr, "transcribe_multi"):
                 nbest_requested = _flag(features, "asr", "nbest_enabled")
                 multi_res = asr.transcribe_multi(transcription_path, sample_id=sample_id)
@@ -607,6 +613,14 @@ def _transcribe(
                 result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
                 hypotheses = list(multi_res.all_hypotheses or multi_res.hypotheses)
                 conditioning["multi_asr"] = {"executed": bool(multi_res.multi_asr), "degraded": bool(multi_res.degraded), "reasons": list(multi_res.reasons)}
+                if multi_raw_results:
+                    conditioning['multi_asr'].update(requested_models=[r['model'] for r in multi_raw_results],
+                        loaded_models=[r['model'] for r in multi_raw_results if r.get('loaded')],
+                        decoded_models=[r['model'] for r in multi_raw_results if r.get('status') == 'executed' and not r.get('cache_hit')],
+                        cached_models=[r['model'] for r in multi_raw_results if r.get('status') == 'executed' and r.get('cache_hit')],
+                        successful_models=[r['model'] for r in multi_raw_results if r.get('status') == 'executed'],
+                        failed_models=[r['model'] for r in multi_raw_results if r.get('status') != 'executed'],
+                        valid_candidates=len(multi_res.all_hypotheses))
                 if nbest_requested:
                     if not getattr(asr.primary, "nbest_supported", False):
                         nbest_reason = "primary backend does not support decoder N-best"
@@ -661,7 +675,9 @@ def _transcribe(
         from lifemate.asr.top1_models import select_llm_candidates
         normalized_hypotheses = select_llm_candidates(
             hypotheses, itn_enabled=_flag(features, 'prompt', 'itn_enabled'),
-            limit=int(_param(features, 'asr', 'multi_asr_max_hypotheses', 3)))
+            conditioned_sft=_flag(features, 'asr', 'conditioned_multi_sft_enabled'),
+            limit=_param(features, 'asr', 'multi_asr_max_hypotheses', 3))
+        conditioning['multi_asr']['valid_candidates'] = len(normalized_hypotheses)
         if normalized_hypotheses:
             selected_source = normalized_hypotheses[0].source
             selected = next((item for item in multi_raw_results if item.get('model') == selected_source and item.get('status') == 'executed'), None)
@@ -689,6 +705,7 @@ def _transcribe(
     if conditioning:
         info["conditioning"] = conditioning
     if multi_raw_results:
+        info['audio_preprocessing_latency_s'] = round(preprocessing_seconds, 6)
         info['multi_asr_results'] = [dict(item, normalized_transcript=apply_itn_pipeline(item['transcript'], enabled=_flag(features, 'prompt', 'itn_enabled')) if item.get('transcript') else None) for item in multi_raw_results]
     if hypotheses is not None:
         from dataclasses import replace

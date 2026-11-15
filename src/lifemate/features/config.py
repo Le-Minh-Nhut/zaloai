@@ -106,6 +106,7 @@ class AsrFeatureConfig:
     multi_asr_failure_policy: str = "primary_only"
     multi_asr_models: list = field(default_factory=list)
     multi_asr_budget_seconds: float = 30.0
+    conditioned_multi_sft_enabled: bool = False
 
 @dataclass
 class PromptFeatureConfig:
@@ -164,6 +165,12 @@ def _coerce(value: Any, current: Any, key: str) -> Any:
             f"{key}: cannot read {value!r} as bool; use true/false/1/0/yes/no"
         )
     if isinstance(current, int) and not isinstance(current, bool):
+        if key == 'features.asr.multi_asr_max_hypotheses':
+            from lifemate.asr.interface import candidate_count
+            try:
+                return candidate_count(value, maximum=4)
+            except Exception as exc:
+                raise FeatureConfigurationError(f'{key}: {exc}') from exc
         if isinstance(value, bool):
             raise FeatureConfigurationError(f"{key}: expected int, got bool {value!r}")
         try:

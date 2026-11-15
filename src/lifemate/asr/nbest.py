@@ -229,6 +229,8 @@ class AsrHypothesis:
     backend: str | None = None
     score_kind: str | None = None
     provenance: tuple[str, ...] = ()
+    model_rank: int = 0
+    model_priority: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "text", str(self.text or ""))

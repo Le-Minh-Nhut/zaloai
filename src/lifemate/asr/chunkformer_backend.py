@@ -20,9 +20,11 @@ class ChunkFormerBackend:
         self.chunk_size, self.left_context_size, self.right_context_size = chunk_size, left_context_size, right_context_size
         self.total_batch_duration = total_batch_duration
         self._model = None
+        self.load_latency_s = None
 
     def _load(self):
         if self._model is not None: return
+        started=time.monotonic()
         if self.model_dir is None: raise AsrError('ChunkFormer requires a pre-existing local model_dir; no download is attempted')
         root = assert_path_allowed(self.model_dir); assert_path_allowed(root.resolve())
         for filename in ('config.yaml', 'global_cmvn', 'pytorch_model.pt', 'vocab.txt'):
@@ -33,6 +35,7 @@ class ChunkFormerBackend:
         except ImportError as exc:
             raise AsrError('ChunkFormer runtime missing: install the upstream chunkformer package') from exc
         self._model = ChunkFormerModel.from_pretrained(str(root)).to(self.device).eval()
+        self.load_latency_s = time.monotonic()-started
 
     def transcribe(self, audio_path, *, sample_id=None, lenient=False):
         t0=time.monotonic()

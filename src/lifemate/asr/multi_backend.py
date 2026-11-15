@@ -31,7 +31,7 @@ from pathlib import Path
 from collections.abc import Mapping
 from dataclasses import replace
 
-from .interface import ASRBackend, AsrError, TranscriptResult
+from .interface import ASRBackend, AsrError, TranscriptResult, candidate_count
 from .nbest import AsrHypothesis, NBestResult, dedupe_hypotheses, normalize_hypothesis_text
 from lifemate.errors import ProhibitedAccessError
 
@@ -83,6 +83,7 @@ class MultiAsrBackend:
         primary_topk: int = 3,
         budget_seconds: float | None = None,
         backends: Mapping[str, ASRBackend] | None = None,
+        conditioned_sft: bool = False,
     ) -> None:
         if primary is None or not callable(getattr(primary, "transcribe", None)):
             raise AsrError("MultiAsrBackend requires a primary ASR backend with transcribe()")
@@ -100,8 +101,7 @@ class MultiAsrBackend:
             raise AsrError(
                 f"unknown failure_policy {failure_policy!r}; choose from {MULTI_ASR_FAILURE_POLICIES}"
             )
-        if isinstance(max_hypotheses, bool) or not 1 <= int(max_hypotheses) <= 3:
-            raise AsrError(f"max_hypotheses must be between 1 and 3, got {max_hypotheses!r}")
+        candidate_count(max_hypotheses, maximum=4 if conditioned_sft and backends is not None else 3)
         if int(primary_topk) < 1:
             raise AsrError(f"primary_topk must be >= 1, got {primary_topk!r}")
         if budget_seconds is not None and float(budget_seconds) <= 0:
@@ -145,9 +145,11 @@ class MultiAsrBackend:
             # Identity, not a copy: the caller's result object comes back as-is.
             return self.primary.transcribe(audio_path, sample_id=sample_id, lenient=lenient)
 
+        started = time.monotonic()
         nbest = self.transcribe_multi(audio_path, sample_id=sample_id)
         if nbest.hypotheses:
-            return nbest.to_transcript_result(backend=nbest.hypotheses[0].backend or "multi")
+            selected = next((r for r in nbest.raw_results if r.get('model') == nbest.hypotheses[0].source and r.get('status') == 'executed'), {})
+            return nbest.to_transcript_result(backend=nbest.hypotheses[0].backend or "multi", model_name=selected.get('model_id'), latency_s=time.monotonic()-started)
         return TranscriptResult(
             text="",
             error="multi-ASR produced no hypothesis",
@@ -269,21 +271,29 @@ class MultiAsrBackend:
         """One independent Top-1 per model; deduplicate only after recording all results."""
         result = NBestResult(scores_calibrated=False, requested_size=self.max_hypotheses)
         distinct = {}
-        for label, backend in self.backends.items():
+        for priority, (label, backend) in enumerate(self.backends.items()):
+            record = {'model': label, 'rank': 1, 'model_priority': priority, 'model_id': getattr(backend, 'model_id', None) or getattr(backend, 'model_name', None),
+                      'revision': getattr(backend, 'revision', None), 'backend': getattr(backend, 'name', label),
+                      'configuration': {k: getattr(backend, k) for k in ('quantization','decoding_method','language') if hasattr(backend,k)}}
+            record['initialization_latency_ms'] = getattr(backend, 'initialization_latency_ms', None)
+            record['loaded'] = (getattr(backend, '_model', None) is not None) if record['backend']=='chunkformer' else record['backend'] != 'unavailable'
             if self.budget_seconds is not None and time.monotonic() - started >= self.budget_seconds:
                 result.budget_exceeded = result.degraded = True
                 result.reasons.append(f'{label}: skipped because the shared ASR budget expired')
-                result.raw_results.append({'model': label, 'status': 'blocked', 'error': 'budget expired'})
+                record.update(status='blocked', error='budget expired', latency_ms=None, cache_hit=False)
+                result.raw_results.append(record)
                 if self.failure_policy == 'strict': raise AsrError(result.reasons[-1])
                 continue
             t0 = time.monotonic()
-            record = {'model': label, 'rank': 1, 'model_id': getattr(backend, 'model_id', None) or getattr(backend, 'model_name', None),
-                      'revision': getattr(backend, 'revision', None), 'backend': getattr(backend, 'name', label),
-                      'configuration': {k: getattr(backend, k) for k in ('quantization','decoding_method','language') if hasattr(backend,k)}}
+            previous_load = getattr(backend, 'load_latency_s', None)
             try:
                 item = backend.transcribe(audio_path, sample_id=sample_id, lenient=True)
+                current_load = getattr(backend, 'load_latency_s', None)
+                record['model_loading_latency_ms'] = round(current_load*1000, 3) if previous_load is None and current_load is not None else 0.0
                 record['cache_hit'] = bool(getattr(backend, 'last_cache_hit', False))
-                record['recognition_latency_ms'] = round(float(getattr(item, 'latency_s', 0.0) or 0.0) * 1000, 3)
+                recorded_ms = round(float(getattr(item, 'latency_s', 0.0) or 0.0) * 1000, 3)
+                record['recognition_latency_ms'] = 0.0 if record['cache_hit'] else recorded_ms
+                record['historical_recognition_latency_ms'] = recorded_ms if record['cache_hit'] else None
                 text = str(item.text or '').strip()
                 if item.error or not text: raise AsrError(item.error or 'empty transcript')
                 record.update(status='executed', raw_transcript=getattr(item, 'raw_text', None) or text,
@@ -293,7 +303,7 @@ class MultiAsrBackend:
                 if key in distinct:
                     old = distinct[key]; distinct[key] = replace(old, provenance=(*old.provenance,label))
                 else:
-                    distinct[key] = AsrHypothesis(text=text, rank=0, source=label, backend=record['backend'], provenance=(label,))
+                    distinct[key] = AsrHypothesis(text=text, rank=0, source=label, backend=record['backend'], provenance=(label,), model_rank=1, model_priority=priority)
             except ProhibitedAccessError:
                 raise
             except Exception as exc:
@@ -302,14 +312,17 @@ class MultiAsrBackend:
                 if self.failure_policy == 'strict': raise AsrError(result.reasons[-1]) from exc
             finally:
                 record['latency_ms'] = round((time.monotonic()-t0)*1000, 3)
+                record['loaded'] = (getattr(backend, '_model', None) is not None) if record['backend']=='chunkformer' else record['backend'] != 'unavailable'
                 result.raw_results.append(record)
             if self.budget_seconds is not None and time.monotonic() - started > self.budget_seconds:
                 result.budget_exceeded = result.degraded = True
                 result.reasons.append(f'{label}: ASR budget exceeded during decoding')
                 if self.failure_policy == 'strict': raise AsrError(result.reasons[-1])
-        result.all_hypotheses = list(distinct.values())
+        result.all_hypotheses = [replace(item, rank=i) for i, item in enumerate(distinct.values())]
         result.hypotheses = result.all_hypotheses[:self.max_hypotheses]
         result.multi_asr = len(result.sources) >= 2
+        if len(result.sources) != len(self.backends):
+            result.degraded = True
         return result
 
     # ----------------------------------------------------------------- helpers

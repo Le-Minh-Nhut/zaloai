@@ -34,6 +34,20 @@ class AsrError(LifeMateError, RuntimeError):
     """Raised for unrecoverable ASR problems (missing package, bad audio, no model)."""
 
 
+def candidate_count(value: Any, *, maximum: int = 3) -> int:
+    """Reject lossy conversion, booleans and non-finite values before loading."""
+    import math
+    if isinstance(value, bool):
+        raise AsrError('candidate count must be an integer')
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AsrError('candidate count must be an integer') from exc
+    if not math.isfinite(number) or not number.is_integer() or not 1 <= number <= maximum:
+        raise AsrError(f'candidate count must be an integer between 1 and {maximum}')
+    return int(number)
+
+
 @dataclass
 class TranscriptResult:
     """One transcription attempt. ``error`` set and ``text == ""`` on failure."""

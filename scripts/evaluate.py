@@ -99,6 +99,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="evaluation mode: text_to_action (gold/fixed transcript) or audio_to_action (full audio->ASR->agent)",
     )
     parser.add_argument("--transcript-cache", default=None, help="transcript cache JSON file")
+    parser.add_argument('--force-asr-history', action='store_true', help='remove train user-history gold text and transcribe its supplied audio')
     parser.add_argument("--end-to-end-runtime", action="store_true", help="run uncached current-turn ASR within each sample deadline")
     parser.add_argument(
         "--asr",
@@ -431,6 +432,8 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
         )
 
     eval_mode = getattr(args, "evaluation_mode", "text_to_action")
+    if getattr(args, 'force_asr_history', False) and eval_mode != 'audio_to_action':
+        raise LifeMateError('--force-asr-history requires audio_to_action evaluation')
     transcripts = None
     cache_stats = {}
     prepare_history = None
@@ -444,8 +447,10 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
 
         infer = _infer_module()
         asr_backend = infer._build_asr(args, cfg, samples)
-        from lifemate.data.history import transcribe_missing_history
+        from lifemate.data.history import transcribe_missing_history, clear_user_history_transcripts
         def prepare_history(sample, deadline):
+            if getattr(args, 'force_asr_history', False):
+                clear_user_history_transcripts(sample)
             errors = transcribe_missing_history(sample, split=args.split, data_root=data_root, deadline=deadline,
                 transcribe=lambda item: infer._transcribe(asr_backend, item, features=features))
             if errors:
@@ -489,6 +494,7 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     )
     if heldout_info is not None:
         summary["heldout_selection"] = heldout_info
+    summary['history_protocol'] = 'forced_audio_asr' if getattr(args, 'force_asr_history', False) else 'existing_or_missing_audio_asr'
     if eval_mode == "audio_to_action":
         info = cache_stats.get("asr_info", {})
         execution = _feature_execution_counts(samples, features, info)

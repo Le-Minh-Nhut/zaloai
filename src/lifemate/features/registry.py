@@ -152,6 +152,7 @@ FEATURES: tuple[FeatureSpec, ...] = (
             "multi_asr_failure_policy": (str, "primary_only"),
             "multi_asr_models": (list, []),
             "multi_asr_budget_seconds": (float, 30.0),
+            "conditioned_multi_sft_enabled": (bool, False),
         },
         scope="inference",
     ),
@@ -249,15 +250,23 @@ def _nbest_rules(cfg: FeatureConfig) -> list[str]:
 
 def _multi_asr_rules(cfg: FeatureConfig) -> list[str]:
     problems: list[str] = []
+    if cfg.asr.conditioned_multi_sft_enabled and not cfg.asr.multi_asr_models:
+        problems.append('conditioned multi-ASR mode requires an explicit Top-1 model list')
+    if cfg.asr.conditioned_multi_sft_enabled and cfg.asr.nbest_enabled:
+        problems.append('conditioned multi-ASR Top-1 mode cannot enable decoder N-best')
     if not cfg.asr.multi_asr_models and not str(cfg.asr.secondary_model_id).strip():
         problems.append(
             "asr.multi_asr is enabled but features.asr.secondary_model_id is empty; "
             "set it to a secondary ASR model id (e.g. 'vinai/PhoWhisper-small') "
             "or disable asr.multi_asr"
         )
-    if not 1 <= cfg.asr.multi_asr_max_hypotheses <= 3:
+    maximum = 4 if cfg.asr.conditioned_multi_sft_enabled else 3
+    from lifemate.asr.interface import candidate_count, AsrError
+    try:
+        candidate_count(cfg.asr.multi_asr_max_hypotheses, maximum=maximum)
+    except AsrError:
         problems.append(
-            "features.asr.multi_asr_max_hypotheses must be between 1 and 3; it caps how many "
+            f"features.asr.multi_asr_max_hypotheses must be an integer between 1 and {maximum}; it caps how many "
             "hypotheses reach the prompt"
         )
     return problems

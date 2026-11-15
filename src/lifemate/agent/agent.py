@@ -309,6 +309,8 @@ class ToolAgent:
                 kwargs["asr_hypotheses"] = asr_hypotheses
                 kwargs["nbest_format"] = nbest_format
                 kwargs["nbest_limit"] = nbest_limit
+                if features is not None and bool(getattr(getattr(features, 'asr', None), 'conditioned_multi_sft_enabled', False)):
+                    kwargs['conditioned_multi_sft'] = True
             prompt = self.prompt_builder(**kwargs)
             messages = to_messages(prompt)
             if deadline is not None and self.clock() >= deadline:

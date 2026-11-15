@@ -253,3 +253,51 @@ def test_invalid_topk_rejected_before_loading_models(monkeypatch):
     monkeypatch.setattr('lifemate.asr.top1_models.create_asr_backend',lambda *a,**kw: calls.append(kw))
     with pytest.raises(AsrError): build_top1_multi(None,[{'name':'gipformer_68m'}],max_hypotheses=4)
     assert calls==[]
+
+
+@pytest.mark.parametrize('value',[True,False,1.5,float('nan'),float('inf'),0,-1,4])
+def test_candidate_count_rejects_lossy_values_before_loading(value,monkeypatch):
+    from lifemate.features.config import FeatureConfig, apply_mapping
+    from lifemate.errors import FeatureConfigurationError
+    calls=[]
+    monkeypatch.setattr('lifemate.asr.top1_models.create_asr_backend',lambda *a,**kw:calls.append(kw))
+    with pytest.raises(AsrError): build_top1_multi(None,[{'name':'gipformer_68m'}],max_hypotheses=value)
+    if value != 4:
+        with pytest.raises(FeatureConfigurationError): apply_mapping(FeatureConfig(),{'asr':{'multi_asr_max_hypotheses':value}})
+    assert not calls
+
+
+def test_asr_none_rejected_when_top1_models_configured():
+    from lifemate.asr.transcription import infer_module
+    from lifemate.features.config import FeatureConfig
+    features=FeatureConfig(); features.asr.multi_asr_enabled=True;features.asr.multi_asr_models=[{'name':'gipformer_68m'}]
+    cfg=SimpleNamespace(asr=SimpleNamespace(backend='gipformer'),features=features,inference=SimpleNamespace(split='public_test'))
+    with pytest.raises(AsrError,match='conflicts'):infer_module()._build_asr(SimpleNamespace(asr='none'),cfg,[])
+
+
+def test_cache_leaf_symlink_to_prohibited_path_fails_without_opening_it(tmp_path):
+    from lifemate.errors import ProhibitedAccessError
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a')
+    backend=Fake('ok');backend.model_id='m';cached=CachedTop1(backend,tmp_path/'cache')
+    cached.transcribe(audio,sample_id='s')
+    entry=next((tmp_path/'cache').glob('*.json'));entry.unlink()
+    entry.symlink_to(tmp_path/'fake_environment'/'never-open.json')
+    with pytest.raises(ProhibitedAccessError): cached.transcribe(audio,sample_id='s')
+
+
+def test_rank_priority_and_cache_historical_latency(tmp_path):
+    from lifemate.asr.top1_models import select_llm_candidates
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a')
+    class Timed(Fake):
+        def transcribe(self,*args,**kwargs):
+            self.calls+=1;return TranscriptResult(text=self.text,raw_text=self.text,backend='fake',latency_s=1.2)
+    a,b=Timed('one'),Timed('two');a.model_id='a';b.model_id='b'
+    ca,cb=CachedTop1(a,tmp_path/'cache'),CachedTop1(b,tmp_path/'cache')
+    m=MultiAsrBackend(ca,enabled=True,backends={'a':ca,'b':cb})
+    m.transcribe_multi(audio,sample_id='s');result=m.transcribe_multi(audio,sample_id='s')
+    selected=select_llm_candidates(result.all_hypotheses,itn_enabled=False)
+    assert [h.rank for h in selected]==[0,1] and [h.model_rank for h in selected]==[1,1]
+    assert [h.model_priority for h in selected]==[0,1]
+    assert result.raw_results[0]['recognition_latency_ms']==0
+    assert result.raw_results[0]['historical_recognition_latency_ms']==1200
+    assert m.transcribe(audio,sample_id='s').model_name=='a'

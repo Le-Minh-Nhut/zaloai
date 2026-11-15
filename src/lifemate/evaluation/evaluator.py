@@ -516,6 +516,17 @@ def evaluate_closed_loop(
             "total_seconds": time.monotonic() - sample_started,
             "timed_out": budget_deadline is not None and time.monotonic() >= budget_deadline,
         }
+        model_results = current_info.get('multi_asr_results') or []
+        if model_results:
+            from lifemate.asr.nbest import normalize_hypothesis_text
+            texts=[normalize_hypothesis_text(m.get('normalized_transcript') or m.get('transcript') or '') for m in model_results if m.get('status')=='executed']
+            texts=[text for text in texts if text]
+            category = ('partial' if len(texts)!=len(model_results) else
+                        'all_agree' if len(set(texts))==1 else
+                        'all_distinct' if len(set(texts))==len(texts) else 'mixed')
+            row['asr_disagreement'] = category
+            row['asr_cache_hits'] = sum(bool(m.get('cache_hit')) for m in model_results)
+            row['asr_model_failures'] = sum(m.get('status') != 'executed' for m in model_results)
         rows.append(row)
         if status not in {"finished", "ok"}:
             failures.append({"id": sample_id, "stage": "run", "error": f"status={status}"})

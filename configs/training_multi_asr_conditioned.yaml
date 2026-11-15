@@ -1,0 +1,67 @@
+# LoRA SFT on the DEFAULT model (MiniCPM5-2B): r=16, alpha=32, dropout=0.05,
+# target_modules: null => the profile's 7 verified projections
+# (q/k/v/o_proj + gate/up/down_proj). MEASURED on the loaded model:
+# 588 adapter tensors, 25,116,672 trainable params (0.9881 % of 2,541,873,152).
+# Adapter state is a rounding error next to the 5.03 GB bf16 base, so this is the
+# only tuning mode that fits a single 16 GB consumer card. Qwen3.5-4B via
+# configs/training_lora_qwen.yaml discovers its own 12 hybrid suffixes
+# (32,464,896 params) — that number belongs to Qwen, not to this config.
+training:
+  method: sft
+  tuning_mode: lora           # the default; --tuning full selects full FT
+  output_dir: outputs/checkpoints
+  precision: bfloat16
+  learning_rate: 2.0e-4       # ~40x the full-FT LR: only adapters train
+  weight_decay: 0.01
+  num_train_epochs: 3
+  per_device_train_batch_size: 1  # 8192 seq, MiniCPM5-2B: the estimator prints 8.54 GB
+                                  # for microbatch 1 and 11.89 GB for microbatch 2
+  gradient_accumulation_steps: 8  # effective batch stays 8 sequences
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  gradient_checkpointing: true
+  gradient_clip_norm: 1.0
+  logging_steps: 10
+  save_strategy: epoch
+  eval_strategy: epoch
+  save_steps: 0           # for save_strategy: steps; 0 = fall back to logging_steps
+  eval_steps: 0           # for eval_strategy: steps; 0 = fall back to logging_steps
+  seed: 42
+  # Dataset fit and truncation counts must be measured for each new dataset.
+  max_seq_length: 8192
+  validation_ratio: 0.1
+  optimizer: adamw_torch
+  resume_from_checkpoint: null
+  dataloader_num_workers: 0
+  save_total_limit: 2
+  report_to: []
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: null        # null => architecture-aware discovery
+  bias: none
+
+model:
+  name: openbmb/MiniCPM5-2B
+  torch_dtype: bfloat16
+  device: cuda
+
+# Research-only prompt mode; the trainer does not load ASR weights.
+features:
+  asr:
+    multi_asr_enabled: true
+    conditioned_multi_sft_enabled: true
+    multi_asr_max_hypotheses: 4
+    multi_asr_failure_policy: primary_only
+    multi_asr_budget_seconds: 120.0
+    multi_asr_models:
+      - name: gipformer_68m
+        model_dir: models/gipformer-68M-rnnt
+      - name: gipformer_15
+        model_dir: models/gipformer1.5-68M-rnnt
+      - name: phowhisper_small
+        model_dir: models/PhoWhisper-small
+      - name: chunkformer_rnnt
+        model_dir: models/chunkformer-rnnt-large-vie

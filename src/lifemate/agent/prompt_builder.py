@@ -316,6 +316,7 @@ def _render_request(
     *,
     nbest_format: bool = False,
     limit: int = 3,
+    conditioned_multi_sft: bool = False,
 ) -> str:
     """Request section: the numbered hypothesis list when it carries signal.
 
@@ -332,7 +333,10 @@ def _render_request(
             f"{index}. {source + ': ' if labelled and source else ''}{text}"
             for index, (text, source) in enumerate(shown, 1)
         ]
-        return NBEST_HEADER + "\n\n" + "\n".join(lines)
+        instruction = ("Các cách nhận dạng sau là cùng một lời nói, có thể sai. "
+                       "Không mặc định thứ tự hoặc số đông là đúng. Dùng ngữ cảnh để chọn hành động; "
+                       "không tự bịa thông tin còn thiếu.\n\n") if conditioned_multi_sft else ""
+        return NBEST_HEADER + "\n\n" + instruction + "\n".join(lines)
     return "# Yêu cầu\n" + (transcript or "").strip()
 
 def _render_context(context: Any, installed_apps: Iterable[str] | None = None) -> str:
@@ -451,6 +455,7 @@ def build_decision_prompt(
     asr_hypotheses: Sequence[Any] | None = None,
     nbest_format: bool = False,
     nbest_limit: int = 3,
+    conditioned_multi_sft: bool = False,
 ) -> str:
     """Render the full decision prompt for one agent step.
 
@@ -469,7 +474,8 @@ def build_decision_prompt(
     sections: list[str] = []
     sections.append(
         _render_request(
-            transcript, asr_hypotheses, nbest_format=nbest_format, limit=nbest_limit
+            transcript, asr_hypotheses, nbest_format=nbest_format, limit=nbest_limit,
+            conditioned_multi_sft=conditioned_multi_sft,
         )
     )
     # ``context`` already carries installed_apps; the registry view supplies the tools.

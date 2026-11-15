@@ -87,6 +87,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--split", default="train", help="split to convert")
     parser.add_argument("--output", default="outputs/datasets", help="output root directory")
     parser.add_argument("--config", default=None, help="optional YAML config for defaults")
+    parser.add_argument('--conditioned-multi-records', help='versioned train multi-ASR artifact')
+    parser.add_argument('--conditioned-ratio', type=float, default=1.0)
+    parser.add_argument('--conditioned-unknown', choices=('exclude','include'), default='exclude')
+    parser.add_argument('--conditioned-mode', choices=('single','multi','mixed'), default='multi')
+    parser.add_argument('--conditioned-single-ratio', type=float, default=1.0)
+    parser.add_argument('--conditioned-multi-ratio', type=float, default=1.0)
     parser.add_argument("--val-ratio", type=float, default=None, help="validation fraction")
     parser.add_argument("--seed", type=int, default=None, help="split seed")
     parser.add_argument(
@@ -623,6 +629,18 @@ def main(argv: list[str] | None = None) -> int:
     _print_feature_report(cfg)
     print(_effective_augmentation_line(effective))
 
+    if args.conditioned_multi_records:
+        if args.split != 'train' or not cfg.features.asr.conditioned_multi_sft_enabled or not cfg.features.asr.multi_asr_enabled:
+            print('configuration error: conditioned data requires train split and both conditioned_multi_sft_enabled and multi_asr_enabled')
+            return 1
+        if any(effective[kind] for kind in _AUGMENTATION_FEATURES):
+            print('configuration error: combining conditioned data with other training augmentation is not verified')
+            return 1
+        dest=Path(args.output)/args.split
+        if any((dest/name).exists() for name in ('train.jsonl','val.jsonl','manifest.json','stats.json')):
+            print('configuration error: conditioned dataset destination already exists')
+            return 1
+
     val_ratio = args.val_ratio if args.val_ratio is not None else float(cfg.training.validation_ratio)
     seed = args.seed if args.seed is not None else int(cfg.training.seed)
     history_limit = args.history_limit if args.history_limit is not None else 10
@@ -670,6 +688,33 @@ def main(argv: list[str] | None = None) -> int:
     except LifeMateError as exc:
         print(f"augmentation failed: {exc}")
         return 2
+    conditioned_report = None
+    if args.conditioned_multi_records:
+        try:
+            from lifemate.data.conditioned_sft import load_records, augment_conditioned
+            index, artifact = load_records(args.conditioned_multi_records)
+            artifact_itn=bool(((artifact.get('identity',{}).get('features',{}).get('prompt',{})) or {}).get('itn_enabled',False))
+            if artifact_itn != bool(cfg.features.prompt.itn_enabled):
+                raise LifeMateError('history ASR and training ITN configurations differ')
+            train_records, counts = augment_conditioned(train_records, split.train, index,
+                k=cfg.features.asr.multi_asr_max_hypotheses, ratio=args.conditioned_ratio, seed=seed,
+                unknown_policy=args.conditioned_unknown, itn=cfg.features.prompt.itn_enabled,
+                split=args.split, data_root=args.data_root, history_limit=history_limit, mode=args.conditioned_mode,
+                single_ratio=args.conditioned_single_ratio, multi_ratio=args.conditioned_multi_ratio)
+            if not counts['created']:
+                raise LifeMateError(f"no conditioned variants retained; audit counts={ {k:v for k,v in counts.items() if k != 'decisions'} }")
+            conditioned_report={'schema':'lifemate.conditioned_sft.v1','artifact_sha256':artifact['sha256'],
+                'artifact_run_identity':artifact['run_identity'],'candidate_k':cfg.features.asr.multi_asr_max_hypotheses,
+                'ratio':args.conditioned_ratio,'single_ratio':args.conditioned_single_ratio,'multi_ratio':args.conditioned_multi_ratio,
+                'seed':seed,'unknown_policy':args.conditioned_unknown,'mode':args.conditioned_mode,
+                'itn':cfg.features.prompt.itn_enabled,'prompt_version':'conditioned_multi_v1','coverage':counts,
+                'asr_models':artifact['identity']['models'],'candidate_selection':'configured_priority_after_itn_dedup',
+                'history_protocol':'replace_visible_user_history_with_verified_asr',
+                'loss_mask_validation':'not_per_record_verified'}
+        except (LifeMateError, OSError, ValueError, KeyError) as exc:
+            print(f'conditioned augmentation failed: {exc}')
+            return 2
+
     if augmentation:
         print(
             f"  augmentation        : {augmentation['n_records_in']} -> {augmentation['n_records_out']} "
@@ -719,6 +764,11 @@ def main(argv: list[str] | None = None) -> int:
         "fit": fit,
         "fit_val": fit_val,
     }
+    if conditioned_report is not None:
+        conditioned_report['train_sha256'] = _sha256_file(out_dir / 'train.jsonl')
+        conditioned_report['validation_sha256'] = _sha256_file(out_dir / 'val.jsonl')
+        manifest['conditioned_multi_asr'] = conditioned_report
+        stats['conditioned_multi_asr'] = conditioned_report
     if augmentation:
         # Only present when an augmentation is active: a no-flag run must stay
         # byte-identical to the pre-augmentation build.

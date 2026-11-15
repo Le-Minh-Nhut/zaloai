@@ -1,0 +1,7 @@
+{
+  "E0": {"training": "existing baseline", "training_config": "configs/training_lora.yaml", "evaluation_config": "configs/competition_inference.yaml", "dataset_mode": "existing"},
+  "E1": {"training": "reuse baseline adapter", "training_config": "configs/training_lora.yaml", "evaluation_config": "configs/training_multi_asr_conditioned.yaml", "dataset_mode": "existing"},
+  "E2": {"training": "independent base LoRA", "training_config": "configs/training_multi_asr_conditioned.yaml", "evaluation_config": "configs/training_multi_asr_conditioned.yaml", "dataset_mode": "single"},
+  "E3": {"training": "independent base LoRA", "training_config": "configs/training_multi_asr_conditioned.yaml", "evaluation_config": "configs/training_multi_asr_conditioned.yaml", "dataset_mode": "multi"},
+  "E4": {"training": "independent base LoRA", "training_config": "configs/training_multi_asr_conditioned.yaml", "evaluation_config": "configs/training_multi_asr_conditioned.yaml", "dataset_mode": "mixed"}
+}

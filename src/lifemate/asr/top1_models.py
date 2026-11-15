@@ -1,10 +1,11 @@
 """Explicit four-model Top-1 registry; no models are downloaded here."""
 from . import create_asr_backend
-from .interface import AsrError, TranscriptResult
+from .interface import AsrError, TranscriptResult, candidate_count
 from .multi_backend import MultiAsrBackend
 from lifemate.errors import ProhibitedAccessError
 from dataclasses import replace
 import math
+import time
 from .nbest import normalize_hypothesis_text
 
 MODELS = {
@@ -15,11 +16,10 @@ MODELS = {
 }
 
 
-def select_llm_candidates(hypotheses, *, itn_enabled, limit=3):
+def select_llm_candidates(hypotheses, *, itn_enabled, limit=3, conditioned_sft=False):
     """Normalize first, then deduplicate and take a priority-ordered Top-K."""
     from lifemate.text.itn import apply_itn_pipeline
-    if isinstance(limit, bool) or not 1 <= int(limit) <= 3:
-        raise AsrError('LLM candidate limit must be between 1 and 3')
+    candidate_count(limit, maximum=4 if conditioned_sft else 3)
     merged = {}
     for item in hypotheses:
         normalized = apply_itn_pipeline(item.text, enabled=itn_enabled)
@@ -32,7 +32,7 @@ def select_llm_candidates(hypotheses, *, itn_enabled, limit=3):
             merged[key] = replace(old, provenance=tuple(dict.fromkeys((*old.provenance, *provenance))))
         else:
             merged[key] = replace(item, text=normalized, provenance=provenance)
-    return list(merged.values())[:int(limit)]
+    return [replace(h, rank=i) for i, h in enumerate(list(merged.values())[:candidate_count(limit, maximum=4 if conditioned_sft else 3)])]
 
 
 class _Unavailable:
@@ -42,12 +42,11 @@ class _Unavailable:
         return TranscriptResult(text='', backend=self.name, model_name=self.model_id, error=self.error)
 
 
-def build_top1_multi(cfg, specs, *, max_hypotheses=3, failure_policy='primary_only', budget_seconds=30, cache_dir='outputs/cache/asr_top1'):
+def build_top1_multi(cfg, specs, *, max_hypotheses=3, failure_policy='primary_only', budget_seconds=30, cache_dir='outputs/cache/asr_top1', conditioned_sft=False):
     """Construct only requested models in configuration order, never use a proxy model."""
     if not isinstance(specs, list) or not 1 <= len(specs) <= 4:
         raise AsrError('multi_asr_models requires one to four model entries')
-    if isinstance(max_hypotheses, bool) or not 1 <= int(max_hypotheses) <= 3:
-        raise AsrError('max_hypotheses must be between 1 and 3')
+    candidate_count(max_hypotheses, maximum=4 if conditioned_sft else 3)
     if failure_policy not in ('primary_only', 'strict') or not math.isfinite(float(budget_seconds)) or float(budget_seconds) <= 0:
         raise AsrError('invalid multi-ASR failure policy or budget')
     names = []
@@ -63,6 +62,7 @@ def build_top1_multi(cfg, specs, *, max_hypotheses=3, failure_policy='primary_on
         name = spec.get('name')
         backend, model_id = MODELS[name]
         directory, device, revision = spec.get('model_dir'), spec.get('device','cpu'), spec.get('revision')
+        initialization_started = time.monotonic()
         try:
             if backend == 'gipformer':
                 kwargs = {'model_id':model_id,'model_dir':directory,'device':device,'offline':True}
@@ -83,10 +83,11 @@ def build_top1_multi(cfg, specs, *, max_hypotheses=3, failure_policy='primary_on
         except Exception as exc:
             if failure_policy == 'strict': raise AsrError(f'{name}: {exc}') from exc
             model = _Unavailable(model_id, f'{type(exc).__name__}: {exc}')
+        model.initialization_latency_ms = round((time.monotonic()-initialization_started)*1000, 3)
         models[name] = model
     primary = next(iter(models.values()))
     return MultiAsrBackend(primary, enabled=True, backends=models, max_hypotheses=max_hypotheses,
-                           failure_policy=failure_policy, budget_seconds=budget_seconds)
+                           failure_policy=failure_policy, budget_seconds=budget_seconds, conditioned_sft=conditioned_sft)
 
 
 def transcript_records_by_model(sample_id, results):

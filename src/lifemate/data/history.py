@@ -247,3 +247,16 @@ def transcribe_missing_history(sample: Any, *, split: str, data_root: str | Path
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"history turn {index}: {type(exc).__name__}: {exc}")
     return errors
+
+
+def clear_user_history_transcripts(sample: Any) -> None:
+    """Remove user text only, for an explicitly requested audio-history evaluation."""
+    for turn in _turns_of(sample):
+        if _turn_role(turn) != 'user':
+            continue
+        raw = _writeable_turn(turn)
+        if raw is not None:
+            for key in ('content', 'audio_text', 'transcript', 'text', 'asr_text', 'utterance'):
+                raw.pop(key, None)
+        if not isinstance(turn, dict) and hasattr(turn, 'content'):
+            turn.content = ''

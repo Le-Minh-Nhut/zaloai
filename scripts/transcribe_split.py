@@ -55,6 +55,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="ONNX precision for the gipformer backend (default: config asr.quantization)",
     )
     parser.add_argument("--model-dir", default=None, help="local directory with the ONNX model files")
+    parser.add_argument('--multi-top1-records', help='versioned multi-model train utterance JSONL')
+    parser.add_argument('--resume-multi-top1', action='store_true', help='resume a matching partial multi-model artifact')
     parser.add_argument("--overwrite", action="store_true", help="replace an existing predictions file")
     parser.add_argument(
         "--alt-decoding",
@@ -278,7 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_DATA
 
     output = Path(args.output or f"outputs/asr/{args.split}_predictions.jsonl")
-    if output.exists() and not args.overwrite:
+    if not args.multi_top1_records and output.exists() and not args.overwrite:
         print(f"error: {output} exists; pass --overwrite to replace it", file=sys.stderr)
         return EXIT_USAGE
 
@@ -297,6 +299,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not samples:
         print(f"error: split {args.split!r} has no usable samples", file=sys.stderr)
         return EXIT_DATA
+
+    if args.multi_top1_records:
+        if args.split != 'train':
+            print('error: multi-ASR SFT records require the official train split', file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            from types import SimpleNamespace
+            from lifemate.asr.transcription import infer_module
+            from lifemate.asr.conditioned_records import produce_multi_records
+            infer = infer_module()
+            cfg.inference.split = args.split
+            backend = infer._build_asr(SimpleNamespace(asr='gipformer', allow_oracle=False), cfg, samples)
+            meta = produce_multi_records(samples, backend, features, split=args.split, data_root=data_root,
+                output=args.multi_top1_records, transcribe=infer._transcribe, resume=args.resume_multi_top1)
+            print(f"wrote {meta['records']} multi-ASR utterance records; sha256={meta['sha256']}")
+            return 0
+        except LifeMateError as exc:
+            print(f'error: {exc}', file=sys.stderr)
+            return EXIT_DATA
 
     try:
         backend = create_asr_backend(cfg)
