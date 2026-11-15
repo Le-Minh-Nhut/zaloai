@@ -29,3 +29,23 @@ Pilot hiện chọn 16 group train phân bố đều và 12 group held-out cùng
 ## E3
 
 Artifact đủ bốn model, phân bố coverage, dataset và pilot train E3: NOT TESTED/BLOCKED cho đến khi ChunkFormer chạy thật và các record đồng nhất audio/model được ghép, audit. Không có checkpoint E3; không có điểm E3 hoặc Top-K ablation. Không tự khởi chạy huấn luyện E3. Trước khi train phải xác nhận đủ số record Multi-ASR thực được giữ; pilot tối đa 100 optimizer step, checkpoint 50, không tự nối dài.
+
+## Cập nhật E3 pilot bốn ASR
+
+Các model đều đã chạy thật trên cùng 82 lượt audio: 28 lượt hiện tại, 54 lượt lịch sử. Gipformer 68M được lấy từ artifact đã có với kiểm tra hash; Gipformer 1.5 82/82 thành công, decode trung bình 66,17 ms/lượt; PhoWhisper-small 82/82, trung bình 2.039 ms/lượt; ChunkFormer 82/82, trung bình 102,37 ms/lượt. Đây là đo CPU cục bộ, không phải hiệu năng GPU. ChunkFormer dùng môi trường Python 3.10 độc lập, torch/torchaudio 2.8.0; smoke load 2,27 s, decode 0,15 s.
+
+Artifact đã ghép `outputs/research/e2_e3_pilot_20261115/four_asr_pilot.jsonl`, SHA256 `b89ca11d04a155323b8837dfe759c011d409e09b9df884bfe2e59d0635bc5577`; manifest cùng tên `.manifest.json`. Lệnh ghép:
+
+```bash
+PYTHONPATH=src /tmp/cudaenv/bin/python scripts/merge_multi_asr_pilot.py \
+ --base /home/heheboiz/data/zaloai/outputs/research/e2_gipformer_20261115/train_top1.jsonl \
+ --input-dir /home/heheboiz/data/zaloai/outputs/research/e2_e3_pilot_20261115 \
+ --models-dir /home/heheboiz/data/zaloai/models/research_e3 \
+ --output /home/heheboiz/data/zaloai/outputs/research/e2_e3_pilot_20261115/four_asr_pilot.jsonl
+```
+
+Dataset pilot thực `outputs/research/e2_e3_pilot_20261115/e3_dataset/train`: 16 nhóm train, 12 nhóm validation tách biệt; 56 record sạch, 9 record conditioned; 48 record validation. Coverage: SUPPORTED 9, UNKNOWN 47, UNSUPPORTED 0. Manifest SHA256 `90bae76903275ec00bb60958e9f66b344c3f421afd02b04972104cc496d6c823`. Tokenizer MiniCPM thật: 11/65 prompt train và 7/48 prompt validation cắt giữa; 0 target bị loại. Các record `UNKNOWN` bị loại. Chỉ 9 record conditioned là quá ít cho thí nghiệm 50–100 optimizer step đáng tin cậy, nên **không khởi chạy E3 training**; E3 checkpoint/reload/metrics đều NOT TESTED. Cần thêm audio train thực và mở rộng coverage bằng bằng chứng an toàn trước pilot train.
+
+Đã khởi chạy đánh giá E0/E2 cùng artifact bốn ASR K=3 trong `tmux` `lifemate_e2_e3_multieval_20261115`, log `outputs/research/e2_e3_pilot_20261115/evaluate_multi.log`; xem output `e0_multi_k3/` và `e2_multi_k3/` khi tiến trình hoàn tất. Không tự chạy training tiếp. Thử replay K=1..4 thành công về cấu trúc trên 12 mẫu; đây không phải kết quả accuracy Top-K.
+
+Sửa code trong nhánh `codex/e2-e3-pilot`: replay một model xác minh audio, ghép các model độc lập với hash audio, và coverage chỉ dùng khớp transcript gốc làm bằng chứng, không đưa transcript gốc vào prompt. Kiểm thử tập trung mới nhất: `PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q tests/test_conditioned_sft.py` — **30 passed**.
