@@ -13,7 +13,7 @@ from run_overnight import score_evaluation
 
 def compare(payloads, samples):
     if len(payloads)<2:raise ValueError('at least two experiments required')
-    expected=None; protocol=None; results={}
+    expected=None; protocol=None; replay_identity=None; results={}
     for name,payload in payloads.items():
         closed=payload.get('closed_loop') or {}
         if closed.get('mock_env') or payload.get('mock_env'):raise ValueError('mock environment cannot support this comparison')
@@ -21,7 +21,10 @@ def compare(payloads, samples):
         if not isinstance(ids,list) or not ids or len(ids)!=len(set(ids)):raise ValueError('held-out IDs missing or duplicated')
         current=(closed.get('evaluation_mode'),closed.get('runtime_protocol'),closed.get('history_protocol'))
         if current[0]!='audio_to_action' or current[2]!='forced_audio_asr':raise ValueError('real-ASR history protocol required')
-        if expected is None:expected=ids;protocol=current
+        if expected is None:
+            expected=ids;protocol=current;replay_identity=closed.get('replay_identity')
+        if closed.get('replay_identity') != replay_identity:
+            raise ValueError('ASR replay artifact identities differ')
         if ids!=expected or current!=protocol:raise ValueError('held-out IDs or evaluation protocol differ')
         if closed.get('degraded_features'):raise ValueError('degraded ASR feature invalidates comparison')
         result=score_evaluation(payload,ids,samples)

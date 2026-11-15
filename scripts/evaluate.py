@@ -98,6 +98,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="text_to_action",
         help="evaluation mode: text_to_action (gold/fixed transcript) or audio_to_action (full audio->ASR->agent)",
     )
+    parser.add_argument("--replay-multi-asr", help="verified train multi-ASR JSONL artifact; excludes ASR decode latency")
+    parser.add_argument("--replay-k", type=int, choices=(1,2,3,4), default=3)
     parser.add_argument("--transcript-cache", default=None, help="transcript cache JSON file")
     parser.add_argument('--force-asr-history', action='store_true', help='remove train user-history gold text and transcribe its supplied audio')
     parser.add_argument("--end-to-end-runtime", action="store_true", help="run uncached current-turn ASR within each sample deadline")
@@ -442,7 +444,23 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     if history_path:
         from lifemate.data.history import apply_history_texts, load_history_texts
         apply_history_texts(samples, load_history_texts(history_path, data_root=data_root), args.split)
-    if eval_mode == "audio_to_action":
+    replay_path = getattr(args, 'replay_multi_asr', None)
+    if replay_path:
+        if eval_mode != 'audio_to_action' or getattr(args, 'end_to_end_runtime', False):
+            raise LifeMateError('artifact replay requires audio_to_action quality evaluation; decoding latency is excluded')
+        if not _flag(features, 'asr', 'conditioned_multi_sft_enabled') or not _flag(features, 'asr', 'multi_asr_enabled'):
+            raise LifeMateError('artifact replay requires conditioned and multi-ASR prompt configuration')
+        from lifemate.evaluation.artifact_replay import ArtifactReplay
+        replay = ArtifactReplay(replay_path, samples, split=args.split, data_root=data_root,
+                                k=args.replay_k, itn=_flag(features, 'prompt', 'itn_enabled'))
+        # The prompt renderer reads this setting from the feature configuration.
+        features.asr.multi_asr_max_hypotheses = args.replay_k
+        prepare_history = replay.history
+        transcripts, cache_stats['asr_info'] = {}, {}
+        for sample in samples:
+            transcripts[str(sample.id)], cache_stats['asr_info'][str(sample.id)] = replay.current(sample)
+        cache_stats['replay_identity'] = replay.manifest['run_identity']
+    elif eval_mode == "audio_to_action":
         from lifemate.asr.transcription import transcribe_samples_cached
 
         infer = _infer_module()
@@ -494,7 +512,10 @@ def _closed_loop(args: argparse.Namespace, cfg: Any) -> dict[str, Any]:
     )
     if heldout_info is not None:
         summary["heldout_selection"] = heldout_info
-    summary['history_protocol'] = 'forced_audio_asr' if getattr(args, 'force_asr_history', False) else 'existing_or_missing_audio_asr'
+    summary['replay_identity'] = cache_stats.get('replay_identity')
+    if replay_path:
+        summary['latency_accounting'] = {'mode':'artifact_replay_quality', 'asr_decode_included':False, 'history_decode_included':False, 'note':'historical decode latency is not current execution latency; unsuitable for runtime compliance'}
+    summary['history_protocol'] = 'forced_audio_asr' if replay_path else ('forced_audio_asr' if getattr(args, 'force_asr_history', False) else 'existing_or_missing_audio_asr')
     if eval_mode == "audio_to_action":
         info = cache_stats.get("asr_info", {})
         execution = _feature_execution_counts(samples, features, info)

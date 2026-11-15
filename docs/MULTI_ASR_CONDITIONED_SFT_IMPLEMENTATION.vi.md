@@ -75,4 +75,31 @@ Chỉ chạy lệnh train nếu manifest, kiểm tra prompt/target, tokenizer th
 
 ## Hạn chế cần xử lý trước khi tuyên bố nghiên cứu hoàn tất
 
-Không có xác minh runtime bốn ASR, transcript thật, khả năng fit GPU, real-LoRA resume, ToolEnv task-level hoặc submission. Chưa có luồng tái sử dụng artifact để ablation K trong evaluation, chưa đo tất cả chỉ số intent/slot/final-state yêu cầu. Policy coverage hiện có thể quá bảo thủ; không tự động xóa rào chắn bằng cách đưa `UNKNOWN` vào train. Cần kiểm tra dữ liệu và review semantic trước khi quyết định cách xử lý. Không có bằng chứng cải thiện chất lượng hay điểm leaderboard.
+Không có xác minh runtime bốn ASR, transcript thật, khả năng fit GPU, real-LoRA resume, ToolEnv task-level hoặc submission. Đã bổ sung replay artifact cho ablation K; chưa đo tất cả chỉ số intent/slot/final-state yêu cầu. Policy coverage hiện có thể quá bảo thủ; không tự động xóa rào chắn bằng cách đưa `UNKNOWN` vào train. Cần kiểm tra dữ liệu và review semantic trước khi quyết định cách xử lý. Không có bằng chứng cải thiện chất lượng hay điểm leaderboard.
+
+
+## Bổ sung sau commit f52f24a — sửa E2, provenance và replay
+
+- E2 chọn model bằng `--conditioned-single-model` (mặc định Gipformer 68M). Chỉ model được chọn phải thành công cho từng lượt hiện tại và lịch sử. E3 yêu cầu đủ bốn model; E4 đánh giá độc lập nhánh single và multi, không đánh đồng kết quả hai nhánh.
+- Audit coverage nhận biết một tập từ khóa ý định báo thức tiếng Việt, dùng ITN hiện có để nhận giờ nói rõ và giữ `UNKNOWN` khi mơ hồ hoặc bằng chứng ngữ cảnh xung đột. Đây là heuristic hẹp, không chứng minh ý định, ngày, số lượng hay liên hệ slot đầy đủ; không đổi chính sách loại `UNKNOWN` mặc định. Không suy ra độ bao phủ trên dữ liệu thật từ fixture. Phân bố thực: **NOT TESTED**, chưa có artifact bốn ASR thật để audit.
+- Mỗi record tăng cường ghi hash artifact, run identity và phiên bản prompt. Manifest conditioned ghi hash train/val; train từ chối file bị đổi và gắn hash toàn bộ manifest vào checkpoint. Hash thứ tự dataset và kiểm tra exact-resume sẵn có được giữ. Không thay identity của baseline cũ.
+- `--replay-multi-asr` của `scripts/evaluate.py` đọc artifact train đã xác minh checksum, model, revision, audio và toàn bộ lượt lịch sử; không khởi tạo ASR. `--replay-k 1..4` chọn lại candidate từ cùng artifact. Kết quả ghi `replay_identity`; so sánh từ chối artifact hoặc tập ID/protocol khác. Replay là quality evaluation: thời gian decode ASR trong quá khứ không được tính thành latency hiện tại và không chứng minh giới hạn thời gian thi. Không sử dụng gold history.
+- Replay cố ý chặn output thiếu model, model identity/revision không khớp, audio hoặc history thiếu/sai hash. Quy trình hiện chỉ nhận artifact split train và giả định đầy đủ bốn model; chưa chạy SDK thật. Các lựa chọn số candidate, model và lịch sử phải được giữ nhất quán khi so sánh.
+
+Ví dụ sau khi có artifact thật và adapter đã chọn (chưa chạy; không dùng khi GPU đang bận):
+
+```bash
+PYTHONPATH=src python scripts/evaluate.py --config configs/training_multi_asr_conditioned.yaml \
+  --data-root data --split train --heldout-dataset outputs/research/e3_dataset/train \
+  --model-mode lora --checkpoint outputs/checkpoints/lifemate_e3 \
+  --evaluation-mode audio_to_action --closed-loop \
+  --replay-multi-asr outputs/research/multi_asr/train_top1.jsonl --replay-k 3 \
+  --output outputs/research/e3_replay_k3
+```
+
+### Kết quả kiểm thử lượt này
+
+- Nhóm CPU độc lập: **330 PASS, 0 FAIL, 1 SKIPPED, 2 DESELECTED**, lệnh `WANDB_MODE=disabled PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q tests/test_conditioned_sft.py tests/test_asr.py tests/test_multi_asr.py tests/test_asr_model_specs.py tests/test_features.py tests/test_feature_integration.py tests/test_asr_variants.py tests/test_prepare_dataset_features.py tests/test_training.py tests/test_training_resume.py -k 'not test_backend_reports_missing_fp32_files_before_importing_sherpa and not test_real_split_is_not_required_but_available'`. Kết quả trước hai kiểm thử bổ sung cuối; các kiểm thử bổ sung nằm trong lượt tập trung bên dưới.
+- Sau thay đổi cuối, `PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q tests/test_conditioned_sft.py tests/test_evaluation_modes.py tests/test_train_target_logits.py`: **36 PASS, 0 FAIL, 0 SKIPPED**. Fixture/mock, không phải ASR hoặc ToolEnv thật.
+- Lượt đầu bao gồm cả hai bài phụ thuộc môi trường: **329 PASS, 2 FAIL, 1 SKIPPED**. Hai FAIL: worktree không có `models/gipformer-68M-rnnt` và `data/train/train.jsonl`; không tải weights hoặc tạo dữ liệu giả để che lỗi. Hai bài này **BLOCKED: 2** trong worktree hiện tại.
+- Các mục **NOT TESTED: 4**: phân bố coverage trên dữ liệu thật, ASR bốn model thật, huấn luyện/checkpoint thật, đánh giá task-level với ToolEnv thật. Không có kết quả hay điểm thi chính thức. Không đủ bằng chứng tuyên bố nghiên cứu hoàn tất hoặc sẵn sàng nộp bài.

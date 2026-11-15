@@ -91,6 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--conditioned-ratio', type=float, default=1.0)
     parser.add_argument('--conditioned-unknown', choices=('exclude','include'), default='exclude')
     parser.add_argument('--conditioned-mode', choices=('single','multi','mixed'), default='multi')
+    parser.add_argument('--conditioned-single-model', default='gipformer_68m', choices=('gipformer_68m','gipformer_15','phowhisper_small','chunkformer_rnnt'))
     parser.add_argument('--conditioned-single-ratio', type=float, default=1.0)
     parser.add_argument('--conditioned-multi-ratio', type=float, default=1.0)
     parser.add_argument("--val-ratio", type=float, default=None, help="validation fraction")
@@ -700,13 +701,13 @@ def main(argv: list[str] | None = None) -> int:
                 k=cfg.features.asr.multi_asr_max_hypotheses, ratio=args.conditioned_ratio, seed=seed,
                 unknown_policy=args.conditioned_unknown, itn=cfg.features.prompt.itn_enabled,
                 split=args.split, data_root=args.data_root, history_limit=history_limit, mode=args.conditioned_mode,
-                single_ratio=args.conditioned_single_ratio, multi_ratio=args.conditioned_multi_ratio)
+                single_ratio=args.conditioned_single_ratio, multi_ratio=args.conditioned_multi_ratio, single_model=args.conditioned_single_model, artifact_sha256=artifact['sha256'])
             if not counts['created']:
                 raise LifeMateError(f"no conditioned variants retained; audit counts={ {k:v for k,v in counts.items() if k != 'decisions'} }")
             conditioned_report={'schema':'lifemate.conditioned_sft.v1','artifact_sha256':artifact['sha256'],
                 'artifact_run_identity':artifact['run_identity'],'candidate_k':cfg.features.asr.multi_asr_max_hypotheses,
                 'ratio':args.conditioned_ratio,'single_ratio':args.conditioned_single_ratio,'multi_ratio':args.conditioned_multi_ratio,
-                'seed':seed,'unknown_policy':args.conditioned_unknown,'mode':args.conditioned_mode,
+                'seed':seed,'unknown_policy':args.conditioned_unknown,'mode':args.conditioned_mode,'single_model':args.conditioned_single_model,
                 'itn':cfg.features.prompt.itn_enabled,'prompt_version':'conditioned_multi_v1','coverage':counts,
                 'asr_models':artifact['identity']['models'],'candidate_selection':'configured_priority_after_itn_dedup',
                 'history_protocol':'replace_visible_user_history_with_verified_asr',

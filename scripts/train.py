@@ -19,6 +19,7 @@ model cannot be loaded). Never silently downgrades full → LoRA.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import sys
@@ -228,6 +229,14 @@ def load_records(dataset_dir: str | Path) -> tuple[list[dict], list[dict], dict]
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise LifeMateError(f"{manifest_path}: invalid JSON ({exc.msg})") from exc
+    conditioned = manifest.get("conditioned_multi_asr")
+    if conditioned:
+        for path, key in ((train_path, "train_sha256"), (val_path, "validation_sha256")):
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != conditioned.get(key):
+                raise LifeMateError(f"conditioned dataset checksum mismatch: {path}")
+        for key in ("artifact_sha256", "prompt_version"):
+            if not conditioned.get(key):
+                raise LifeMateError(f"conditioned dataset missing provenance: {key}")
     train = _read_jsonl(train_path)
     val = _read_jsonl(val_path) if val_path.is_file() else []
     if not train:
@@ -696,7 +705,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"configuration error: {exc}")
         return EXIT_FAIL
 
-    manifest_hash = manifest.get("group_hash")
+    manifest_hash = (hashlib.sha256(json.dumps(manifest, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+                     if manifest.get("conditioned_multi_asr") else manifest.get("group_hash"))
     # SIGINT/SIGTERM set a cooperative stop flag: the current optimizer step
     # finishes, an interrupt-<step> checkpoint is written, exit code 130.
     stop = StopController().install()

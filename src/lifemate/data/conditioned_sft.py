@@ -53,31 +53,48 @@ def coverage_audit(target, visible_prompt):
     if action.type=='invalid':return {'status':'UNSUPPORTED','reasons':['invalid action target']}
     sections=prompt_sections(visible_prompt)
     if sections is None:return {'status':'UNKNOWN','reasons':['unrecognized prompt structure']}
+    from lifemate.text.itn import normalize_itn
     visible=' '.join(v for k,v in sections.items() if k in {'# Yêu cầu','# Các giả thuyết ASR','# Ngữ cảnh','# Lịch sử hội thoại','# Các bước đã thực hiện'})
+    visible = normalize_itn(visible, enabled=True).text
     arguments=json.dumps(action.arguments,ensure_ascii=False)
     gold_times=re.findall(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)',arguments)
     observed=re.findall(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)',visible)
     norm=lambda t: f'{int(t.split(":")[0]):02d}:{t.split(":")[1]}'
     gold_times=[norm(t) for t in gold_times];observed=[norm(t) for t in observed]
     request=sections.get('# Các giả thuyết ASR') or sections.get('# Yêu cầu') or ''
+    request=normalize_itn(request, enabled=True).text
     lines=re.findall(r'^\d+\. .+$',request,flags=re.MULTILINE) or [request]
     candidate_times=[re.findall(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)',line) for line in lines]
-    if gold_times and observed and all(len(ts)==1 for ts in candidate_times) and any(t not in observed for t in gold_times):
+    # A clock elsewhere may be a previous event, not the argument in question.
+    # Contradiction is only conclusive for an explicitly named time slot.
+    time_keys={'time','alarm_time','start_time','datetime'}
+    explicit_time=any(k in time_keys for k in action.arguments)
+    if explicit_time and gold_times and observed and all(len(ts)==1 for ts in candidate_times) and any(t not in observed for t in gold_times):
         return {'status':'UNSUPPORTED','reasons':['explicit target time absent while other visible times occur'], 'gold_times':gold_times,'observed_times':observed}
     def leaves(value):
         if isinstance(value, dict): return [item for child in value.values() for item in leaves(child)]
         if isinstance(value, list): return [item for child in value for item in leaves(child)]
         return [value] if isinstance(value, (str, int, float)) and not isinstance(value, bool) else []
     values=leaves(action.arguments)
-    if action.is_tool_call and action.name and action.name.casefold() in request.casefold() and all(str(v).casefold() in visible.casefold() for v in values):
-        return {'status':'SUPPORTED','reasons':['exact tool name in request and literal arguments visible; heuristic, not semantic proof']}
+    # A deliberately small high-precision vocabulary; unknown tools remain UNKNOWN.
+    intents={'alarm.create': ('đặt báo thức','cài báo thức','tạo báo thức','nhắc tôi dậy'),
+             'alarm.list': ('danh sách báo thức','xem báo thức','liệt kê báo thức')}
+    req=request.casefold()
+    intent=bool(action.name and (action.name.casefold() in req or any(phrase in req for phrase in intents.get(action.name, ()))))
+    def visible_value(value):
+        value=str(value).casefold()
+        return value in visible.casefold() or any(norm(t) in observed for t in re.findall(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)',value)) and bool(re.fullmatch(r'(?:[01]?\d|2[0-3]):[0-5]\d',value))
+    conflicting_request_time = bool(gold_times and candidate_times and any(ts and any(norm(t) not in gold_times for t in ts) for ts in candidate_times))
+    if action.is_tool_call and intent and not conflicting_request_time and all(visible_value(v) for v in values):
+        return {'status':'SUPPORTED','reasons':['recognized explicit intent and visible argument values; heuristic, not semantic proof']}
     return {'status':'UNKNOWN','reasons':['heuristic cannot establish intent and argument support']}
 
 
-def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unknown_policy='exclude', itn=False, split='train', data_root=None, history_limit=10, mode='multi', single_ratio=1.0, multi_ratio=1.0):
+def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unknown_policy='exclude', itn=False, split='train', data_root=None, history_limit=10, mode='multi', single_ratio=1.0, multi_ratio=1.0, single_model='gipformer_68m', artifact_sha256=None):
     """Append at most one variant per decision point, preserving the exact target."""
     k=candidate_count(k,maximum=4)
     if not 0 < ratio <= 1 or not 0 <= single_ratio <= 1 or not 0 <= multi_ratio <= 1 or unknown_policy not in {'exclude','include'} or mode not in {'single','multi','mixed'}:raise LifeMateError('invalid conditioned augmentation policy')
+    if single_model not in MODELS: raise LifeMateError('unknown single ASR model')
     samples={str(s.id):s for s in samples}
     counts={'SUPPORTED':0,'UNSUPPORTED':0,'UNKNOWN':0,'history_excluded':0,'missing_or_degraded':0,'created':0}
     counts['decisions'] = []
@@ -88,7 +105,7 @@ def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unk
         sid=str(record['sample_id'])
         if not _selected(seed,sid,ratio):continue
         sample=samples.get(sid); row=index.get((sid,'current'))
-        if sample is None or row is None or row.get('status')!='complete':counts['missing_or_degraded']+=1;continue
+        if sample is None or row is None:counts['missing_or_degraded']+=1;continue
         if sid not in audio_hashes:
             audio=read_sample_audio(sample)
             audio_hashes[sid]=_hash(audio) if audio and audio.is_file() else None
@@ -96,39 +113,59 @@ def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unk
             raise LifeMateError(f'audio identity mismatch for {sid}')
         # Replace every visible user turn with its own verified ASR text.  Never
         # carry a gold history transcript into a noisy variant.
-        turns=list(_turns_of(sample)); history=copy.deepcopy(turns)
+        turns=list(_turns_of(sample))
         visible_start=max(0,len(turns)-history_limit) if history_limit and history_limit>0 else len(turns)
+        prior_rows = {}
         history_missing=False
         for i,turn in enumerate(turns):
             if i<visible_start or _turn_role(turn)!='user': continue
             prior=index.get((sid,f'history:{i}'))
             raw=_writeable_turn(turn) or {}
             audio=_audio_path(raw,split,data_root) if raw.get('audio') and data_root is not None else None
-            if not prior or prior.get('status')!='complete' or not prior.get('selected_text') or not audio or not audio.is_file() or _hash(audio)!=prior.get('audio_sha256'):
+            if not prior or not audio or not audio.is_file() or _hash(audio)!=prior.get('audio_sha256'):
                 history_missing=True;break
-            target=history[i]; target_raw=_writeable_turn(target)
-            if isinstance(target,dict):
-                for key in ('audio_text','transcript','text','asr_text','utterance'):target.pop(key,None)
-                target['content']=prior['selected_text']
-            else:
-                target.content=prior['selected_text']
-                if target_raw is not None:
-                    for key in ('audio_text','transcript','text','asr_text','utterance'):target_raw.pop(key,None)
-                    target_raw['content']=prior['selected_text']
+            prior_rows[i] = prior
         if history_missing:
             counts['history_excluded']+=1;continue
         models=row.get('models') or []
-        if len(models)!=4 or {m.get('model') for m in models} != set(MODELS) or any(m.get('status')!='executed' or not m.get('transcript') or m.get('model_id') != MODELS.get(m.get('model'),(None,None))[1] for m in models):
-            counts['missing_or_degraded']+=1;continue
-        hypotheses=[AsrHypothesis(text=m['transcript'],source=m['model'],backend=m.get('backend'),provenance=(m['model'],),model_rank=1,model_priority=i) for i,m in enumerate(models)]
+        valid = {m.get('model'): m for m in models if m.get('model') in MODELS and m.get('status')=='executed' and m.get('transcript') and m.get('model_id') == MODELS[m['model']][1]}
+        complete = len(models)==4 and set(valid)==set(MODELS) and row.get('status')=='complete'
+        hypotheses=[AsrHypothesis(text=m['transcript'],source=m['model'],backend=m.get('backend'),provenance=(m['model'],),model_rank=1,model_priority=i) for i,m in enumerate(models) if m.get('model') in valid]
         selected=select_llm_candidates(hypotheses,itn_enabled=itn,limit=k,conditioned_sft=True)
-        if not selected:counts['missing_or_degraded']+=1;continue
         variants = ('single','multi') if mode == 'mixed' else (mode,)
         seen_prompts = set()
         for variant_kind in variants:
             variant_ratio = single_ratio if variant_kind == 'single' else multi_ratio
             if not _selected(f'{seed}:{variant_kind}',sid,variant_ratio):continue
-            shown = selected[:1] if variant_kind == 'single' else selected
+            if variant_kind == 'single':
+                chosen = [h for h in hypotheses if h.source == single_model]
+                shown = select_llm_candidates(chosen,itn_enabled=itn,limit=1,conditioned_sft=True)
+            else:
+                shown = selected if complete else []
+            if not shown:
+                counts['missing_or_degraded']+=1
+                continue
+            history=copy.deepcopy(turns)
+            history_missing=False
+            for i, prior in prior_rows.items():
+                if variant_kind == 'multi':
+                    history_text=prior.get('selected_text') if prior.get('status')=='complete' else None
+                else:
+                    matches=[m for m in prior.get('models',[]) if m.get('model')==single_model and m.get('model_id')==MODELS[single_model][1] and m.get('status')=='executed' and m.get('transcript')]
+                    history_text=matches[0]['transcript'] if len(matches)==1 else None
+                if not history_text:
+                    history_missing=True;break
+                target=history[i]; target_raw=_writeable_turn(target)
+                if isinstance(target,dict):
+                    for key in ('audio_text','transcript','text','asr_text','utterance'):target.pop(key,None)
+                    target['content']=history_text
+                else:
+                    target.content=history_text
+                    if target_raw is not None:
+                        for key in ('audio_text','transcript','text','asr_text','utterance'):target_raw.pop(key,None)
+                        target_raw['content']=history_text
+            if history_missing:
+                counts['history_excluded']+=1;continue
             section=_render_request(shown[0].text,shown,nbest_format=True,limit=k,conditioned_multi_sft=True)
             prompt=replace_first_section(record['messages'][-1]['content'],section)
             if prompt is None:raise LifeMateError('cannot locate request section in causal SFT prompt')
@@ -142,6 +179,6 @@ def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unk
             audit=coverage_audit(record['target'],prompt);counts[audit['status']]+=1
             counts['decisions'].append({'sample_id':sid,'step_index':record.get('step_index'),'kind':variant_kind,'audit':audit})
             if audit['status']=='UNSUPPORTED' or (audit['status']=='UNKNOWN' and unknown_policy=='exclude'):continue
-            variant=_with_prompt(record,prompt,{'augmentation':'conditioned_multi_asr' if variant_kind=='multi' else 'conditioned_single_asr','coverage_audit':audit,'candidate_k':k if variant_kind=='multi' else 1,'asr_run_identity':row['run_identity'],'token_estimate':estimate_tokens(prompt)})
+            variant=_with_prompt(record,prompt,{'augmentation':'conditioned_multi_asr' if variant_kind=='multi' else 'conditioned_single_asr','coverage_audit':audit,'candidate_k':k if variant_kind=='multi' else 1,'asr_run_identity':row['run_identity'],'asr_artifact_sha256':artifact_sha256,'prompt_version':'conditioned_multi_v1','token_estimate':estimate_tokens(prompt)})
             output.append(variant);counts['created']+=1
     return output,counts

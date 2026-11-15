@@ -256,3 +256,92 @@ def test_asr_report_uses_only_present_train_references():
     result=module.summarize(index,[SimpleNamespace(id='s',audio_text='xin chào')])
     assert result['models']['a']['asr']['available'] and result['models']['a']['cache_hits']==1
     assert result['models']['b']['failed']==1 and result['official_score']=='UNAVAILABLE'
+
+
+def test_single_model_does_not_require_other_models(tmp_path):
+    data,sample,backend,features,_=producer_fixture(tmp_path);sample.history=[]
+    def transcribe(*args, **kwargs):
+        models=[{'model':name,'model_id':MODELS[name][1], 'status':'executed' if i==1 else 'failed',
+                 'transcript':'đặt báo thức 07:00' if i==1 else ''} for i,name in enumerate(MODELS)]
+        return 'đặt báo thức 07:00', {'multi_asr_results':models,'conditioning':{'multi_asr':{'degraded':True}}}
+    path=tmp_path/'records.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=transcribe)
+    index,_=load_records(path)
+    clean={'sample_id':'s','messages':[{'role':'user','content':prompt('gold')}], 'target':'<action>{"type":"tool_call","name":"alarm.create","arguments":{"time":"07:00"}}</action>', 'meta':{}}
+    out,counts=augment_conditioned([clean],[sample],index,mode='mixed',single_model='gipformer_15')
+    assert len(out)==2 and counts['created']==1 and counts['missing_or_degraded']==1
+    assert out[1]['meta']['augmentation']=='conditioned_single_asr'
+    out,_=augment_conditioned([clean],[sample],index,mode='single',single_model='gipformer_68m')
+    assert out==[clean]
+
+
+def test_semantic_coverage_counterexamples():
+    target='<action>{"type":"tool_call","name":"alarm.create","arguments":{"time":"07:00"}}</action>'
+    assert coverage_audit(target,prompt('đặt báo thức lúc 07:00'))['status']=='SUPPORTED'
+    assert coverage_audit(target,prompt('đặt báo thức lúc 09:00'))['status']=='UNSUPPORTED'
+    assert coverage_audit(target,prompt('đặt báo thức lúc 09:00').replace('không có','đã xác nhận 07:00',1))['status']!='UNSUPPORTED'
+    assert coverage_audit(target,prompt('có một cuộc họp lúc 07:00'))['status']=='UNKNOWN'
+
+
+def test_replay_k_and_identity(tmp_path):
+    from lifemate.evaluation.artifact_replay import ArtifactReplay
+    data,sample,backend,features,_=producer_fixture(tmp_path)
+    for name,model in backend.backends.items(): model.model_id=MODELS[name][1]
+    def transcribe(*args,**kwargs):
+        models=[{'model':name,'model_id':MODELS[name][1],'status':'executed','transcript':f'text {i}'} for i,name in enumerate(MODELS)]
+        return 'text 0',{'multi_asr_results':models,'latency_s':123,'conditioning':{'multi_asr':{'degraded':False}}}
+    path=tmp_path/'records.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=transcribe)
+    for k in range(1,5):
+        replay=ArtifactReplay(path,[sample],split='train',data_root=data,k=k)
+        text,info=replay.current(sample)
+        assert text=='text 0' and len(info['hypotheses'])==k and info['historical_asr_latency_s']==123
+        replay.history(sample)
+        assert sample.history[0]['content']=='text 0'
+    sample.audio_path.write_bytes(b'changed')
+    with pytest.raises(LifeMateError,match='identity'):ArtifactReplay(path,[sample],split='train',data_root=data,k=1)
+
+
+def test_conditioned_training_manifest_checksums(tmp_path):
+    import importlib.util, hashlib
+    path=Path(__file__).resolve().parents[1]/'scripts/train.py'
+    spec=importlib.util.spec_from_file_location('train_provenance_test',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    train=tmp_path/'train.jsonl';val=tmp_path/'val.jsonl'
+    train.write_text('{"target":"x"}\n');val.write_text('{"target":"y"}\n')
+    h=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
+    (tmp_path/'manifest.json').write_text(json.dumps({'conditioned_multi_asr':{'train_sha256':h(train),'validation_sha256':h(val),'artifact_sha256':'abc','prompt_version':'v1'}}))
+    assert module.load_records(tmp_path)[0]
+    train.write_text('{"target":"changed"}\n')
+    with pytest.raises(LifeMateError,match='checksum'):module.load_records(tmp_path)
+
+
+def test_replay_runs_evaluator_with_history_and_hypotheses(tmp_path):
+    from lifemate.evaluation.artifact_replay import ArtifactReplay
+    from lifemate.evaluation.evaluator import evaluate_closed_loop
+    data,sample,backend,features,_=producer_fixture(tmp_path)
+    for name,model in backend.backends.items(): model.model_id=MODELS[name][1]
+    def decode(*args,**kwargs):
+        models=[{'model':name,'model_id':MODELS[name][1],'status':'executed','transcript':f'variant {i}'} for i,name in enumerate(MODELS)]
+        return 'variant 0',{'multi_asr_results':models,'latency_s':99,'conditioning':{'multi_asr':{'degraded':False}}}
+    path=tmp_path/'records.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=decode)
+    replay=ArtifactReplay(path,[sample],split='train',data_root=data,k=4)
+    text,info=replay.current(sample);seen=[]
+    class Env:
+        def get_tool_calls(self):return []
+        def get_state_hash(self):return 'official-test-env-hash'
+    class Agent:
+        env=Env()
+        def run(self, sample, **kwargs):
+            seen.append((sample.history[0]['content'],kwargs))
+            return SimpleNamespace(status='finished')
+    result=evaluate_closed_loop(lambda s:Agent(),[sample],split='train',data_root=data,evaluation_mode='audio_to_action',transcripts={'s':text},asr_info={'s':info},prepare_history=replay.history)
+    assert seen[0][0]=='variant 0' and len(seen[0][1]['asr_hypotheses'])==4
+    assert result['rows'][0]['state_hash']=='official-test-env-hash'
+    assert result['runtime_protocol']=='quality_asr_latency_excluded'
+    assert result['rows'][0]['current_asr_seconds']==0
+
+
+def test_semantic_itn_and_ambiguous_date():
+    target='<action>{"type":"tool_call","name":"alarm.create","arguments":{"time":"07:00"}}</action>'
+    assert coverage_audit(target,prompt('đặt báo thức lúc bảy giờ sáng'))['status']=='SUPPORTED'
+    assert coverage_audit(target,prompt('đặt báo thức lúc bảy giờ'))['status']=='UNKNOWN'
+    dated='<action>{"type":"tool_call","name":"alarm.create","arguments":{"date":"2026-11-20"}}</action>'
+    assert coverage_audit(dated,prompt('đặt báo thức ngày hai mươi tháng mười một'))['status']=='UNKNOWN'
