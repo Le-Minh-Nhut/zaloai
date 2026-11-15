@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import copy
+import unicodedata
 from pathlib import Path
 from lifemate.agent.protocol import parse_action
 from lifemate.agent.prompt_builder import _render_request, _render_history
@@ -88,6 +89,20 @@ def coverage_audit(target, visible_prompt):
     if action.is_tool_call and intent and not conflicting_request_time and all(visible_value(v) for v in values):
         return {'status':'SUPPORTED','reasons':['recognized explicit intent and visible argument values; heuristic, not semantic proof']}
     return {'status':'UNKNOWN','reasons':['heuristic cannot establish intent and argument support']}
+
+
+def _equivalent_transcript(left, right):
+    """Only case, whitespace and punctuation not adjoining digits may differ.
+
+    Digit-adjacent punctuation/signs are preserved to avoid merging amounts,
+    dates, negative values or identifiers. This is validation evidence only;
+    the gold transcript is never put into the augmented prompt.
+    """
+    def canonical(text):
+        text=unicodedata.normalize('NFC', text).casefold()
+        text=re.sub(r'(?<![\d])[,.!?;](?![\d])', ' ', text)
+        return ' '.join(text.split())
+    return bool(left and right and canonical(left)==canonical(right))
 
 
 def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unknown_policy='exclude', itn=False, split='train', data_root=None, history_limit=10, mode='multi', single_ratio=1.0, multi_ratio=1.0, single_model='gipformer_68m', artifact_sha256=None):
@@ -176,7 +191,14 @@ def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unk
                 counts['duplicate_variants'] = counts.get('duplicate_variants', 0) + 1
                 continue
             seen_prompts.add(prompt)
-            audit=coverage_audit(record['target'],prompt);counts[audit['status']]+=1
+            audit=coverage_audit(record['target'],prompt)
+            clean_sections=prompt_sections(record['messages'][-1]['content']) or {}
+            clean_request=clean_sections.get('# Yêu cầu', '')
+            history_equivalent=not prior_rows or _equivalent_transcript(_render_history(turns,history_limit), _render_history(history,history_limit))
+            if (audit['status']=='UNKNOWN' and variant_kind=='single' and history_equivalent
+                    and _equivalent_transcript(clean_request, shown[0].text)):
+                audit={'status':'SUPPORTED','reasons':['ASR request and visible history match the original after conservative surface normalization; gold text used only for validation']}
+            counts[audit['status']]+=1
             counts['decisions'].append({'sample_id':sid,'step_index':record.get('step_index'),'kind':variant_kind,'audit':audit})
             if audit['status']=='UNSUPPORTED' or (audit['status']=='UNKNOWN' and unknown_policy=='exclude'):continue
             variant=_with_prompt(record,prompt,{'augmentation':'conditioned_multi_asr' if variant_kind=='multi' else 'conditioned_single_asr','coverage_audit':audit,'candidate_k':k if variant_kind=='multi' else 1,'asr_run_identity':row['run_identity'],'asr_artifact_sha256':artifact_sha256,'prompt_version':'conditioned_multi_v1','token_estimate':estimate_tokens(prompt)})

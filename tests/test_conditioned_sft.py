@@ -345,3 +345,26 @@ def test_semantic_itn_and_ambiguous_date():
     assert coverage_audit(target,prompt('đặt báo thức lúc bảy giờ'))['status']=='UNKNOWN'
     dated='<action>{"type":"tool_call","name":"alarm.create","arguments":{"date":"2026-11-20"}}</action>'
     assert coverage_audit(dated,prompt('đặt báo thức ngày hai mươi tháng mười một'))['status']=='UNKNOWN'
+
+
+def test_conservative_reference_equivalence_rejects_numbers_and_signs():
+    from lifemate.data.conditioned_sft import _equivalent_transcript
+    assert _equivalent_transcript('Mở nhạc, nhé!', 'mở nhạc nhé')
+    assert not _equivalent_transcript('chuyển 10.000 đồng', 'chuyển 10000 đồng')
+    assert not _equivalent_transcript('trừ -5', 'trừ 5')
+    assert not _equivalent_transcript('bảy giờ', 'chín giờ')
+
+
+def test_exact_gold_surface_is_coverage_evidence_only(tmp_path):
+    data,sample,backend,features,_=producer_fixture(tmp_path);sample.history=[]
+    def transcribe(*args,**kwargs):
+        models=[{'model':name,'model_id':MODELS[name][1],'status':'executed','transcript':'mở nhạc nhé'} for name in MODELS]
+        return 'mở nhạc nhé',{'multi_asr_results':models,'conditioning':{'multi_asr':{'degraded':False}}}
+    path=tmp_path/'records.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=transcribe)
+    idx,_=load_records(path)
+    clean={'sample_id':'s','messages':[{'role':'user','content':prompt('Mở nhạc, nhé!')}], 'target':'<action>{"type":"finish"}</action>', 'meta':{}}
+    out,stats=augment_conditioned([clean],[sample],idx,mode='single')
+    assert len(out)==2 and stats['SUPPORTED']==1
+    assert '# Yêu cầu\nmở nhạc nhé' in out[1]['messages'][-1]['content']
+    assert 'Mở nhạc, nhé!' not in out[1]['messages'][-1]['content']
+    assert out[1]['target']==clean['target']
