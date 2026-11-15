@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -673,7 +674,6 @@ def main(argv: list[str] | None = None) -> int:
             if cfg.training.tuning_mode != 'lora' or meta.get('tuning_mode') != 'lora' or meta.get('model_profile') != 'minicpm5' or Path(cfg.model.name).name != 'MiniCPM5-2B':
                 raise LifeMateError('warm-start requires the verified MiniCPM5-2B LoRA parent and base')
             if not weights.is_file(): raise LifeMateError('warm-start adapter weights missing')
-            import subprocess
             source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
             provenance={'experiment':'E3-WARMSTART','base_model_id':'openbmb/MiniCPM5-2B','parent_adapter_path':str(parent),
                 'parent_adapter_sha256':hashlib.sha256(weights.read_bytes()).hexdigest(), 'parent_training_step':meta.get('global_step'),
