@@ -49,3 +49,9 @@ Dataset pilot thực `outputs/research/e2_e3_pilot_20261115/e3_dataset/train`: 1
 Đã khởi chạy đánh giá E0/E2 cùng artifact bốn ASR K=3 trong `tmux` `lifemate_e2_e3_multieval_20261115`, log `outputs/research/e2_e3_pilot_20261115/evaluate_multi.log`; xem output `e0_multi_k3/` và `e2_multi_k3/` khi tiến trình hoàn tất. Không tự chạy training tiếp. Thử replay K=1..4 thành công về cấu trúc trên 12 mẫu; đây không phải kết quả accuracy Top-K.
 
 Sửa code trong nhánh `codex/e2-e3-pilot`: replay một model xác minh audio, ghép các model độc lập với hash audio, và coverage chỉ dùng khớp transcript gốc làm bằng chứng, không đưa transcript gốc vào prompt. Kiểm thử tập trung mới nhất: `PYTHONPATH=src /tmp/cudaenv/bin/python -m pytest -q tests/test_conditioned_sft.py` — **30 passed**.
+
+## Kết quả E0/E2 với cùng đầu vào bốn ASR K=3
+
+Đã hoàn tất `evaluate_multi.sh` trên cùng 12 ID held-out và ToolEnv thật, dùng artifact bốn model đã lưu. E0 đạt exact match tool-call cục bộ **4/12**, tên tool toàn chuỗi **5/12**, có 9 episode `finished`, 2 `max_steps`, 1 `repeated_failure`; E2 đạt **0/12** exact match và **0/12** tên tool, 12 episode `finished`. Timeout 0 cho cả hai. Thời gian replay trung bình E0 **9,44 s**, E2 **1,77 s**, không bao gồm thời gian nhận dạng ASR. Tỷ lệ action invalid và final-state correctness: UNAVAILABLE. Kết quả 12 mẫu là thăm dò, không phải điểm chính thức.
+
+Dự đoán từng mẫu: `outputs/research/e2_e3_pilot_20261115/e0_e2_multi_k3_comparison.json`; metrics gốc trong `e0_multi_k3/metrics.json` và `e2_multi_k3/metrics.json`. Đầu vào K=3 khác K=1 nên phải so sánh riêng theo từng chế độ. E3 không có checkpoint do chỉ có 9 record conditioned đủ bằng chứng; không có kết quả E3 hay accuracy ablation K=2/4.
