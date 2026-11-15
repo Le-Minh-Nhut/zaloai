@@ -23,3 +23,7 @@ nvidia-smi
 ```
 
 Regression cho mở rộng epoch/horizon: 2 bài PASS (bao gồm từ chối thay LR hoặc thiếu `--extend-horizon`). Không dùng `--best-effort-resume`. Khi cần phục hồi từ checkpoint epoch mới, giữ source commit, config, dataset, E0 adapter, sampling và horizon 13.260; không quay về checkpoint E0 hay step 0. Không chạy lệnh phục hồi khi PID hiện tại còn sống.
+
+## Cập nhật sau resume
+
+Đã quan sát `step=110`, `train_loss=0,000417` (microbatch cuối), learning rate `5,577889447236181e-06`, tổng 711 clean và 169 conditioned exposures. Đây là log đầu tiên sau khi tiếp tục vì cấu hình ghi mỗi 10 optimizer step, xác nhận đã vượt step 100; không ghi giả số loss riêng của step 101. GPU RTX 5070 Ti, PID `761530`, khoảng 9,4 GiB compute VRAM khi kiểm tra. Training vẫn đang chạy; epoch đầu chưa kết thúc, validation/best/final chưa có.
