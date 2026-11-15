@@ -42,3 +42,9 @@ tmux list-sessions
 ```
 
 So sánh đã có trước đó: E0 4/12 exact match tool-call ở bốn ASR K=3 trên ToolEnv thật, nhưng run mới sẽ đánh giá lại E0 cùng cấu hình E3 trước khi so sánh. E3 accuracy/tool-name/latency: NOT TESTED tại thời điểm ghi; điểm chính thức UNAVAILABLE. Kết quả 12 mẫu là diagnostic, không phải leaderboard. Regression code: 27 tests warm-start/resume/loss PASS; warm-start riêng 2 tests PASS.
+
+## Cập nhật checkpoint step 25
+
+Run chính đã hoàn tất **25/100 optimizer step** và tạo `outputs/checkpoints/lifemate_e3_warmstart/lora/step-25`. Đã kiểm tra các file adapter, optimizer và `training_state.json`: `step=25`, scheduler horizon `100`, parent adapter SHA256 `789eb8389cb6e79ea0705cbf2ee616e7e29dcf6f39a50c7898cf38370c183860`, ASR artifact SHA256 `b219aaef1feab1bc2313994ca602d0ca3cf94c94caea2aaa57257bd092354b00`, source commit `3179c629492a48b8bc6d646de03818888e5f6328`. State ghi `exact_resume=true`, nhưng **chưa thử reload/resume checkpoint này**. Parent E0 vẫn giữ nguyên SHA256.
+
+Tại step 25, log: loss microbatch cuối `0,004836`, 43 conditioned/200 exposure (**21,5%**). Loss không phải task metric. Training vẫn chạy; step 50/100 và evaluation chưa có kết quả tại thời điểm ghi. `watch_run.py` chạy riêng, kiểm tra định kỳ SHA dataset/ASR/parent, step, file checkpoint và GPU contention; nếu phát hiện vi phạm, nó gửi SIGTERM đúng PID training. Log: `outputs/research/e3_multiasr_warmstart_20261115/watch.log`. Sau training, `evaluate_after.sh` và `summarize.py` chỉ đánh giá và tổng hợp; không tự kéo dài training.
