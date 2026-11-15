@@ -178,3 +178,78 @@ def test_all_failures_are_reported_to_caller(monkeypatch,tmp_path):
     text,info=infer_module()._transcribe(backend,SimpleNamespace(id='s'),features=features)
     assert not text and info['error'] and len(info['multi_asr_results'])==2
     assert all(item['status']=='failed' for item in info['multi_asr_results'])
+
+
+def test_itn_dedup_refills_and_prompt_has_final_provenance(monkeypatch,tmp_path):
+    from lifemate.asr.transcription import infer_module
+    from lifemate.agent.prompt_builder import _render_request
+    from lifemate.features.config import FeatureConfig
+    import lifemate.data.loader as loader
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a')
+    monkeypatch.setattr(loader,'read_sample_audio',lambda s:audio)
+    models={'a':Fake('ngày hai mươi tháng mười một'),'b':Fake('20/11'),'c':Fake('chọn lịch'),'d':Fake('đặt xe')}
+    backend=MultiAsrBackend(models['a'],enabled=True,backends=models,max_hypotheses=3)
+    features=FeatureConfig();features.asr.multi_asr_enabled=True;features.prompt.itn_enabled=True
+    text,info=infer_module()._transcribe(backend,SimpleNamespace(id='s'),features=features)
+    assert [h.text for h in info['hypotheses']]==['20/11','chọn lịch','đặt xe']
+    assert info['hypotheses'][0].provenance==('a','b') and len(info['raw_hypotheses'])==4
+    assert len(info['multi_asr_results'])==4 and info['multi_asr_results'][0]['raw_transcript']=='ngày hai mươi tháng mười một'
+    prompt=_render_request(text,info['hypotheses'],nbest_format=True,limit=3)
+    assert 'a, b: 20/11' in prompt and 'd: đặt xe' in prompt and prompt.count('20/11')==1
+
+
+def test_selected_model_and_elapsed_when_primary_fails(monkeypatch,tmp_path):
+    from lifemate.asr.transcription import infer_module
+    from lifemate.features.config import FeatureConfig
+    import lifemate.data.loader as loader
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a');monkeypatch.setattr(loader,'read_sample_audio',lambda s:audio)
+    class Slow(Fake):
+        def transcribe(self,*a,**kw): time.sleep(.01); return super().transcribe(*a,**kw)
+    first=Fake('');first.model_id='failed-model';second=Slow('ok');second.model_id='working-model'
+    backend=MultiAsrBackend(first,enabled=True,backends={'primary':first,'secondary':second})
+    features=FeatureConfig();features.asr.multi_asr_enabled=True
+    text,info=infer_module()._transcribe(backend,SimpleNamespace(id='s'),features=features)
+    assert text=='ok' and info['model_id']=='working-model' and info['latency_s']>=.01
+    assert info['multi_asr_results'][1]['latency_ms']>=10 and info['multi_asr_results'][1]['cache_hit'] is False
+
+
+@pytest.mark.parametrize('limit',[0,4,10,True])
+def test_multi_candidate_limit_rejects_invalid(limit):
+    with pytest.raises(AsrError): MultiAsrBackend(Fake(),enabled=True,backends={'a':Fake()},max_hypotheses=limit)
+
+
+def test_config_validation_rejects_more_than_three():
+    from lifemate.features.config import FeatureConfig
+    from lifemate.features.registry import FeatureRegistry
+    features=FeatureConfig();features.asr.multi_asr_enabled=True
+    features.asr.multi_asr_models=[{'name':'gipformer_68m'}]
+    features.asr.multi_asr_max_hypotheses=4
+    assert any('between 1 and 3' in p for p in FeatureRegistry().validate(features))
+
+
+def test_cache_hit_visible_in_per_model_result(tmp_path):
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a')
+    a=Fake('ok');a.model_id='m';wrapped=CachedTop1(a,tmp_path/'cache')
+    backend=MultiAsrBackend(wrapped,enabled=True,backends={'a':wrapped})
+    assert backend.transcribe_multi(audio,sample_id='s').raw_results[0]['cache_hit'] is False
+    assert backend.transcribe_multi(audio,sample_id='s').raw_results[0]['cache_hit'] is True
+
+
+def test_legacy_two_backend_selected_model_is_secondary(monkeypatch,tmp_path):
+    from lifemate.asr.transcription import infer_module
+    from lifemate.features.config import FeatureConfig
+    import lifemate.data.loader as loader
+    audio=tmp_path/'a.wav';audio.write_bytes(b'a');monkeypatch.setattr(loader,'read_sample_audio',lambda s:audio)
+    primary=Fake('');primary.model_id='primary-id'
+    secondary=Fake('ok');secondary.model_id='secondary-id'
+    backend=MultiAsrBackend(primary,secondary,enabled=True,primary_topk=1)
+    features=FeatureConfig();features.asr.multi_asr_enabled=True
+    text,info=infer_module()._transcribe(backend,SimpleNamespace(id='s'),features=features)
+    assert text=='ok' and info['model_id']=='secondary-id'
+
+
+def test_invalid_topk_rejected_before_loading_models(monkeypatch):
+    calls=[]
+    monkeypatch.setattr('lifemate.asr.top1_models.create_asr_backend',lambda *a,**kw: calls.append(kw))
+    with pytest.raises(AsrError): build_top1_multi(None,[{'name':'gipformer_68m'}],max_hypotheses=4)
+    assert calls==[]

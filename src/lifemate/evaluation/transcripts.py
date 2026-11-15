@@ -113,6 +113,9 @@ def asr_cache_identity(cfg: Any, features: Any) -> dict[str, Any]:
         "multi_asr_models": _param(features, "asr", "multi_asr_models", []),
         "multi_asr_budget_seconds": _param(features, "asr", "multi_asr_budget_seconds", 30.0),
     }
+    if identity['asr_features']['multi_asr_models']:
+        # Invalidate pre-fix aggregate caches that truncated before ITN.
+        identity['asr_features']['candidate_selection_version'] = 2
     identity["itn_enabled"] = _flag(features, "prompt", "itn_enabled")
     return identity
 

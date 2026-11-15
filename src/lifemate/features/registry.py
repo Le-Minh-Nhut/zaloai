@@ -255,9 +255,9 @@ def _multi_asr_rules(cfg: FeatureConfig) -> list[str]:
             "set it to a secondary ASR model id (e.g. 'vinai/PhoWhisper-small') "
             "or disable asr.multi_asr"
         )
-    if cfg.asr.multi_asr_max_hypotheses < 1:
+    if not 1 <= cfg.asr.multi_asr_max_hypotheses <= 3:
         problems.append(
-            "features.asr.multi_asr_max_hypotheses must be >= 1; it caps how many "
+            "features.asr.multi_asr_max_hypotheses must be between 1 and 3; it caps how many "
             "hypotheses reach the prompt"
         )
     return problems

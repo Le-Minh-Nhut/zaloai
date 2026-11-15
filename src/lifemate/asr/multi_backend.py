@@ -100,8 +100,8 @@ class MultiAsrBackend:
             raise AsrError(
                 f"unknown failure_policy {failure_policy!r}; choose from {MULTI_ASR_FAILURE_POLICIES}"
             )
-        if int(max_hypotheses) < 1:
-            raise AsrError(f"max_hypotheses must be >= 1, got {max_hypotheses!r}")
+        if isinstance(max_hypotheses, bool) or not 1 <= int(max_hypotheses) <= 3:
+            raise AsrError(f"max_hypotheses must be between 1 and 3, got {max_hypotheses!r}")
         if int(primary_topk) < 1:
             raise AsrError(f"primary_topk must be >= 1, got {primary_topk!r}")
         if budget_seconds is not None and float(budget_seconds) <= 0:
@@ -307,7 +307,8 @@ class MultiAsrBackend:
                 result.budget_exceeded = result.degraded = True
                 result.reasons.append(f'{label}: ASR budget exceeded during decoding')
                 if self.failure_policy == 'strict': raise AsrError(result.reasons[-1])
-        result.hypotheses = list(distinct.values())[:self.max_hypotheses]
+        result.all_hypotheses = list(distinct.values())
+        result.hypotheses = result.all_hypotheses[:self.max_hypotheses]
         result.multi_asr = len(result.sources) >= 2
         return result
 

@@ -276,6 +276,7 @@ class NBestResult:
     #: Set when the wall-clock budget cut the run short.
     budget_exceeded: bool = False
     raw_results: list[dict[str, Any]] = field(default_factory=list)
+    all_hypotheses: list[AsrHypothesis] = field(default_factory=list)
 
     @property
     def text(self) -> str:

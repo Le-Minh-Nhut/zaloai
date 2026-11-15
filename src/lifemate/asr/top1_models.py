@@ -3,6 +3,9 @@ from . import create_asr_backend
 from .interface import AsrError, TranscriptResult
 from .multi_backend import MultiAsrBackend
 from lifemate.errors import ProhibitedAccessError
+from dataclasses import replace
+import math
+from .nbest import normalize_hypothesis_text
 
 MODELS = {
     'gipformer_68m': ('gipformer', 'g-group-ai-lab/gipformer-68M-rnnt'),
@@ -10,6 +13,26 @@ MODELS = {
     'phowhisper_small': ('whisper', 'vinai/PhoWhisper-small'),
     'chunkformer_rnnt': ('chunkformer', 'khanhld/chunkformer-rnnt-large-vie'),
 }
+
+
+def select_llm_candidates(hypotheses, *, itn_enabled, limit=3):
+    """Normalize first, then deduplicate and take a priority-ordered Top-K."""
+    from lifemate.text.itn import apply_itn_pipeline
+    if isinstance(limit, bool) or not 1 <= int(limit) <= 3:
+        raise AsrError('LLM candidate limit must be between 1 and 3')
+    merged = {}
+    for item in hypotheses:
+        normalized = apply_itn_pipeline(item.text, enabled=itn_enabled)
+        key = normalize_hypothesis_text(normalized)
+        if not key:
+            continue
+        provenance = tuple(item.provenance or (item.source,))
+        if key in merged:
+            old = merged[key]
+            merged[key] = replace(old, provenance=tuple(dict.fromkeys((*old.provenance, *provenance))))
+        else:
+            merged[key] = replace(item, text=normalized, provenance=provenance)
+    return list(merged.values())[:int(limit)]
 
 
 class _Unavailable:
@@ -23,12 +46,21 @@ def build_top1_multi(cfg, specs, *, max_hypotheses=3, failure_policy='primary_on
     """Construct only requested models in configuration order, never use a proxy model."""
     if not isinstance(specs, list) or not 1 <= len(specs) <= 4:
         raise AsrError('multi_asr_models requires one to four model entries')
-    models = {}
+    if isinstance(max_hypotheses, bool) or not 1 <= int(max_hypotheses) <= 3:
+        raise AsrError('max_hypotheses must be between 1 and 3')
+    if failure_policy not in ('primary_only', 'strict') or not math.isfinite(float(budget_seconds)) or float(budget_seconds) <= 0:
+        raise AsrError('invalid multi-ASR failure policy or budget')
+    names = []
     for spec in specs:
         if not isinstance(spec, dict) or set(spec) - {'name','model_dir','device','revision'}:
             raise AsrError('each model entry accepts name, model_dir, device and revision only')
         name = spec.get('name')
-        if name not in MODELS or name in models: raise AsrError(f'unknown or duplicate ASR model: {name!r}')
+        if name not in MODELS or name in names:
+            raise AsrError(f'unknown or duplicate ASR model: {name!r}')
+        names.append(name)
+    models = {}
+    for spec in specs:
+        name = spec.get('name')
         backend, model_id = MODELS[name]
         directory, device, revision = spec.get('model_dir'), spec.get('device','cpu'), spec.get('revision')
         try:

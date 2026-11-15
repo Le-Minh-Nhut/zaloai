@@ -568,6 +568,7 @@ def _transcribe(
     """
     if asr is None:
         return "", {"backend": "none", "error": None}
+    asr_started = time.monotonic()
     from lifemate.data.loader import read_sample_audio
 
     try:
@@ -604,7 +605,7 @@ def _transcribe(
                 if not multi_res.hypotheses:
                     raise AsrError("multi-ASR produced no hypotheses")
                 result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
-                hypotheses = list(multi_res.hypotheses)
+                hypotheses = list(multi_res.all_hypotheses or multi_res.hypotheses)
                 conditioning["multi_asr"] = {"executed": bool(multi_res.multi_asr), "degraded": bool(multi_res.degraded), "reasons": list(multi_res.reasons)}
                 if nbest_requested:
                     if not getattr(asr.primary, "nbest_supported", False):
@@ -644,6 +645,7 @@ def _transcribe(
         }
         if multi_raw_results:
             info['multi_asr_results'] = multi_raw_results
+            info['latency_s'] = round(time.monotonic() - asr_started, 3)
         if nbest_reason is not None:
             info["nbest_fallback"] = nbest_reason[:300]
         return "", info
@@ -653,13 +655,34 @@ def _transcribe(
     # ``apply_itn_pipeline(enabled=False)`` IS ``to_llm_text``: one pipe either way.
     text = apply_itn_pipeline(raw_text, enabled=_flag(features, "prompt", "itn_enabled")) if raw_text else raw_text
     reported_backend = str(getattr(result, "backend", "") or "")
+    normalized_hypotheses = None
+    selected = None
+    if multi_raw_results and hypotheses is not None:
+        from lifemate.asr.top1_models import select_llm_candidates
+        normalized_hypotheses = select_llm_candidates(
+            hypotheses, itn_enabled=_flag(features, 'prompt', 'itn_enabled'),
+            limit=int(_param(features, 'asr', 'multi_asr_max_hypotheses', 3)))
+        if normalized_hypotheses:
+            selected_source = normalized_hypotheses[0].source
+            selected = next((item for item in multi_raw_results if item.get('model') == selected_source and item.get('status') == 'executed'), None)
+            if selected:
+                raw_text = str(selected.get('raw_transcript') or selected.get('transcript') or '')
+                reported_backend = str(selected.get('backend') or reported_backend)
+            text = normalized_hypotheses[0].text
+    primary = getattr(asr, 'primary', asr)
+    selected_model_id = selected.get('model_id') if selected else (getattr(primary, 'model_id', None) or getattr(primary, 'model_name', None))
+    if not multi_raw_results and hypotheses and getattr(asr, 'secondary', None) is not None:
+        secondary = asr.secondary
+        source = hypotheses[0].source
+        if source == 'secondary' or (source == getattr(secondary, 'name', None) and source != getattr(primary, 'name', None)):
+            selected_model_id = getattr(secondary, 'model_id', None) or getattr(secondary, 'model_name', None)
     info = {
         # A backend that reports nothing usable must not hide which one ran.
         "backend": backend_label if reported_backend in {"", "unknown"} else reported_backend,
         "error": getattr(result, "error", None),
-        "latency_s": round(float(getattr(result, "latency_s", 0.0) or 0.0), 3),
+        "latency_s": round(time.monotonic() - asr_started, 3) if hypotheses is not None else round(float(getattr(result, "latency_s", 0.0) or 0.0), 3),
         "raw_transcript": raw_text,
-        "model_id": getattr(getattr(asr, "primary", asr), "model_id", None),
+        "model_id": selected_model_id,
     }
     if _flag(features, "prompt", "itn_enabled"):
         info["itn_applied"] = bool(raw_text)
@@ -670,7 +693,7 @@ def _transcribe(
     if hypotheses is not None:
         from dataclasses import replace
         info["raw_hypotheses"] = hypotheses
-        info["hypotheses"] = [replace(h, text=apply_itn_pipeline(h.text, enabled=_flag(features, "prompt", "itn_enabled"))) for h in hypotheses]
+        info["hypotheses"] = normalized_hypotheses if normalized_hypotheses is not None else [replace(h, text=apply_itn_pipeline(h.text, enabled=_flag(features, "prompt", "itn_enabled"))) for h in hypotheses]
     if nbest_requested:
         info["nbest_requested"] = True
     if nbest_reason is not None:
