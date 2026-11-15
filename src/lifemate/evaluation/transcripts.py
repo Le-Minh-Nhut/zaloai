@@ -110,6 +110,8 @@ def asr_cache_identity(cfg: Any, features: Any) -> dict[str, Any]:
         "multi_asr_policy": _param(features, "asr", "multi_asr_policy", "primary_topk_secondary_top1"),
         "multi_asr_max_hypotheses": _param(features, "asr", "multi_asr_max_hypotheses", 3),
         "multi_asr_failure_policy": _param(features, "asr", "multi_asr_failure_policy", "primary_only"),
+        "multi_asr_models": _param(features, "asr", "multi_asr_models", []),
+        "multi_asr_budget_seconds": _param(features, "asr", "multi_asr_budget_seconds", 30.0),
     }
     identity["itn_enabled"] = _flag(features, "prompt", "itn_enabled")
     return identity

@@ -173,7 +173,7 @@ class GipformerBackend:
         )
 
         if self.offline:
-            search_dir = self.model_dir if self.model_dir else Path("models/gipformer-68M-rnnt")
+            search_dir = self.model_dir if self.model_dir else Path("models") / self.spec.key
             problems = validate_artifacts(self.spec, search_dir, quantization=self.quantization)
             if problems:
                 opposite_found = bool(other_files) and (

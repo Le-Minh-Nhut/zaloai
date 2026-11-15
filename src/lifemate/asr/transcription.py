@@ -50,10 +50,13 @@ def transcribe_samples_cached(
         return {"name": getattr(backend, "name", None),
                 "model_id": getattr(backend, "model_id", None),
                 "revision": getattr(backend, "revision", None),
+                "model_artifacts": _artifact_identity(getattr(backend, 'model_dir', None) or (getattr(backend, 'model_name', None) if Path(str(getattr(backend, 'model_name', ''))).is_dir() else None)),
                 "resolved_artifacts": {str(role): _artifact_identity(path) for role, path in sorted(paths.items())}}
     runtime_identity = {"requested_backend": getattr(args, "asr", None),
                         "primary": backend_identity(getattr(asr, "primary", asr)),
                         "secondary": backend_identity(getattr(asr, "secondary", None))}
+    if getattr(asr, 'backends', None) is not None:
+        runtime_identity['backends'] = {name: backend_identity(model) for name, model in asr.backends.items()}
     key = transcript_cache_key(cfg, features, split=split, sample_ids=sample_ids,
                                audio_identities=audio_identities(samples), runtime_identity=runtime_identity)
 
@@ -78,6 +81,9 @@ def transcribe_samples_cached(
             for field in ("hypotheses", "raw_hypotheses"):
                 if field in info:
                     info[field] = [asdict(h) if is_dataclass(h) else h for h in info[field]]
+                    for item in info[field]:
+                        if isinstance(item, dict) and isinstance(item.get('provenance'), tuple):
+                            item['provenance'] = list(item['provenance'])
             cached_transcripts[sid] = text
             cached_info[sid] = info
         valid = {

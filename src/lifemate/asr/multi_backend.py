@@ -28,9 +28,12 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from collections.abc import Mapping
+from dataclasses import replace
 
 from .interface import ASRBackend, AsrError, TranscriptResult
-from .nbest import AsrHypothesis, NBestResult, dedupe_hypotheses
+from .nbest import AsrHypothesis, NBestResult, dedupe_hypotheses, normalize_hypothesis_text
+from lifemate.errors import ProhibitedAccessError
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,7 @@ class MultiAsrBackend:
         failure_policy: str = "primary_only",
         primary_topk: int = 3,
         budget_seconds: float | None = None,
+        backends: Mapping[str, ASRBackend] | None = None,
     ) -> None:
         if primary is None or not callable(getattr(primary, "transcribe", None)):
             raise AsrError("MultiAsrBackend requires a primary ASR backend with transcribe()")
@@ -111,6 +115,12 @@ class MultiAsrBackend:
         self.failure_policy = failure_policy
         self.primary_topk = int(primary_topk)
         self.budget_seconds = float(budget_seconds) if budget_seconds is not None else None
+        self.backends = dict(backends) if backends is not None else None
+        if self.backends is not None:
+            if not self.backends or any(not k or not callable(getattr(v, 'transcribe', None)) for k, v in self.backends.items()):
+                raise AsrError('backends must contain uniquely named transcribe-capable backends')
+            if len({id(v) for v in self.backends.values()}) != len(self.backends):
+                raise AsrError('each model must use a distinct backend instance')
 
     # ------------------------------------------------------------------ public
     @property
@@ -131,7 +141,7 @@ class MultiAsrBackend:
         primary's top-1 unless the secondary produced something and the primary
         produced nothing (then the secondary text is the only text there is).
         """
-        if not self.enabled or self.secondary is None:
+        if not self.enabled or (self.secondary is None and self.backends is None):
             # Identity, not a copy: the caller's result object comes back as-is.
             return self.primary.transcribe(audio_path, sample_id=sample_id, lenient=lenient)
 
@@ -154,6 +164,9 @@ class MultiAsrBackend:
         """Every candidate text from the enabled sources, in priority order."""
         started = time.monotonic()
         result = NBestResult(scores_calibrated=False)
+
+        if self.enabled and self.backends is not None:
+            return self._transcribe_top1_sources(audio_path, sample_id, started)
 
         if not self.enabled or self.secondary is None:
             # A single-ASR run: degraded single-hypothesis result, multi_asr False.
@@ -250,6 +263,52 @@ class MultiAsrBackend:
             result.reasons.append(
                 f"budget_seconds={self.budget_seconds:g} exceeded; ordering kept but the run is over budget"
             )
+        return result
+
+    def _transcribe_top1_sources(self, audio_path, sample_id, started):
+        """One independent Top-1 per model; deduplicate only after recording all results."""
+        result = NBestResult(scores_calibrated=False, requested_size=self.max_hypotheses)
+        distinct = {}
+        for label, backend in self.backends.items():
+            if self.budget_seconds is not None and time.monotonic() - started >= self.budget_seconds:
+                result.budget_exceeded = result.degraded = True
+                result.reasons.append(f'{label}: skipped because the shared ASR budget expired')
+                result.raw_results.append({'model': label, 'status': 'blocked', 'error': 'budget expired'})
+                if self.failure_policy == 'strict': raise AsrError(result.reasons[-1])
+                continue
+            t0 = time.monotonic()
+            record = {'model': label, 'rank': 1, 'model_id': getattr(backend, 'model_id', None) or getattr(backend, 'model_name', None),
+                      'revision': getattr(backend, 'revision', None), 'backend': getattr(backend, 'name', label),
+                      'configuration': {k: getattr(backend, k) for k in ('quantization','decoding_method','language') if hasattr(backend,k)}}
+            try:
+                item = backend.transcribe(audio_path, sample_id=sample_id, lenient=True)
+                record['cache_hit'] = bool(getattr(backend, 'last_cache_hit', False))
+                record['recognition_latency_ms'] = round(float(getattr(item, 'latency_s', 0.0) or 0.0) * 1000, 3)
+                text = str(item.text or '').strip()
+                if item.error or not text: raise AsrError(item.error or 'empty transcript')
+                record.update(status='executed', raw_transcript=getattr(item, 'raw_text', None) or text,
+                              transcript=text, error=None)
+                result.sources.append(label)
+                key = normalize_hypothesis_text(text)
+                if key in distinct:
+                    old = distinct[key]; distinct[key] = replace(old, provenance=(*old.provenance,label))
+                else:
+                    distinct[key] = AsrHypothesis(text=text, rank=0, source=label, backend=record['backend'], provenance=(label,))
+            except ProhibitedAccessError:
+                raise
+            except Exception as exc:
+                record.update(status='failed', error=f'{type(exc).__name__}: {exc}', raw_transcript=None)
+                result.degraded = True; result.reasons.append(f"{label}: {record['error']}")
+                if self.failure_policy == 'strict': raise AsrError(result.reasons[-1]) from exc
+            finally:
+                record['latency_ms'] = round((time.monotonic()-t0)*1000, 3)
+                result.raw_results.append(record)
+            if self.budget_seconds is not None and time.monotonic() - started > self.budget_seconds:
+                result.budget_exceeded = result.degraded = True
+                result.reasons.append(f'{label}: ASR budget exceeded during decoding')
+                if self.failure_policy == 'strict': raise AsrError(result.reasons[-1])
+        result.hypotheses = list(distinct.values())[:self.max_hypotheses]
+        result.multi_asr = len(result.sources) >= 2
         return result
 
     # ----------------------------------------------------------------- helpers

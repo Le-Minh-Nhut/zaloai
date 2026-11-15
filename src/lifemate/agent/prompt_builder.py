@@ -299,6 +299,9 @@ def _hypothesis_items(asr_hypotheses: Sequence[Any] | None) -> list[tuple[str, s
             text, source = raw, ""
         else:
             text, source = getattr(raw, "text", ""), getattr(raw, "source", "")
+        provenance = raw.get('provenance', ()) if isinstance(raw, Mapping) else getattr(raw, 'provenance', ())
+        if isinstance(provenance, (list, tuple)) and provenance:
+            source = ', '.join(str(item) for item in provenance)
         text = " ".join(str(text or "").split())
         key = normalize_hypothesis_text(text)
         if not key or key in seen:

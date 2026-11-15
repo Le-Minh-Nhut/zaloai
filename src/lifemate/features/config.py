@@ -104,6 +104,8 @@ class AsrFeatureConfig:
     multi_asr_policy: str = "primary_topk_secondary_top1"
     multi_asr_max_hypotheses: int = 3
     multi_asr_failure_policy: str = "primary_only"
+    multi_asr_models: list = field(default_factory=list)
+    multi_asr_budget_seconds: float = 30.0
 
 @dataclass
 class PromptFeatureConfig:
@@ -145,6 +147,10 @@ def _section_fields(obj: object) -> dict[str, dataclasses.Field]:
 def _coerce(value: Any, current: Any, key: str) -> Any:
     """Read ``value`` as the type of ``current`` (YAML/env/CLI text welcome)."""
     if current is None:
+        return value
+    if isinstance(current, list):
+        if not isinstance(value, list):
+            raise FeatureConfigurationError(f"{key}: expected a list")
         return value
     if isinstance(current, bool):
         if isinstance(value, bool):

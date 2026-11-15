@@ -164,6 +164,10 @@ def create_asr_backend(
             )
         return MultiAsrBackend(**opts)
 
+    if name == "chunkformer":
+        from .chunkformer_backend import ChunkFormerBackend
+        return ChunkFormerBackend(**kwargs)
+
     if name == "oracle":
         if transcripts is None:
             raise AsrError(

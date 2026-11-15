@@ -355,6 +355,17 @@ def _build_asr(args: argparse.Namespace, cfg: Any, samples: Sequence[Any]) -> An
     split = cfg.inference.split
     labeled = split in LABELED_SPLITS
 
+    features = getattr(cfg, 'features', cfg)
+    specs = _param(features, 'asr', 'multi_asr_models', [])
+    if backend != 'oracle' and _flag(features, 'asr', 'multi_asr_enabled') and specs:
+        if _flag(features, 'asr', 'nbest_enabled'):
+            raise AsrError('four-model Top-1 mode does not support decoder N-best')
+        from lifemate.asr.top1_models import build_top1_multi
+        return build_top1_multi(cfg, specs,
+            max_hypotheses=int(_param(features, 'asr', 'multi_asr_max_hypotheses', 3)),
+            failure_policy=str(_param(features, 'asr', 'multi_asr_failure_policy', 'primary_only')),
+            budget_seconds=float(_param(features, 'asr', 'multi_asr_budget_seconds', 30.0)))
+
     if backend == "oracle":
         if not labeled:
             raise LifeMateError(
@@ -574,6 +585,7 @@ def _transcribe(
     nbest_reason: str | None = None
     nbest_requested = False
     hypotheses: list[Any] | None = None
+    multi_raw_results: list[dict[str, Any]] = []
     try:
         with contextlib.ExitStack() as stack:
             transcription_path = audio_path
@@ -588,6 +600,7 @@ def _transcribe(
             if _flag(features, "asr", "multi_asr_enabled") and hasattr(asr, "transcribe_multi"):
                 nbest_requested = _flag(features, "asr", "nbest_enabled")
                 multi_res = asr.transcribe_multi(transcription_path, sample_id=sample_id)
+                multi_raw_results = list(getattr(multi_res, 'raw_results', []))
                 if not multi_res.hypotheses:
                     raise AsrError("multi-ASR produced no hypotheses")
                 result = multi_res.to_transcript_result(backend=multi_res.hypotheses[0].backend or backend_label)
@@ -629,6 +642,8 @@ def _transcribe(
             "error": f"{type(exc).__name__}: {exc}"[:300],
             "nbest_requested": nbest_requested,
         }
+        if multi_raw_results:
+            info['multi_asr_results'] = multi_raw_results
         if nbest_reason is not None:
             info["nbest_fallback"] = nbest_reason[:300]
         return "", info
@@ -650,6 +665,8 @@ def _transcribe(
         info["itn_applied"] = bool(raw_text)
     if conditioning:
         info["conditioning"] = conditioning
+    if multi_raw_results:
+        info['multi_asr_results'] = [dict(item, normalized_transcript=apply_itn_pipeline(item['transcript'], enabled=_flag(features, 'prompt', 'itn_enabled')) if item.get('transcript') else None) for item in multi_raw_results]
     if hypotheses is not None:
         from dataclasses import replace
         info["raw_hypotheses"] = hypotheses

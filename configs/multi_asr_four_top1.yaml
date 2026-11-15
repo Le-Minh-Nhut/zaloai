@@ -1,0 +1,18 @@
+# Optional experiment. Stage local weights first; all models run offline on CPU.
+features:
+  asr:
+    multi_asr_enabled: true
+    multi_asr_failure_policy: primary_only
+    multi_asr_max_hypotheses: 3
+    multi_asr_budget_seconds: 30.0
+    multi_asr_models:
+      - name: gipformer_68m
+        model_dir: models/gipformer-68M-rnnt
+      - name: gipformer_15
+        model_dir: models/gipformer1.5-68M-rnnt
+      - name: phowhisper_small
+        model_dir: models/PhoWhisper-small
+      - name: chunkformer_rnnt
+        model_dir: models/chunkformer-rnnt-large-vie
+  prompt:
+    nbest_prompt_enabled: true

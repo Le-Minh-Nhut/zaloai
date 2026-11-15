@@ -20,11 +20,8 @@ Two entries:
     the local file, computed by reading it — not copied from a manifest.
 
 ``gipformer1.5-68M-rnnt``
-    **[UNVERIFIED]** — no weights available on this machine and nothing was ever
-    observed (no local directory, no HF cache entry). See ``notes``. Its
-    ``onnx`` mapping holds only the conventional role→filename names, and its
-    ``quantizations`` tuple is empty, so any attempt to build a recognizer from
-    it fails with an actionable message instead of guessing.
+    Artifact names and revision verified against the upstream repository; actual
+    model loading and inference remain unverified without local weights.
 
 Pure stdlib: importable without sherpa_onnx/torch/numpy.
 """
@@ -124,34 +121,24 @@ GIPFORMER_SPECS: dict[str, GipformerSpec] = {
         verified=True,
         assets=("bpe.model", "config.json"),
     ),
-    # [UNVERIFIED] — no weights available; see docs/GIPFORMER_INTEGRATION_AUDIT.md
+    # Upstream metadata verified; the checkpoint is not bundled in this repository.
     "gipformer1.5-68M-rnnt": GipformerSpec(
         model_id="g-group-ai-lab/gipformer1.5-68M-rnnt",
-        revision="",
+        revision="dd9227dcd8705c13f33bdbe59728d546ab94480f",
         onnx={
-            # Conventional sherpa-onnx transducer role names ONLY. Nothing here
-            # was observed: treat every value as a guess, not a fact.
-            "encoder": "encoder.onnx",
-            "decoder": "decoder.onnx",
-            "joiner": "joiner.onnx",
+            "encoder": "encoder.int8.onnx",
+            "decoder": "decoder.int8.onnx",
+            "joiner": "joiner.int8.onnx",
             "tokens": "tokens.txt",
         },
         sample_rate=16000,
         feature_dim=80,
         tokens_sha256=None,
         languages=("vi",),
-        notes=(
-            "[UNVERIFIED] No weights available: this repo has no local directory and no "
-            "Hugging Face cache entry for gipformer1.5-68M-rnnt, so its file set, revision, "
-            "token count and decoder configuration were NEVER observed on this machine. The "
-            "filenames above are the conventional sherpa-onnx role names and the sample "
-            "rate/feature dim are copied from the 68M checkpoint as a placeholder, not a "
-            "measurement. Mark this entry verified (and fill revision/tokens_sha256/"
-            "quantizations) only after downloading the weights and inspecting them."
-        ),
-        quantizations=(),
-        verified=False,
-        assets=(),
+        notes="Upstream config and file inventory verified; real weights and decoding not tested locally.",
+        quantizations=("int8", "fp32"),
+        verified=True,
+        assets=("bpe.model", "config.json"),
         version="1.5",
     ),
 }

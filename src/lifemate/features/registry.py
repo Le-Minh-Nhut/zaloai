@@ -150,6 +150,8 @@ FEATURES: tuple[FeatureSpec, ...] = (
             "multi_asr_policy": (str, "primary_topk_secondary_top1"),
             "multi_asr_max_hypotheses": (int, 3),
             "multi_asr_failure_policy": (str, "primary_only"),
+            "multi_asr_models": (list, []),
+            "multi_asr_budget_seconds": (float, 30.0),
         },
         scope="inference",
     ),
@@ -247,7 +249,7 @@ def _nbest_rules(cfg: FeatureConfig) -> list[str]:
 
 def _multi_asr_rules(cfg: FeatureConfig) -> list[str]:
     problems: list[str] = []
-    if not str(cfg.asr.secondary_model_id).strip():
+    if not cfg.asr.multi_asr_models and not str(cfg.asr.secondary_model_id).strip():
         problems.append(
             "asr.multi_asr is enabled but features.asr.secondary_model_id is empty; "
             "set it to a secondary ASR model id (e.g. 'vinai/PhoWhisper-small') "

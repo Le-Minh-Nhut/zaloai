@@ -79,23 +79,14 @@ def test_tokens_sha256_is_the_hash_of_the_local_file():
         assert any("tokens.txt sha256 mismatch" in problem for problem in problems)
 
 
-def test_15_spec_is_marked_unverified_and_declares_no_artifact_set():
-    """No weights were ever observed, so the entry says so instead of guessing."""
+def test_15_spec_matches_upstream_artifact_inventory():
     spec = GIPFORMER_SPECS[_15]
-    assert spec.verified is False
-    assert spec.quantizations == ()
-    assert spec.revision == ""
-    assert spec.tokens_sha256 is None
-    assert "[UNVERIFIED]" in spec.notes
-    assert "never observed" in spec.notes.lower() or "NEVER observed" in spec.notes
-    # Conventional role names only — and asking for files raises instead of guessing.
-    assert sorted(spec.onnx) == ["decoder", "encoder", "joiner", "tokens"]
-    try:
-        artifacts_for(spec, "int8")
-    except ConfigError as exc:
-        assert "[UNVERIFIED]" in str(exc) or "UNVERIFIED" in str(exc)
-    else:
-        raise AssertionError("an unverified spec must not produce an artifact list")
+    assert spec.verified is True
+    assert spec.quantizations == ("int8", "fp32")
+    assert spec.revision == "dd9227dcd8705c13f33bdbe59728d546ab94480f"
+    assert artifacts_for(spec, "int8")["encoder"] == "encoder.int8.onnx"
+    assert artifacts_for(spec, "fp32")["encoder"] == "encoder.onnx"
+    assert spec.tokens_sha256 is None  # bytes have not been downloaded
 
 
 def test_known_ids_and_unknown_id_error_lists_them():
@@ -203,10 +194,10 @@ def test_backend_rejects_15_through_the_spec_not_a_substring():
         GipformerBackend(model_id="g-group-ai-lab/gipformer1.5-68M-rnnt")
     except AsrError as exc:
         message = str(exc)
-        assert "[UNVERIFIED]" in message
+        assert "missing Gipformer" in message
         assert "gipformer1.5-68M-rnnt" in message
     else:
-        raise AssertionError("the [UNVERIFIED] 1.5 spec must not build a recognizer")
+        raise AssertionError("missing 1.5 weights must not build a recognizer")
 
 
 def test_backend_rejects_unknown_model_instead_of_falling_back_to_68m():

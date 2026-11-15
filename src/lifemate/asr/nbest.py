@@ -228,6 +228,7 @@ class AsrHypothesis:
     source: str = ""
     backend: str | None = None
     score_kind: str | None = None
+    provenance: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "text", str(self.text or ""))
@@ -274,6 +275,7 @@ class NBestResult:
     secondary_error: str | None = None
     #: Set when the wall-clock budget cut the run short.
     budget_exceeded: bool = False
+    raw_results: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -287,7 +289,7 @@ class NBestResult:
     @property
     def is_nbest(self) -> bool:
         """True only with 2+ distinct alternatives and no degradation."""
-        return not self.degraded and len(self.hypotheses) > 1
+        return not self.multi_asr and not self.degraded and len(self.hypotheses) > 1
 
     def to_transcript_result(self, *, source: str | None = None, **overrides: Any) -> TranscriptResult:
         """Rank-0 as a :class:`TranscriptResult`; errors when there is none."""

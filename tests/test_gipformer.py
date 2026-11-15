@@ -193,7 +193,7 @@ def test_03_version_1_5_is_spec_known_but_cannot_load_here():
     # Backend constructor refuses the [UNVERIFIED] 1.5 spec (never a silent 68M load).
     with pytest.raises(AsrError) as excinfo2:
         GipformerBackend(model_id="g-group-ai-lab/gipformer1.5-68M-rnnt")
-    assert "rejected" in str(excinfo2.value) and "UNVERIFIED" in str(excinfo2.value)
+    assert "missing Gipformer" in str(excinfo2.value) and "gipformer1.5" in str(excinfo2.value)
 
 
 def test_04_recognizer_built_with_right_filenames_int8_and_fp32():
