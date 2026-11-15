@@ -30,7 +30,7 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src /tmp/cudaenv/bin/python s
  --data-root /home/heheboiz/data/zaloai/data --split train \
  --config /home/heheboiz/data/zaloai/outputs/research/e3_multiasr_warmstart_20261115/config.yaml \
  --conditioned-multi-records /home/heheboiz/data/zaloai/outputs/research/e3_four_asr_full_20261115/four_asr_train.jsonl \
- --conditioned-mode multi --output <NEW_OUTPUT> --tokenizer /home/heheboiz/data/zaloai/models/MiniCPM5-2B --max-seq-length 8192
+ --conditioned-mode multi --output /home/heheboiz/data/zaloai/outputs/research/e3_warmstart_rebuild_check --tokenizer /home/heheboiz/data/zaloai/models/MiniCPM5-2B --max-seq-length 8192
 ```
 
 Lệnh run chính và kiểm tra smoke thực tế nằm tại `outputs/research/e3_multiasr_warmstart_20261115/run.sh`; evaluation tuần tự tại `.../evaluate_after.sh`. Không chạy lại khi PID hiện tại còn sống hoặc output đã tồn tại. Source code được cố định tại commit training nêu trên; nếu resume, dùng đúng source, config, dataset, parent và sampling identity của checkpoint, không resume E0.
@@ -48,3 +48,35 @@ So sánh đã có trước đó: E0 4/12 exact match tool-call ở bốn ASR K=3
 Run chính đã hoàn tất **25/100 optimizer step** và tạo `outputs/checkpoints/lifemate_e3_warmstart/lora/step-25`. Đã kiểm tra các file adapter, optimizer và `training_state.json`: `step=25`, scheduler horizon `100`, parent adapter SHA256 `789eb8389cb6e79ea0705cbf2ee616e7e29dcf6f39a50c7898cf38370c183860`, ASR artifact SHA256 `b219aaef1feab1bc2313994ca602d0ca3cf94c94caea2aaa57257bd092354b00`, source commit `3179c629492a48b8bc6d646de03818888e5f6328`. State ghi `exact_resume=true`, nhưng **chưa thử reload/resume checkpoint này**. Parent E0 vẫn giữ nguyên SHA256.
 
 Tại step 25, log: loss microbatch cuối `0,004836`, 43 conditioned/200 exposure (**21,5%**). Loss không phải task metric. Training vẫn chạy; step 50/100 và evaluation chưa có kết quả tại thời điểm ghi. `watch_run.py` chạy riêng, kiểm tra định kỳ SHA dataset/ASR/parent, step, file checkpoint và GPU contention; nếu phát hiện vi phạm, nó gửi SIGTERM đúng PID training. Log: `outputs/research/e3_multiasr_warmstart_20261115/watch.log`. Sau training, `evaluate_after.sh` và `summarize.py` chỉ đánh giá và tổng hợp; không tự kéo dài training.
+
+
+Kiểm tra bổ sung step 25: `optimizer_state.pt` có 588 mục optimizer, optimizer step 25 và scheduler `last_epoch=25`. Đây là kiểm tra cấu trúc/trạng thái trên CPU, chưa chứng minh reload inference hay exact resume thực tế.
+
+Để tái hiện **một run độc lập mới** sau khi GPU rảnh, dùng đúng source commit `3179c629492a48b8bc6d646de03818888e5f6328`, chọn output chưa tồn tại và chạy:
+
+```bash
+cd /tmp/lifemate-e3-warmstart
+R=/home/heheboiz/data/zaloai
+W="$R/outputs/research/e3_multiasr_warmstart_20261115"
+[ ! -e "$R/outputs/checkpoints/lifemate_e3_warmstart_repro" ] && \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src TOKENIZERS_PARALLELISM=false \
+/tmp/cudaenv/bin/python scripts/train.py --config "$W/config.yaml" --dataset-dir "$W/dataset/train" \
+ --model "$R/models/MiniCPM5-2B" --init-adapter "$R/outputs/overnight/candidates/step-1614" \
+ --conditioned-exposure-ratio 0.2 --planned-steps 100 --max-steps 100 --save-steps 25 \
+ --output-dir "$R/outputs/checkpoints/lifemate_e3_warmstart_repro"
+```
+
+Ví dụ nạp và đánh giá checkpoint step 25 sau khi GPU rảnh (output phải chưa tồn tại):
+
+```bash
+cd /tmp/lifemate-e3-warmstart
+R=/home/heheboiz/data/zaloai
+W="$R/outputs/research/e3_multiasr_warmstart_20261115"
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=src /tmp/cudaenv/bin/python scripts/evaluate.py \
+ --config "$W/config.yaml" --data-root "$R/data" --split train \
+ --heldout-dataset "$R/outputs/datasets/minicpm_baseline/train" --model "$R/models/MiniCPM5-2B" \
+ --model-mode lora --checkpoint "$R/outputs/checkpoints/lifemate_e3_warmstart/lora/step-25" \
+ --evaluation-mode audio_to_action --closed-loop --replay-multi-asr \
+ "$R/outputs/research/e3_four_asr_full_20261115/four_asr_train.jsonl" --replay-k 3 --limit 12 \
+ --output "$W/manual_eval_25"
+```
