@@ -382,3 +382,21 @@ def test_replay_one_real_model_schema_and_rejects_mismatch(tmp_path):
     assert replay.current(sample)[0]=='nhắc tôi'
     sample.audio_path.write_bytes(b'tampered')
     with pytest.raises(LifeMateError,match='identity'):ArtifactReplay(path,[sample],split='train',data_root=data,k=1)
+
+
+def test_merge_pilot_preserves_real_results_and_rejects_audio_mismatch(tmp_path):
+    import importlib.util
+    path=Path(__file__).resolve().parents[1]/'scripts/merge_multi_asr_pilot.py';spec=importlib.util.spec_from_file_location('merge_pilot_test',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    data,sample,backend,features,_=producer_fixture(tmp_path);sample.history=[]
+    model=Model();model.model_id=MODELS['gipformer_68m'][1];backend.backends={'gipformer_68m':model}
+    def transcribe(*a,**kw):
+        return 'genuine a',{'multi_asr_results':[{'model':'gipformer_68m','model_id':model.model_id,'status':'executed','transcript':'genuine a'}], 'conditioning':{'multi_asr':{'degraded':False}}}
+    base=tmp_path/'base.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=base,transcribe=transcribe)
+    idx,_=load_records(base);sha=idx[('s','current')]['audio_sha256'];paths={};dirs={}
+    for name in module.REVISIONS:
+        paths[name]=tmp_path/(name+'.jsonl');dirs[name]=tmp_path/name;dirs[name].mkdir()
+        paths[name].write_text(json.dumps({'sample_id':'s','turn_id':'current','audio_sha256':sha,'model':name,'model_id':MODELS[name][1],'status':'executed','transcript':'real '+name})+'\n')
+    out=tmp_path/'merged.jsonl';module.merge(base,paths,dirs,out);rows,_=load_records(out)
+    assert len(rows[('s','current')]['models'])==4 and rows[('s','current')]['models'][0]['transcript']=='genuine a'
+    row=json.loads(paths['gipformer_15'].read_text());row['audio_sha256']='bad';paths['gipformer_15'].write_text(json.dumps(row)+'\n')
+    with pytest.raises(LifeMateError,match='audio identity'):module.merge(base,paths,dirs,tmp_path/'bad.jsonl')
