@@ -400,3 +400,15 @@ def test_merge_pilot_preserves_real_results_and_rejects_audio_mismatch(tmp_path)
     assert len(rows[('s','current')]['models'])==4 and rows[('s','current')]['models'][0]['transcript']=='genuine a'
     row=json.loads(paths['gipformer_15'].read_text());row['audio_sha256']='bad';paths['gipformer_15'].write_text(json.dumps(row)+'\n')
     with pytest.raises(LifeMateError,match='audio identity'):module.merge(base,paths,dirs,tmp_path/'bad.jsonl')
+
+
+def test_multi_candidate_exact_gold_is_used_only_as_evidence(tmp_path):
+    data,sample,backend,features,_=producer_fixture(tmp_path);sample.history=[]
+    def transcribe(*args,**kwargs):
+        models=[{'model':name,'model_id':MODELS[name][1],'status':'executed','transcript':text} for name,text in zip(MODELS,['mở đèn nhé','mở nhạc nhé','mở cửa nhé','mở máy nhé'])]
+        return 'mở đèn nhé',{'multi_asr_results':models,'conditioning':{'multi_asr':{'degraded':False}}}
+    path=tmp_path/'records.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=transcribe)
+    idx,_=load_records(path);clean={'sample_id':'s','messages':[{'role':'user','content':prompt('Mở nhạc, nhé!')}], 'target':'<action>{"type":"finish"}</action>', 'meta':{}}
+    out,stats=augment_conditioned([clean],[sample],idx,mode='multi',k=4)
+    assert stats['SUPPORTED']==1 and len(out)==2 and out[1]['target']==clean['target']
+    assert 'Mở nhạc, nhé!' not in out[1]['messages'][-1]['content']

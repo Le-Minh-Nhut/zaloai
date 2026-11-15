@@ -195,9 +195,9 @@ def augment_conditioned(records, samples, index, *, k=3, ratio=1.0, seed=42, unk
             clean_sections=prompt_sections(record['messages'][-1]['content']) or {}
             clean_request=clean_sections.get('# Yêu cầu', '')
             history_equivalent=not prior_rows or _equivalent_transcript(_render_history(turns,history_limit), _render_history(history,history_limit))
-            if (audit['status']=='UNKNOWN' and variant_kind=='single' and history_equivalent
-                    and _equivalent_transcript(clean_request, shown[0].text)):
-                audit={'status':'SUPPORTED','reasons':['ASR request and visible history match the original after conservative surface normalization; gold text used only for validation']}
+            if (audit['status']=='UNKNOWN' and history_equivalent
+                    and any(_equivalent_transcript(clean_request, hypothesis.text) for hypothesis in shown)):
+                audit={'status':'SUPPORTED','reasons':['At least one ASR request and the visible history match the original after conservative surface normalization; gold text used only for validation']}
             counts[audit['status']]+=1
             counts['decisions'].append({'sample_id':sid,'step_index':record.get('step_index'),'kind':variant_kind,'audit':audit})
             if audit['status']=='UNSUPPORTED' or (audit['status']=='UNKNOWN' and unknown_policy=='exclude'):continue
