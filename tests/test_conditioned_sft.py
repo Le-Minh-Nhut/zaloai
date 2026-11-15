@@ -368,3 +368,17 @@ def test_exact_gold_surface_is_coverage_evidence_only(tmp_path):
     assert '# Yêu cầu\nmở nhạc nhé' in out[1]['messages'][-1]['content']
     assert 'Mở nhạc, nhé!' not in out[1]['messages'][-1]['content']
     assert out[1]['target']==clean['target']
+
+
+def test_replay_one_real_model_schema_and_rejects_mismatch(tmp_path):
+    from lifemate.evaluation.artifact_replay import ArtifactReplay
+    data,sample,backend,features,_=producer_fixture(tmp_path);sample.history=[]
+    backend.backends={'gipformer_68m':Model()};backend.backends['gipformer_68m'].model_id=MODELS['gipformer_68m'][1]
+    def transcribe(*args,**kwargs):
+        model={'model':'gipformer_68m','model_id':MODELS['gipformer_68m'][1],'status':'executed','transcript':'nhắc tôi'}
+        return 'nhắc tôi',{'multi_asr_results':[model],'conditioning':{'multi_asr':{'degraded':False}}}
+    path=tmp_path/'single.jsonl';produce_multi_records([sample],backend,features,split='train',data_root=data,output=path,transcribe=transcribe)
+    replay=ArtifactReplay(path,[sample],split='train',data_root=data,k=1)
+    assert replay.current(sample)[0]=='nhắc tôi'
+    sample.audio_path.write_bytes(b'tampered')
+    with pytest.raises(LifeMateError,match='identity'):ArtifactReplay(path,[sample],split='train',data_root=data,k=1)

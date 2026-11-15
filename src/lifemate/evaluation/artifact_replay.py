@@ -15,7 +15,8 @@ class ArtifactReplay:
         self.index, self.manifest = load_records(path)
         self.k, self.itn = k, itn
         identities = self.manifest['identity'].get('models', {})
-        if set(identities) != set(MODELS) or any(identities[name].get('model_id') != spec[1] for name, spec in MODELS.items()):
+        self.expected = set(identities)
+        if self.expected not in ({'gipformer_68m'}, set(MODELS)) or any(identities[name].get('model_id') != MODELS[name][1] for name in self.expected):
             raise LifeMateError('replay model identity mismatch')
         self.rows = {}
         for sample in samples:
@@ -31,7 +32,7 @@ class ArtifactReplay:
                 if not row or not audio or not audio.is_file() or _hash(audio) != row.get('audio_sha256'):
                     raise LifeMateError(f'replay audio identity mismatch: {sid}/{turn_id}')
                 models = row.get('models') or []
-                if row.get('status') != 'complete' or not row.get('selected_text') or len(models) != 4 or {m.get('model') for m in models} != set(MODELS):
+                if row.get('status') != 'complete' or not row.get('selected_text') or len(models) != len(self.expected) or {m.get('model') for m in models} != self.expected:
                     raise LifeMateError(f'replay incomplete: {sid}/{turn_id}')
                 if any(m.get('status') != 'executed' or not m.get('transcript') or m.get('model_id') != MODELS[m['model']][1] for m in models):
                     raise LifeMateError(f'replay invalid model result: {sid}/{turn_id}')
