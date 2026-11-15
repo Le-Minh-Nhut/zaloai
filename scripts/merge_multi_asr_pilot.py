@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Merge independently decoded Top-1 pilot rows with an existing verified artifact."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -37,8 +38,12 @@ def merge(base, other, model_dirs, output):
     if not keys or any(set(indices[name])!=set(keys) for name in REVISIONS):
         raise LifeMateError('independent model sample sets differ')
     inputs=[{k:prior[key].get(k) for k in ('sample_id','turn_id','audio_sha256')} for key in keys]
+    features=copy.deepcopy(meta['identity']['features'])
+    features.setdefault('asr',{})['multi_asr_models'] = [{'name':name,'model_dir':str(model_dirs[name]),'device':'cpu'} for name in REVISIONS]
+    features['asr']['multi_asr_models'].insert(0, {'name':'gipformer_68m','origin_artifact_sha256':source_sha})
     identity={'schema':SCHEMA,'split':'train','inputs':inputs,'models':identities,
-              'features':meta['identity']['features'],'source_gipformer_sha256':source_sha,
+              'features':features,'source_gipformer_sha256':source_sha,
+              'decoders':{'gipformer_68m':'verified_source_artifact','gipformer_15':'backend_default_cpu_int8', 'phowhisper_small':'backend_greedy_cpu', 'chunkformer_rnnt':{'chunk_size':64,'left_context_size':128,'right_context_size':128,'total_batch_duration':1800}},
               'merge_policy':'strict_independent_top1_v1'}
     identity_hash=hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
     output=Path(output);manifest=output.with_name(output.name+'.manifest.json')
